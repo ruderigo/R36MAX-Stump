@@ -1,0 +1,6 @@
+{
+  "name": "R36MAX AV Breakbeat Workstation",
+  "description": "Live audiovisual breakbeat engine, RGB565/PCM file chewer, and ALSA + GLES2 native handheld workstation for the R36MAX (RK3326).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
