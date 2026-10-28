@@ -399,7 +399,7 @@ export default function App() {
             <span aria-hidden="true">·</span>
             <span>Build 1: Chewer + AV Breakbeat Engine</span>
             <span aria-hidden="true">·</span>
-            <span>Build 2: LaBuche-Stump v1.0.0-beta.34 (SDL2 KMSDRM + Reticulum/RRC + BarKeep)</span>
+            <span>Build 2: LaBuche-Stump v1.6.0-r36max ([A]=Accept/[B]=Cancel + Panel 5 Network Revision + Multi-Threaded AP Portal)</span>
           </div>
           <div className="flex items-center gap-2">
             <span>/dev/shm: {ramBudget.usedShmMiB} MiB used</span>
