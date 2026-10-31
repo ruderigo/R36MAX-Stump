@@ -145,8 +145,10 @@ if [ "$CAP" = 1 ] && [ -d /etc/NetworkManager ]; then
 fi
 # The screen and gamepad for the user who runs the cockpit: its groups (they
 # apply from the next boot), and the devices opened up now for this boot.
+# (dArkOS's sudo doesn't look in /usr/sbin: full paths for its tools.)
+USERMOD="$(command -v usermod || echo /usr/sbin/usermod)"
 for g in video render input tty; do
-  getent group "$g" >/dev/null && sudo usermod -aG "$g" "$ME"
+  getent group "$g" >/dev/null && ! id -nG "$ME" | grep -qw "$g" && sudo "$USERMOD" -aG "$g" "$ME"
 done
 sudo chmod 666 /dev/dri/card* /dev/dri/render* /dev/fb0 /dev/input/event* 2>/dev/null
 ok "screen and gamepad: $ME is in $(id -nG "$ME" | tr ' ' ',')"
