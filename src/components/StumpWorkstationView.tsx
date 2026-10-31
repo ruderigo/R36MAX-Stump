@@ -538,119 +538,14 @@ export const StumpWorkstationView: React.FC = () => {
     }
   };
 
-  const fullOneClickSshDeploy = `mkdir -p ~/r36max-deploy/stump_pkg/node
-cd ~/r36max-deploy
-rm -rf /tmp/LaBuche-Stump
-git clone --depth 1 https://github.com/ruderigo/LaBuche-Stump.git /tmp/LaBuche-Stump
-cp -rf /tmp/LaBuche-Stump/final_firmware/* ~/r36max-deploy/stump_pkg/node/
-cp -rf /tmp/LaBuche-Stump/pc/stump_pc.py ~/r36max-deploy/stump_pkg/node/
-cp -rf /tmp/LaBuche-Stump/pc/pc_compat ~/r36max-deploy/stump_pkg/node/
+  // v2.0.0-r36max: the R36MAX runs the stock PC Stump (SandBox_Stump_On pc/stump_pc.py,
+  // set up by provisioner.py --pc), like every other computer Stump. The handheld
+  // layer (cockpit, feed, Ports launcher) lives in handheld/ of this repo, and
+  // handheld/install.sh installs or updates everything. Run from the Mac:
+  const fullOneClickSshDeploy = `ssh -t ark@r36max.local 'if [ -d ~/R36MAX-Stump/.git ]; then git -C ~/R36MAX-Stump pull --ff-only; else git clone https://github.com/ruderigo/R36MAX-Stump.git ~/R36MAX-Stump; fi && bash ~/R36MAX-Stump/handheld/install.sh'`;
 
-cat << 'CFGEOF' >> ~/r36max-deploy/stump_pkg/node/config.py
-
-NODE_NAME = "LaBuche-R36MAX"
-PC_HTTP_PORT = 8880
-PC_STORAGE_MB = 2048
-THEME = "amber"
-AUTH_MODE = "open"
-AUTH_ACCESS_MODE = "open"
-APP_HELLO = False
-CHAIN = True
-FEATURES = ["chat", "billboard", "files", "about"]
-CFGEOF
-
-cat << 'PYEOF' > ~/r36max-deploy/stump_pkg/node/run_stump_r36max.py
-${STUMP_R36MAX_BRIDGE_PY}
-PYEOF
-
-cat << 'CEOF' > ~/r36max-deploy/stump_pkg/stump_r36max_engine.c
-${STUMP_R36MAX_C_SOURCE}
-CEOF
-
-cat << 'SHEOF' > ~/r36max-deploy/LaBuche_Stump.sh
-${STUMP_R36MAX_PORTS_SCRIPT}
-SHEOF
-
-cat << 'INSTEOF' > ~/r36max-deploy/install_full_remote.sh
-#!/bin/bash
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
-mkdir -p /roms/ports/stump_r36max/node/sd/shared /roms/ports/stump_r36max/node/sd/tools /roms/ports/stump_r36max/tf_backup
-echo ark | sudo -S pkill -f stump_r36max_engine 2>/dev/null || true
-echo ark | sudo -S pkill -f run_stump_r36max.py 2>/dev/null || true
-echo ark | sudo -S rm -f /dev/shm/stump_cmd.txt /dev/shm/stump_live.txt 2>/dev/null || true
-echo ark | sudo -S pkill -f stump_hostapd 2>/dev/null || true
-echo ark | sudo -S pkill -f stump_wpa_ap 2>/dev/null || true
-echo ark | sudo -S pkill -f stump_dnsmasq.conf 2>/dev/null || true
-echo ark | sudo -S nmcli con down StumpCAM 2>/dev/null || true
-echo ark | sudo -S nmcli con delete StumpCAM 2>/dev/null || true
-echo ark | sudo -S systemctl unmask --runtime NetworkManager NetworkManager-dispatcher wpa_supplicant dhcpcd 2>/dev/null || true
-echo ark | sudo -S systemctl unmask NetworkManager wpa_supplicant 2>/dev/null || true
-echo ark | sudo -S systemctl start wpa_supplicant 2>/dev/null || true
-echo ark | sudo -S systemctl start NetworkManager 2>/dev/null || true
-tar -xzf /roms/ports/stump_r36max.tar.gz -C /roms/ports/stump_r36max
-rm -f /roms/ports/stump_r36max.tar.gz
-cd /roms/ports/stump_r36max || exit 1
-gcc -O2 -mcpu=cortex-a35 -Wall stump_r36max_engine.c -o stump_r36max_engine.new -lasound -lpthread -ldl -lm && mv -f stump_r36max_engine.new stump_r36max_engine
-chmod +x /roms/ports/stump_r36max/stump_r36max_engine /roms/ports/LaBuche_Stump.sh
-/roms/ports/stump_r36max/stump_r36max_engine --smoke
-rm -f /roms/ports/install_full_remote.sh
-echo "=== INSTALLED v1.7.1-r36max — Authentic final_firmware Stump Portal + FireFly R36MAX UI ==="
-INSTEOF
-
-tar -czf ~/r36max-deploy/stump_r36max.tar.gz -C ~/r36max-deploy/stump_pkg .
-scp ~/r36max-deploy/stump_r36max.tar.gz ~/r36max-deploy/LaBuche_Stump.sh ~/r36max-deploy/install_full_remote.sh ark@r36max.local:/roms/ports/
-ssh -t ark@r36max.local "bash /roms/ports/install_full_remote.sh"`;
-
-  const fastUpdateSshDeploy = `echo ">>> Staging LaBuche-Stump v1.7.1-r36max in ~/r36max-deploy ..."
-mkdir -p ~/r36max-deploy
-
-cat << 'PYEOF' > ~/r36max-deploy/run_stump_r36max.py
-${STUMP_R36MAX_BRIDGE_PY}
-PYEOF
-
-cat << 'CEOF' > ~/r36max-deploy/stump_r36max_engine.c
-${STUMP_R36MAX_C_SOURCE}
-CEOF
-
-cat << 'SHEOF' > ~/r36max-deploy/LaBuche_Stump.sh
-${STUMP_R36MAX_PORTS_SCRIPT}
-SHEOF
-
-cat << 'INSTEOF' > ~/r36max-deploy/install_remote.sh
-#!/bin/bash
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
-mkdir -p /roms/ports/stump_r36max/tf_backup /roms/ports/stump_r36max/node/sd/shared /roms/ports/stump_r36max/node/sd/tools
-mv -f /roms/ports/run_stump_r36max.py /roms/ports/stump_r36max/node/run_stump_r36max.py
-cp -f /roms/ports/stump_r36max/node/run_stump_r36max.py /roms/ports/stump_r36max/run_stump_r36max.py
-mv -f /roms/ports/stump_r36max_engine.c /roms/ports/stump_r36max/stump_r36max_engine.c
-echo ark | sudo -S pkill -f stump_r36max_engine 2>/dev/null || true
-echo ark | sudo -S pkill -f run_stump_r36max.py 2>/dev/null || true
-echo ark | sudo -S rm -f /dev/shm/stump_cmd.txt /dev/shm/stump_live.txt 2>/dev/null || true
-echo ark | sudo -S pkill -f stump_hostapd 2>/dev/null || true
-echo ark | sudo -S pkill -f stump_wpa_ap 2>/dev/null || true
-echo ark | sudo -S pkill -f stump_dnsmasq.conf 2>/dev/null || true
-echo ark | sudo -S nft flush ruleset 2>/dev/null || true
-echo ark | sudo -S iptables -P INPUT ACCEPT 2>/dev/null || true
-echo ark | sudo -S iptables -F INPUT 2>/dev/null || true
-echo ark | sudo -S sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
-echo ark | sudo -S nmcli con down StumpCAM 2>/dev/null || true
-echo ark | sudo -S nmcli con delete StumpCAM 2>/dev/null || true
-echo ark | sudo -S systemctl unmask --runtime NetworkManager NetworkManager-dispatcher wpa_supplicant dhcpcd 2>/dev/null || true
-echo ark | sudo -S systemctl unmask NetworkManager wpa_supplicant 2>/dev/null || true
-echo ark | sudo -S systemctl start wpa_supplicant 2>/dev/null || true
-echo ark | sudo -S systemctl start NetworkManager 2>/dev/null || true
-grep -q 'CHAIN = True' /roms/ports/stump_r36max/node/config.py 2>/dev/null || echo 'CHAIN = True' >> /roms/ports/stump_r36max/node/config.py
-grep -q "FEATURES = \['chat', 'billboard', 'files', 'about'\]" /roms/ports/stump_r36max/node/config.py 2>/dev/null || echo "FEATURES = ['chat', 'billboard', 'files', 'about']" >> /roms/ports/stump_r36max/node/config.py
-cd /roms/ports/stump_r36max || exit 1
-gcc -O2 -mcpu=cortex-a35 -Wall stump_r36max_engine.c -o stump_r36max_engine.new -lasound -lpthread -ldl -lm && mv -f stump_r36max_engine.new stump_r36max_engine
-chmod +x /roms/ports/stump_r36max/stump_r36max_engine /roms/ports/LaBuche_Stump.sh
-/roms/ports/stump_r36max/stump_r36max_engine --smoke
-rm -f /roms/ports/install_remote.sh
-echo "=== UPDATED TO v1.7.1-r36max — Port 53 Errno 98 Fix + Authentic final_firmware Portal (:80/:8080) + FireFly UI Ready ==="
-INSTEOF
-
-scp ~/r36max-deploy/run_stump_r36max.py ~/r36max-deploy/stump_r36max_engine.c ~/r36max-deploy/LaBuche_Stump.sh ~/r36max-deploy/install_remote.sh ark@r36max.local:/roms/ports/
-ssh -t ark@r36max.local "bash /roms/ports/install_remote.sh"`;
+  // Updating is the same command: install.sh pulls both repos and re-runs provisioner.py --pc.
+  const fastUpdateSshDeploy = fullOneClickSshDeploy;
 
   const handleCopy = (id: string, text: string) => {
     try {
@@ -692,13 +587,13 @@ ssh -t ark@r36max.local "bash /roms/ports/install_remote.sh"`;
       <div className="bg-emerald-950/30 border border-emerald-500/40 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3">
         <div>
           <span className="text-[11px] font-mono uppercase tracking-wider text-emerald-400 block font-bold">
-            v1.7.1-r36max · PORT 53 ERRNO 98 FIX + AUTHENTIC FINAL_FIRMWARE STUMP PORTAL + FIREFLY_RK3326 UI
+            v2.0.0-r36max · A STOCK PC STUMP, LIKE THE OTHERS + THE 720×720 COCKPIT
           </span>
           <p className="text-xs text-slate-200 mt-0.5">
-            Fixes AP Mode <code className="text-emerald-300">Port 53 Errno 98 (Address already in use)</code> by delegating{' '}
-            <code className="text-emerald-300">captive_portal.run_dns_server</code> to the R36MAX AP worker, serves real{' '}
-            <code className="text-emerald-300">final_firmware/barkeep.py + rrc_ui.py</code> on <code className="text-emerald-300">192.168.4.1:80</code>, and renders the{' '}
-            <code className="text-emerald-300">FireFly_RK3326_R36MAX_R36S</code> UI.
+            The handheld runs SandBox_Stump_On's own{' '}
+            <code className="text-emerald-300">pc/stump_pc.py</code>, set up by{' '}
+            <code className="text-emerald-300">provisioner.py --pc</code>, exactly like macOS1. The cockpit is a client of its HTTP API.{' '}
+            Install or update: <code className="text-emerald-300">handheld/install.sh</code>.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -708,8 +603,8 @@ ssh -t ark@r36max.local "bash /roms/ports/install_remote.sh"`;
           >
             {copiedId === 'fast_update_top' ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
             {copiedId === 'fast_update_top'
-              ? 'Copied v1.7.1 1-Paste CLI!'
-              : 'Copy 1-Paste CLI Update (v1.7.1-r36max)'}
+              ? 'Copied the install/update command!'
+              : 'Copy install/update command (v2.0.0-r36max)'}
           </button>
           <button
             onClick={() => setSubView('deploy_ssh')}
