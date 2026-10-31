@@ -67,18 +67,21 @@ fi
 PIN=""; command -v taskset >/dev/null 2>&1 && PIN="taskset -c 2,3"
 as_user env STUMP_DIR="$STUMP_DIR" STUMP_R36MAX_DIR="$APP_DIR" $PIN python3 "$COCKPIT_DIR/cockpit_feed.py" >> "$LOG" 2>&1 &
 
-# The display: pygame KMSDRM presenter + the C engine (the v1.8.8 display path, unchanged).
-PYGAME_PY=""
-for py in "$USER_HOME/firefly/venv/bin/python" python3; do
-  if command -v "$py" >/dev/null 2>&1 && "$py" -c "import pygame" >/dev/null 2>&1; then PYGAME_PY="$py"; break; fi
-done
+# The display. The engine draws to the screen itself through the system's SDL2
+# (the one EmulationStation uses, with KMSDRM), as before v1.8; it reads the
+# gamepad itself, and SELECT+START ends it. The pygame presenter (v1.8.x) is
+# kept only on request, STUMP_DISPLAY=pygame: on dArkOS the FireFly venv's
+# pygame brings its own SDL, which has no KMSDRM there and drew "offscreen",
+# into memory, so the screen stayed black.
 ENGINE="$COCKPIT_DIR/stump_r36max_engine"
 for attempt in 1 2 3; do
-  if [ -n "$PYGAME_PY" ]; then
-    "$PYGAME_PY" -X faulthandler "$COCKPIT_DIR/stump_pygame_display.py" "$ENGINE" >> "$LOG" 2>&1
+  if [ "${STUMP_DISPLAY:-engine}" = "pygame" ]; then
+    for py in "$USER_HOME/firefly/venv/bin/python" python3; do
+      command -v "$py" >/dev/null 2>&1 && "$py" -c "import pygame" >/dev/null 2>&1 && break
+    done
+    "$py" -X faulthandler "$COCKPIT_DIR/stump_pygame_display.py" "$ENGINE" >> "$LOG" 2>&1
   else
-    echo "pygame not found: the engine alone (no KMSDRM presenter)" >> "$LOG"
-    "$ENGINE" >> "$LOG" 2>&1
+    SDL_VIDEODRIVER=kmsdrm "$ENGINE" >> "$LOG" 2>&1
   fi
   [ -f /dev/shm/stump_user_quit ] && break        # SELECT+START: back to EmulationStation
   echo "display exited without SELECT+START (attempt $attempt); restarting it" >> "$LOG"

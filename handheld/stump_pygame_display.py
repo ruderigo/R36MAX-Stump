@@ -86,7 +86,8 @@ class Display:
             if os.environ.get("SDL_VIDEODRIVER") == "dummy":
                 os.environ.pop("SDL_VIDEODRIVER", None)
             pygame.display.init()
-            if pygame.display.get_driver() == "dummy":
+            # "offscreen" too: SDL's fallback draws into memory, never to the panel.
+            if pygame.display.get_driver() in ("dummy", "offscreen"):
                 pygame.display.quit()
                 os.environ["SDL_VIDEODRIVER"] = "kmsdrm"
                 pygame.display.init()
@@ -116,6 +117,8 @@ class Display:
                 self.width, self.height = dh, dw
             else:
                 self.width, self.height = dw, dh
+            if pygame.display.get_driver() in ("dummy", "offscreen"):
+                raise RuntimeError("SDL driver %s doesn't reach the screen" % pygame.display.get_driver())
             self._canvas = pygame.Surface((self.width, self.height))
             # Verify KMSDRM CRTC master by performing an initial page-flip now
             self._screen.fill((27, 21, 18))
