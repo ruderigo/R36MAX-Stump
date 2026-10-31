@@ -1,0 +1,2997 @@
+/*
+ * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
+ * (RK3326 / dArkOS), v2.0.0-r36max.
+ *
+ * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
+ * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
+ * screen and gamepad: it reads /dev/shm/stump_live.txt and sends command
+ * lines to cockpit_feed.py (UDP 127.0.0.1:42421), which talks to the Stump
+ * over its public HTTP API. Nothing here reads or writes the Stump's own
+ * files, and nothing here talks to the network.
+ *   - Chat (#main, #lora-mesh, #wifi-mesh), Billboard, Files, Network, Setup
+ *   - ISO/IEC 18004 QR code (Version 2-L) for the Stump's address
+ *
+ * Build on R36MAX:
+ *   gcc -O2 -mcpu=cortex-a35 -Wall stump_r36max_engine.c -o stump_r36max_engine -lasound -lpthread -ldl -lm
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <linux/fb.h>
+#include <net/if.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <linux/input.h>
+#include <alsa/asoundlib.h>
+
+#define PANEL_W         720
+#define PANEL_H         720
+#define PANEL_BYTES     (PANEL_W * PANEL_H * 4)
+#define SR              44100
+#define ALSA_PERIOD     512
+#define IPC_UDP_PORT    42421
+
+#define LIVE_STATE_FILE "/dev/shm/stump_live.txt"
+#define CMD_QUEUE_FILE  "/dev/shm/stump_cmd.txt"
+#define SHM_FB_FILE     "/dev/shm/stump_fb.rgba"
+
+#define SDL_INIT_VIDEO              0x00000020u
+#define SDL_WINDOW_SHOWN            0x00000004u
+#define SDL_WINDOW_FULLSCREEN_DESK  0x00001001u
+#define SDL_WINDOWPOS_UNDEFINED     0x1FFF0000u
+#define SDL_RENDERER_ACCELERATED    0x00000002u
+#define SDL_RENDERER_PRESENTVSYNC   0x00000004u
+#define SDL_PIXELFORMAT_ARGB8888    0x16362004u
+#define SDL_TEXTUREACCESS_STREAMING 1
+
+typedef int         (*pfn_SDL_Init)(uint32_t);
+typedef void        (*pfn_SDL_Quit)(void);
+typedef void*       (*pfn_SDL_CreateWindow)(const char*, int, int, int, int, uint32_t);
+typedef void        (*pfn_SDL_DestroyWindow)(void*);
+typedef void*       (*pfn_SDL_CreateRenderer)(void*, int, uint32_t);
+typedef void        (*pfn_SDL_DestroyRenderer)(void*);
+typedef void*       (*pfn_SDL_CreateTexture)(void*, uint32_t, int, int, int);
+typedef void        (*pfn_SDL_DestroyTexture)(void*);
+typedef int         (*pfn_SDL_UpdateTexture)(void*, const void*, const void*, int);
+typedef int         (*pfn_SDL_RenderClear)(void*);
+typedef int         (*pfn_SDL_RenderCopy)(void*, void*, const void*, const void*);
+typedef void        (*pfn_SDL_RenderPresent)(void*);
+typedef void        (*pfn_SDL_PumpEvents)(void);
+typedef int         (*pfn_SDL_ShowCursor)(int);
+
+typedef struct {
+    const char *name;
+    uint32_t bg, panel, panel2, ember, ember_bright, text, muted, border, ok, warn;
+} ThemeColors;
+
+/* Exact FireFly_RK3326_R36MAX_R36S (firefly/ui/theme.py) + Stump Final Firmware Palettes */
+static const ThemeColors g_themes[5] = {
+    { "AMBER",    0xFF1B1512u, 0xFF2A2119u, 0xFF221B15u, 0xFFD97A3Au, 0xFFF0A050u, 0xFFECDFC8u, 0xFF9C8D76u, 0xFF493C2Eu, 0xFF9CB876u, 0xFFE07A5Au },
+    { "PHOSPHOR", 0xFF0B120Cu, 0xFF142217u, 0xFF0F1A11u, 0xFF33FF66u, 0xFF66FF8Cu, 0xFFE2FCE6u, 0xFF6EA87Bu, 0xFF23452Au, 0xFF33FF66u, 0xFFFFCC33u },
+    { "OLED",     0xFF000000u, 0xFF141414u, 0xFF0A0A0Au, 0xFF4DA6FFu, 0xFF80BFFFu, 0xFFFFFFFFu, 0xFF9E9E9Eu, 0xFF333333u, 0xFF4DFF88u, 0xFFFFB84Du },
+    { "PAPER",    0xFFF5F2EBu, 0xFFE6E0D0u, 0xFFEDE8DAu, 0xFFA84814u, 0xFFC25B1Fu, 0xFF1F1C19u, 0xFF5C5447u, 0xFFC4BBA6u, 0xFF1B6E23u, 0xFFB85D00u },
+    { "TAVERN",   0xFF1A120Bu, 0xFF2B1D12u, 0xFF22170Eu, 0xFFE0A040u, 0xFFF5C063u, 0xFFF7EBD6u, 0xFFB59C76u, 0xFF573C24u, 0xFF9CB876u, 0xFFE07A5Au }
+};
+
+static void fill_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > PANEL_W) w = PANEL_W - x;
+    if (y + h > PANEL_H) h = PANEL_H - y;
+    if (w <= 0 || h <= 0) return;
+    for (int py = y; py < y + h; py++) {
+        uint32_t *row = fb + py * PANEL_W + x;
+        for (int px = 0; px < w; px++) row[px] = color;
+    }
+}
+
+static void draw_border(uint32_t *fb, int x, int y, int w, int h, int thick, uint32_t color) {
+    fill_rect(fb, x, y, w, thick, color);
+    fill_rect(fb, x, y + h - thick, w, thick, color);
+    fill_rect(fb, x, y, thick, h, color);
+    fill_rect(fb, x + w - thick, y, thick, h, color);
+}
+
+/* True 5x7 Pixel-Matrix Bitmap Font (35-bit row-major integer per glyph) */
+#define G57(a,b,c,d,e,f,g) ( \
+    ((uint64_t)(a) << 30) | ((uint64_t)(b) << 25) | ((uint64_t)(c) << 20) | \
+    ((uint64_t)(d) << 15) | ((uint64_t)(e) << 10) | ((uint64_t)(f) << 5)  | (uint64_t)(g) )
+
+static uint64_t glyph_bits5x7(char ch) {
+    unsigned char u = (unsigned char)ch;
+    if (u >= 'a' && u <= 'z') u = (unsigned char)(u - 32);
+    switch (u) {
+        case 'A': return G57(14, 17, 17, 31, 17, 17, 17);
+        case 'B': return G57(30, 17, 17, 30, 17, 17, 30);
+        case 'C': return G57(14, 17, 16, 16, 16, 17, 14);
+        case 'D': return G57(30, 17, 17, 17, 17, 17, 30);
+        case 'E': return G57(31, 16, 16, 30, 16, 16, 31);
+        case 'F': return G57(31, 16, 16, 30, 16, 16, 16);
+        case 'G': return G57(14, 17, 16, 23, 17, 17, 15);
+        case 'H': return G57(17, 17, 17, 31, 17, 17, 17);
+        case 'I': return G57(14,  4,  4,  4,  4,  4, 14);
+        case 'J': return G57( 7,  2,  2,  2, 18, 18, 12);
+        case 'K': return G57(17, 18, 20, 24, 20, 18, 17);
+        case 'L': return G57(16, 16, 16, 16, 16, 16, 31);
+        case 'M': return G57(17, 27, 21, 21, 17, 17, 17);
+        case 'N': return G57(17, 25, 21, 19, 17, 17, 17);
+        case 'O': return G57(14, 17, 17, 17, 17, 17, 14);
+        case 'P': return G57(30, 17, 17, 30, 16, 16, 16);
+        case 'Q': return G57(14, 17, 17, 17, 21, 18, 13);
+        case 'R': return G57(30, 17, 17, 30, 20, 18, 17);
+        case 'S': return G57(15, 16, 16, 14,  1,  1, 30);
+        case 'T': return G57(31,  4,  4,  4,  4,  4,  4);
+        case 'U': return G57(17, 17, 17, 17, 17, 17, 14);
+        case 'V': return G57(17, 17, 17, 17, 17, 10,  4);
+        case 'W': return G57(17, 17, 17, 21, 21, 27, 17);
+        case 'X': return G57(17, 17, 10,  4, 10, 17, 17);
+        case 'Y': return G57(17, 17, 10,  4,  4,  4,  4);
+        case 'Z': return G57(31,  1,  2,  4,  8, 16, 31);
+        case '0': return G57(14, 17, 19, 21, 25, 17, 14);
+        case '1': return G57( 4, 12,  4,  4,  4,  4, 14);
+        case '2': return G57(14, 17,  1,  6,  8, 16, 31);
+        case '3': return G57(30,  1,  1, 14,  1,  1, 30);
+        case '4': return G57( 2,  6, 10, 18, 31,  2,  2);
+        case '5': return G57(31, 16, 30,  1,  1, 17, 14);
+        case '6': return G57(14, 16, 16, 30, 17, 17, 14);
+        case '7': return G57(31,  1,  2,  4,  8,  8,  8);
+        case '8': return G57(14, 17, 17, 14, 17, 17, 14);
+        case '9': return G57(14, 17, 17, 15,  1,  1, 14);
+        case '-': return G57( 0,  0,  0, 31,  0,  0,  0);
+        case '_': return G57( 0,  0,  0,  0,  0,  0, 31);
+        case '.': return G57( 0,  0,  0,  0,  0, 12, 12);
+        case ',': return G57( 0,  0,  0,  0,  6,  6, 12);
+        case ':': return G57( 0, 12, 12,  0, 12, 12,  0);
+        case ';': return G57( 0, 12, 12,  0, 12,  4,  8);
+        case 39:  return G57( 4,  4,  8,  0,  0,  0,  0);
+        case '@': return G57(14, 17, 23, 21, 23, 16, 14);
+        case '/': return G57( 1,  2,  2,  4,  8,  8, 16);
+        case '!': return G57( 4,  4,  4,  4,  4,  0,  4);
+        case '?': return G57(14, 17,  1,  6,  4,  0,  4);
+        case '#': return G57(10, 31, 10, 10, 31, 10,  0);
+        case '+': return G57( 0,  4,  4, 31,  4,  4,  0);
+        case '=': return G57( 0,  0, 31,  0, 31,  0,  0);
+        case '<': return G57( 2,  4,  8, 16,  8,  4,  2);
+        case '>': return G57( 8,  4,  2,  1,  2,  4,  8);
+        case '(': return G57( 2,  4,  8,  8,  8,  4,  2);
+        case ')': return G57( 8,  4,  2,  2,  2,  4,  8);
+        case '[': return G57(14,  8,  8,  8,  8,  8, 14);
+        case ']': return G57(14,  2,  2,  2,  2,  2, 14);
+        case '%': return G57(25, 26,  2,  4,  8, 19, 19);
+        case '*': return G57( 0, 21, 14, 31, 14, 21,  0);
+        default:  return 0ULL;
+    }
+}
+
+static void draw_char_scaled(uint32_t *fb, int x, int y, char c, uint32_t fg, int scale, bool shadow) {
+    uint64_t bits = glyph_bits5x7(c);
+    if (!bits) return;
+    for (int row = 0; row < 7; row++) {
+        uint32_t rmask = (uint32_t)((bits >> ((6 - row) * 5)) & 0x1Fu);
+        for (int col = 0; col < 5; col++) {
+            if (rmask & (1u << (4 - col))) {
+                int px = x + col * scale;
+                int py = y + row * scale;
+                if (shadow) fill_rect(fb, px + 1, py + 1, scale, scale, 0xFF080808u);
+                fill_rect(fb, px, py, scale, scale, fg);
+            }
+        }
+    }
+}
+
+static void draw_text_s(uint32_t *fb, int x, int y, const char *s, uint32_t color, int scale, int max_chars) {
+    int count = 0;
+    int step = 6 * scale;
+    bool shadow = (color != 0xFF000000u && color != 0xFF1F1C19u);
+    while (*s && (max_chars <= 0 || count < max_chars)) {
+        if (x + step > PANEL_W - 4) break;
+        draw_char_scaled(fb, x, y, *s++, color, scale, shadow);
+        x += step;
+        count++;
+    }
+}
+
+/* ---- Standards-Compliant ISO/IEC 18004 QR Version 2-L (25x25) Encoder ---- */
+static void encode_qr_v2_l(const char *text, uint8_t grid[25][25]) {
+    uint8_t is_func[25][25];
+    memset(grid, 0, 25 * 25);
+    memset(is_func, 0, 25 * 25);
+
+    size_t len = strlen(text);
+    if (len > 32) len = 32;
+
+    uint8_t bits[280];
+    int nbits = 0;
+    bits[nbits++] = 0; bits[nbits++] = 1; bits[nbits++] = 0; bits[nbits++] = 0; /* Byte mode 0100 */
+    for (int i = 7; i >= 0; i--) bits[nbits++] = (uint8_t)((len >> i) & 1);
+    for (size_t k = 0; k < len; k++) {
+        uint8_t b = (uint8_t)text[k];
+        for (int i = 7; i >= 0; i--) bits[nbits++] = (uint8_t)((b >> i) & 1);
+    }
+    for (int i = 0; i < 4 && nbits < 272; i++) bits[nbits++] = 0;
+    while (nbits % 8 != 0) bits[nbits++] = 0;
+
+    uint8_t data[34];
+    int nbytes = nbits / 8;
+    for (int i = 0; i < nbytes; i++) {
+        uint8_t v = 0;
+        for (int b = 0; b < 8; b++) v = (uint8_t)((v << 1) | bits[i * 8 + b]);
+        data[i] = v;
+    }
+    const uint8_t pads[2] = { 0xECu, 0x11u };
+    for (int i = nbytes; i < 34; i++) data[i] = pads[(i - nbytes) & 1];
+
+    /* GF(256) tables with primitive polynomial 0x11D */
+    uint8_t gf_exp[512], gf_log[256];
+    memset(gf_log, 0, sizeof(gf_log));
+    int x = 1;
+    for (int i = 0; i < 255; i++) {
+        gf_exp[i] = (uint8_t)x;
+        gf_log[x] = (uint8_t)i;
+        x <<= 1;
+        if (x & 0x100) x ^= 0x11D;
+    }
+    for (int i = 255; i < 512; i++) gf_exp[i] = gf_exp[i - 255];
+
+    uint8_t gen[11];
+    memset(gen, 0, sizeof(gen));
+    gen[0] = 1;
+    int glen = 1;
+    for (int i = 0; i < 10; i++) {
+        uint8_t nxt[11];
+        memset(nxt, 0, sizeof(nxt));
+        for (int j = 0; j < glen; j++) {
+            uint8_t c = gen[j];
+            nxt[j] ^= c;
+            if (c) nxt[j + 1] ^= gf_exp[gf_log[c] + i];
+        }
+        glen++;
+        memcpy(gen, nxt, sizeof(gen));
+    }
+
+    uint8_t msg[44];
+    memset(msg, 0, sizeof(msg));
+    memcpy(msg, data, 34);
+    for (int i = 0; i < 34; i++) {
+        uint8_t coef = msg[i];
+        if (coef) {
+            for (int j = 1; j < 11; j++) {
+                if (gen[j]) msg[i + j] ^= gf_exp[gf_log[gen[j]] + gf_log[coef]];
+            }
+        }
+    }
+    uint8_t codewords[44];
+    memcpy(codewords, data, 34);
+    memcpy(codewords + 34, msg + 34, 10);
+
+    const int N = 25;
+    int f_origins[3][2] = { {0, 0}, {0, N - 7}, {N - 7, 0} };
+    for (int f = 0; f < 3; f++) {
+        int r0 = f_origins[f][0], c0 = f_origins[f][1];
+        for (int dr = -1; dr <= 7; dr++) {
+            for (int dc = -1; dc <= 7; dc++) {
+                int r = r0 + dr, c = c0 + dc;
+                if (r >= 0 && r < N && c >= 0 && c < N) {
+                    bool out_ring = (dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6 && (dr == 0 || dr == 6 || dc == 0 || dc == 6));
+                    bool in_box   = (dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4);
+                    grid[r][c] = (out_ring || in_box) ? 1 : 0;
+                    is_func[r][c] = 1;
+                }
+            }
+        }
+    }
+
+    /* Version 2 Alignment pattern at (18, 18) */
+    for (int dr = -2; dr <= 2; dr++) {
+        for (int dc = -2; dc <= 2; dc++) {
+            int ad = (abs(dr) > abs(dc)) ? abs(dr) : abs(dc);
+            grid[18 + dr][18 + dc] = (ad == 0 || ad == 2) ? 1 : 0;
+            is_func[18 + dr][18 + dc] = 1;
+        }
+    }
+
+    /* Timing patterns */
+    for (int i = 8; i < N - 8; i++) {
+        grid[6][i] = (i % 2 == 0) ? 1 : 0; is_func[6][i] = 1;
+        grid[i][6] = (i % 2 == 0) ? 1 : 0; is_func[i][6] = 1;
+    }
+
+    /* Dark module & reserved format areas */
+    grid[N - 8][8] = 1; is_func[N - 8][8] = 1;
+    for (int i = 0; i < 9; i++) {
+        if (!is_func[8][i]) { grid[8][i] = 0; is_func[8][i] = 1; }
+        if (!is_func[i][8]) { grid[i][8] = 0; is_func[i][8] = 1; }
+    }
+    for (int i = 0; i < 8; i++) {
+        if (!is_func[8][N - 1 - i]) { grid[8][N - 1 - i] = 0; is_func[8][N - 1 - i] = 1; }
+        if (!is_func[N - 1 - i][8]) { grid[N - 1 - i][8] = 0; is_func[N - 1 - i][8] = 1; }
+    }
+
+    uint8_t all_bits[360];
+    int ab_len = 0;
+    for (int cw = 0; cw < 44; cw++) {
+        for (int i = 7; i >= 0; i--) all_bits[ab_len++] = (uint8_t)((codewords[cw] >> i) & 1);
+    }
+    for (int i = 0; i < 7; i++) all_bits[ab_len++] = 0;
+
+    int bit_idx = 0;
+    bool up = true;
+    for (int col = N - 1; col > 0; col -= 2) {
+        if (col == 6) col--;
+        for (int step = 0; step < N; step++) {
+            int r = up ? (N - 1 - step) : step;
+            for (int dc = 0; dc >= -1; dc--) {
+                int c = col + dc;
+                if (!is_func[r][c]) {
+                    uint8_t b = (bit_idx < ab_len) ? all_bits[bit_idx++] : 0;
+                    if ((r + c) % 2 == 0) b ^= 1; /* Mask 0 */
+                    grid[r][c] = b;
+                }
+            }
+        }
+        up = !up;
+    }
+
+    /* Format bits for Level L (01), Mask 0 (000) -> 0x77C4 */
+    const uint16_t fmt = 0x77C4u;
+    const int tl_r[15] = {8,8,8,8,8,8,8,8,7,5,4,3,2,1,0};
+    const int tl_c[15] = {0,1,2,3,4,5,7,8,8,8,8,8,8,8,8};
+    for (int i = 0; i < 15; i++) {
+        uint8_t fb_bit = (uint8_t)((fmt >> (14 - i)) & 1u);
+        grid[tl_r[i]][tl_c[i]] = fb_bit;
+    }
+    for (int i = 0; i < 7; i++) grid[N - 1 - i][8] = (uint8_t)((fmt >> (14 - i)) & 1u);
+    for (int i = 7; i < 15; i++) grid[8][N - 15 + i] = (uint8_t)((fmt >> (14 - i)) & 1u);
+}
+
+/* ---- Multi-Transport Hardware Scanner (Blueway RT3070, Eth, Heltec V3 RNode, USB Keyboard) ---- */
+typedef struct {
+    bool wifi_online;
+    char wifi_if[24];
+    char wifi_ip[40];
+    char wifi_driver[32];
+    char wifi_mac[24];
+    bool is_rt3070;
+    int  wifi_rssi_dbm;
+
+    bool eth_online;
+    char eth_if[24];
+    char eth_ip[40];
+
+    bool bt_online;
+    char bt_name[24];
+
+    bool lora_online;
+    char lora_dev[32];
+
+    bool usb_kbd_online;
+    char usb_kbd_name[32];
+
+    char primary_ip[40];
+} TransportStatus;
+
+static void scan_transports(TransportStatus *ts) {
+    memset(ts, 0, sizeof(*ts));
+    snprintf(ts->primary_ip, sizeof(ts->primary_ip), "127.0.0.1");
+    ts->wifi_rssi_dbm = -48;
+
+    DIR *d = opendir("/sys/class/net");
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (ent->d_name[0] == '.' || strcmp(ent->d_name, "lo") == 0) continue;
+            char wpath[320], ppath[320], uevent[320], apath[320];
+            snprintf(wpath, sizeof(wpath), "/sys/class/net/%s/wireless", ent->d_name);
+            snprintf(ppath, sizeof(ppath), "/sys/class/net/%s/phy80211", ent->d_name);
+            bool is_wlan = (access(wpath, F_OK) == 0 || access(ppath, F_OK) == 0 ||
+                            strncmp(ent->d_name, "wl", 2) == 0 || strncmp(ent->d_name, "ra", 2) == 0);
+            if (is_wlan) {
+                char mac_buf[32] = "";
+                snprintf(apath, sizeof(apath), "/sys/class/net/%s/address", ent->d_name);
+                FILE *af = fopen(apath, "r");
+                if (af) {
+                    if (fgets(mac_buf, sizeof(mac_buf), af)) {
+                        char *nl = strchr(mac_buf, '\n');
+                        if (nl) *nl = '\0';
+                    }
+                    fclose(af);
+                }
+                char drv_buf[32] = "USB-WIFI";
+                bool found_rt = (strstr(mac_buf, "00:0f:00:5e:11:ee") != NULL ||
+                                 strstr(mac_buf, "11:ee") != NULL ||
+                                 (strlen(mac_buf) >= 2 && strcmp(mac_buf + strlen(mac_buf) - 2, "ee") == 0));
+                snprintf(uevent, sizeof(uevent), "/sys/class/net/%s/device/uevent", ent->d_name);
+                FILE *uf = fopen(uevent, "r");
+                if (uf) {
+                    char line[128];
+                    while (fgets(line, sizeof(line), uf)) {
+                        if (strncmp(line, "DRIVER=", 7) == 0) {
+                            char *nl = strchr(line + 7, '\n');
+                            if (nl) *nl = '\0';
+                            snprintf(drv_buf, sizeof(drv_buf), "%.31s", line + 7);
+                            if (strstr(drv_buf, "rt2800") != NULL) found_rt = true;
+                        } else if (strstr(line, "148f") != NULL || strstr(line, "3070") != NULL) {
+                            found_rt = true;
+                        }
+                    }
+                    fclose(uf);
+                }
+                /* Prefer the Blueway RT3070 (00:0f:00:5e:11:ee / rt2800usb) if multiple wlans exist */
+                if (!ts->wifi_online || (found_rt && !ts->is_rt3070)) {
+                    ts->wifi_online = true;
+                    ts->is_rt3070 = found_rt;
+                    snprintf(ts->wifi_if, sizeof(ts->wifi_if), "%.23s", ent->d_name);
+                    snprintf(ts->wifi_ip, sizeof(ts->wifi_ip), "DHCP/READY");
+                    snprintf(ts->wifi_driver, sizeof(ts->wifi_driver), "%.31s", drv_buf);
+                    snprintf(ts->wifi_mac, sizeof(ts->wifi_mac), "%.23s", mac_buf[0] ? mac_buf : "00:0f:00:5e:11:ee");
+                }
+            } else if (!is_wlan && !ts->eth_online &&
+                       (strncmp(ent->d_name, "eth", 3) == 0 || strncmp(ent->d_name, "usb", 3) == 0 ||
+                        strncmp(ent->d_name, "en", 2) == 0 || strncmp(ent->d_name, "rndis", 5) == 0)) {
+                ts->eth_online = true;
+                snprintf(ts->eth_if, sizeof(ts->eth_if), "%.23s", ent->d_name);
+                snprintf(ts->eth_ip, sizeof(ts->eth_ip), "LINK-UP");
+            }
+        }
+        closedir(d);
+    }
+
+    FILE *wf = fopen("/proc/net/wireless", "r");
+    if (wf) {
+        char line[256];
+        int lno = 0;
+        while (fgets(line, sizeof(line), wf)) {
+            lno++;
+            if (lno <= 2) continue;
+            char ifname[32];
+            int status = 0;
+            float link = 0.0f, level = 0.0f;
+            if (sscanf(line, " %31[^:]: %x %f %f", ifname, &status, &link, &level) >= 3) {
+                if (!ts->wifi_online) {
+                    ts->wifi_online = true;
+                    snprintf(ts->wifi_if, sizeof(ts->wifi_if), "%.23s", ifname);
+                    snprintf(ts->wifi_driver, sizeof(ts->wifi_driver), "rt2800usb");
+                }
+                ts->wifi_rssi_dbm = (level < 0.0f) ? (int)level : (int)(level - 100.0f);
+            }
+        }
+        fclose(wf);
+    }
+
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == 0) {
+        for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+            if (!ifa->ifa_name || !ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
+            if (strcmp(ifa->ifa_name, "lo") == 0) continue;
+            char ip[40];
+            struct sockaddr_in *sa = (struct sockaddr_in *)ifa->ifa_addr;
+            inet_ntop(AF_INET, &(sa->sin_addr), ip, sizeof(ip));
+
+            if (strncmp(ifa->ifa_name, "wl", 2) == 0 || strncmp(ifa->ifa_name, "ra", 2) == 0 ||
+                strcmp(ifa->ifa_name, ts->wifi_if) == 0) {
+                ts->wifi_online = true;
+                if (strcmp(ifa->ifa_name, ts->wifi_if) == 0 || strcmp(ts->wifi_ip, "DHCP/READY") == 0) {
+                    snprintf(ts->wifi_ip, sizeof(ts->wifi_ip), "%.39s", ip);
+                }
+                snprintf(ts->primary_ip, sizeof(ts->primary_ip), "%.39s", ip);
+            } else {
+                ts->eth_online = true;
+                snprintf(ts->eth_if, sizeof(ts->eth_if), "%.23s", ifa->ifa_name);
+                snprintf(ts->eth_ip, sizeof(ts->eth_ip), "%.39s", ip);
+                if (strcmp(ts->primary_ip, "127.0.0.1") == 0) {
+                    snprintf(ts->primary_ip, sizeof(ts->primary_ip), "%.39s", ip);
+                }
+            }
+        }
+        freeifaddrs(ifaddr);
+    }
+
+    if (access("/sys/class/bluetooth/hci0", F_OK) == 0) {
+        ts->bt_online = true;
+        snprintf(ts->bt_name, sizeof(ts->bt_name), "HCI0 READY");
+    }
+    const char *serials[] = { "/dev/ttyACM0", "/dev/ttyUSB0", "/dev/ttyACM1", "/dev/ttyUSB1", NULL };
+    for (int i = 0; serials[i]; i++) {
+        if (access(serials[i], F_OK) == 0) {
+            ts->lora_online = true;
+            snprintf(ts->lora_dev, sizeof(ts->lora_dev), "HELTEC V3 (%s)", serials[i] + 5);
+            break;
+        }
+    }
+
+    /* Detect external USB Keyboard on USB hub via /proc/bus/input/devices */
+    FILE *idf = fopen("/proc/bus/input/devices", "r");
+    if (idf) {
+        char line[256];
+        char cur_name[64] = "";
+        while (fgets(line, sizeof(line), idf)) {
+            if (strncmp(line, "N: Name=", 8) == 0 && strlen(line) > 9) {
+                snprintf(cur_name, sizeof(cur_name), "%.63s", line + 9);
+                char *q = strchr(cur_name, 34);
+                if (q) *q = '\0';
+            } else if (strncmp(line, "H: Handlers=", 12) == 0) {
+                if (strstr(line, "kbd") &&
+                    !strstr(cur_name, "rk8xx") &&
+                    !strstr(cur_name, "gpio") &&
+                    !strstr(cur_name, "joypad") &&
+                    !strstr(cur_name, " retrogame") &&
+                    !strstr(cur_name, "OpenSimHardware")) {
+                    ts->usb_kbd_online = true;
+                    snprintf(ts->usb_kbd_name, sizeof(ts->usb_kbd_name), "%.31s",
+                             cur_name[0] ? cur_name : "USB HID KEYBOARD");
+                }
+            }
+        }
+        fclose(idf);
+    }
+}
+
+#define STUMP_ENGINE_VERSION "v2.0.0-r36max"
+#define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
+#define MAX_LOG_LINES 10
+#define MAX_DBG_LINES 16
+
+/* R36MAX Physical Gamepad Button Mapping:
+ *   Physical A (Right / East)  = ev.code 305 (BTN_EAST)  -> STRICT ACCEPT / CONFIRM
+ *   Physical B (Bottom / South)= ev.code 304 (BTN_SOUTH) -> STRICT CANCEL / BACK / REVERT
+ *   Physical X (Top / North)   = ev.code 307 (BTN_NORTH) -> SECONDARY / DELETE / QR
+ *   Physical Y (Left / West)   = ev.code 308 (BTN_WEST)  -> OSK / TF BACKUP
+ */
+#define R36_BTN_A_ACCEPT 305
+#define R36_BTN_B_CANCEL 304
+
+typedef struct {
+    char nick[18];
+    char body[46];
+    bool is_sys;
+} ChatLine;
+
+typedef struct {
+    char id[28];
+    char sig[16];
+    char title[46];
+    char body[50];
+    bool checked;
+} BoardItem;
+
+typedef struct {
+    char name[36];
+    int  size_kb;
+    char cat[8];
+    bool checked;
+} ShelfItem;
+
+typedef struct {
+    char ssid[32];
+    char sec[10];
+    int  signal;
+    bool active;
+} WifiSsidItem;
+
+typedef struct {
+    volatile bool   running;
+    volatile int    chime_freq;
+    volatile int    chime_ms;
+    int             theme_idx;
+    int             tab_idx;       /* 0:CHAT, 1:BOARD, 2:FILES, 3:WIFI, 4:SETUP/CHAIN v1.8 */
+    int             room_idx;
+    int             auth_mode_idx;
+    int             cmd_cursor;
+    int             board_cursor;  /* 0..board_count-1 = items, board_count = Action Bar */
+    int             board_bar_mode;/* 0 = BACKUP CHECKED->TF, 1 = DELETE CHECKED, 2 = POST PRESET */
+    int             board_preset_idx;
+    int             file_cursor;   /* 0..file_count-1 = items, file_count = Action Bar */
+    int             file_bar_mode; /* 0 = BACKUP CHECKED->TF, 1 = DELETE CHECKED, 2 = SHARE FILE */
+    int             file_action_idx;
+    bool            verified;
+    int             beacons_sent;
+    int             rx_packets;
+    int             udp_sock;
+    int             ipc_sock;
+    int             suppress_poll_frames;
+    uint64_t        last_btn_ms;
+    uint64_t        last_dpad_ms;
+    uint64_t        busy_until_ms;
+    uint64_t        radio_lock_until_ms;
+    bool            py_busy;
+    char            busy_msg[64];
+    int             last_ev_code;
+    char            ver_str[28];
+    char            build_str[28];
+    bool            http80_ok;
+    bool            http8080_ok;
+    char            bridge_lan_ip[28];
+    int             tf_backup_count;
+    char            node_lxmf[36];
+    char            rnode_status[24];
+    int             mesh_peers;
+    bool            ap_active;
+    char            ap_if[20];
+    char            ap_mac[24];
+    char            ap_driver[20];
+    char            ap_ssid[24];
+    int             ap_clients;
+    /* SandBox_Stump_On Chain State (UDP :4242 ChainHub / ChainUplink + UDP :4244 Discovery) */
+    bool            chain_enabled;
+    int             chain_role_idx; /* 0 = AUTO (LAN+AP), 1 = ROOT (FIRST STUMP), 2 = MEMBER (JOIN LAN) */
+    bool            chain_has_secret;
+    char            chain_secret[52];
+    char            chain_id[20];
+    int             chain_peers;
+    char            chain_peer_ip[28];
+    char            chain_status_msg[64];
+    int             qr_mode;       /* 0 = HTTP Portal URL QR, 1 = WIFI Auto-Join QR */
+    WifiSsidItem    wifi_list[6];
+    int             wifi_count;
+    int             wifi_cursor;   /* 0 = Stage Radio Mode, 1 = Wi-Fi Tool Bar, 2.. = Stage SSID */
+    int             wifi_bar_mode; /* 0 = SCAN WIFI, 1 = SWITCH QR MODE, 2 = PASSWORD OSK */
+    char            wifi_status_msg[80];
+    /* Staged Network Settings Revision (Panel 4 & Panel 5) */
+    bool            net_staged_init;
+    bool            net_staged_dirty;
+    bool            net_staged_ap;
+    char            net_staged_ssid[32];
+    char            net_staged_pass[64];
+    int             net_ssid_cycle_idx;
+    int             rev_cursor;    /* Panel 5 rows: 0=Mode, 1=SSID, 2=ChainSecret/Role, 3=Apply/Revert, 4=ToolBar, 5=Logs */
+    int             debug_bar_mode;/* 0 = SCAN & LINK LAN CHAIN, 1 = EDIT CHAIN SECRET, 2 = EXPORT DIAG->TF, 3 = HEAL HTTP */
+    int             debug_scroll;
+    char            debug_logs[MAX_DBG_LINES][64];
+    int             debug_log_count;
+    bool            confirm_open;
+    int             confirm_type;   /* 1 = Billboard Notices, 2 = Shared Files, 3 = Network Revision */
+    int             confirm_choice; /* 0 = NO / CANCEL, 1 = YES / ACCEPT */
+    char            confirm_label[56];
+    bool            osk_open;
+    int             osk_target;     /* 0 = default tab input, 1 = Chain Secret editor in Panel 5 */
+    int             osk_row;
+    int             osk_col;
+    bool            shift_held;
+    char            input_buf[96];
+    int             input_len;
+    TransportStatus net;
+    ChatLine        rooms[3][MAX_LOG_LINES];
+    int             room_counts[3];
+    int             room_users[3];
+    BoardItem       board[8];
+    int             board_count;
+    ShelfItem       files[8];
+    int             file_count;
+    int             used_kb;
+    int             ceil_kb;
+    uint8_t         qr_grid[25][25];
+    char            qr_url[64];
+} StumpPocketState;
+
+static StumpPocketState g_st;
+
+static uint64_t monotonic_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+}
+
+static void set_ui_busy(const char *msg, uint64_t duration_ms) {
+    g_st.busy_until_ms = monotonic_ms() + duration_ms;
+    snprintf(g_st.busy_msg, sizeof(g_st.busy_msg), "%.62s", msg ? msg : "IN PROCESS...");
+}
+
+static bool is_ui_busy(void) {
+    return (monotonic_ms() < g_st.busy_until_ms) || g_st.py_busy;
+}
+
+static void handle_sig(int sig) {
+    (void)sig;
+    g_st.running = false;
+}
+
+static const char *ROOM_SLUGS[3] = { "main", "lora-mesh", "wifi-mesh" };
+static const char *ROOM_NAMES[3] = { "#MAIN", "#LORA-MESH", "#WIFI-MESH" };
+
+static const char *QUICK_CMDS[6] = {
+    "1. /WHOAMI + /NAMES",
+    "2. /AUTH CHALLENGE+SIGN",
+    "3. !FIND JARDINAGE",
+    "4. !ROLL 2D6 TAVERN",
+    "5. ANNOUNCE ON MESH",
+    "6. SEND HELLO TO ROOM"
+};
+
+/* 4x10 On-Screen Keyboard (OSK) Grid (Y to open/close, A to type, B to cancel/close) */
+static const char *OSK_LABELS[4][10] = {
+    { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" },
+    { "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P" },
+    { "A", "S", "D", "F", "G", "H", "J", "K", "L", "-" },
+    { "Z", "X", "C", "V", "B", "N", "M", "SPC", "DEL", "OK" }
+};
+
+static const char *BOARD_PRESET_TITLES[5] = {
+    "R36MAX NODE ONLINE & READY",
+    "BLUEWAY RT3070 CAM AP LIVE",
+    "MEET AT BASE / CHANNEL 6",
+    "NEW FILES SHARED IN /FILES",
+    "HELTEC V3 + WIFI CHAIN OK"
+};
+
+static const char *BOARD_PRESET_BODIES[5] = {
+    "Posted from R36MAX handheld operator console.",
+    "Join this Stump's Wi-Fi hotspot; the page opens itself.",
+    "Check #main or #wifi-mesh room for coordinates.",
+    "Download offline guides and logs from /files.",
+    "RT3070 20dBm AP + Reticulum LoRa relay active."
+};
+
+static const char *FILE_ACTION_LABELS[3] = {
+    "EXPORT LIVE MESH LOG (.TXT)",
+    "SHARE FIELD GUIDE (.MD)",
+    "IMPORT FROM DROP FOLDER"
+};
+
+static void trigger_chime(int freq, int ms) {
+    g_st.chime_freq = freq;
+    g_st.chime_ms = ms;
+}
+
+/* Send command to Python bridge via UDP 127.0.0.1:42421 FIRST; only write to /dev/shm/stump_cmd.txt
+ * if UDP sendto fails, preventing duplicate command execution! */
+static void send_bridge_cmd(const char *cmd_line) {
+    ssize_t sent = -1;
+    if (g_st.ipc_sock >= 0) {
+        struct sockaddr_in dst;
+        memset(&dst, 0, sizeof(dst));
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(IPC_UDP_PORT);
+        dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        sent = sendto(g_st.ipc_sock, cmd_line, strlen(cmd_line), MSG_DONTWAIT,
+                      (struct sockaddr *)&dst, sizeof(dst));
+    }
+    if (sent <= 0) {
+        int fd = open(CMD_QUEUE_FILE, O_WRONLY | O_CREAT | O_APPEND, 0666);
+        if (fd >= 0) {
+            dprintf(fd, "%s\n", cmd_line);
+            close(fd);
+        }
+    }
+    g_st.suppress_poll_frames = 16;
+}
+
+static void push_chat_local(int room, const char *nick, const char *body, bool is_sys) {
+    if (room < 0 || room > 2) return;
+    int idx = g_st.room_counts[room];
+    if (idx >= MAX_LOG_LINES) {
+        memmove(&g_st.rooms[room][0], &g_st.rooms[room][1], sizeof(ChatLine) * (MAX_LOG_LINES - 1));
+        idx = MAX_LOG_LINES - 1;
+    } else {
+        g_st.room_counts[room]++;
+    }
+    snprintf(g_st.rooms[room][idx].nick, sizeof(g_st.rooms[room][idx].nick), "%.17s", nick);
+    snprintf(g_st.rooms[room][idx].body, sizeof(g_st.rooms[room][idx].body), "%.45s", body);
+    g_st.rooms[room][idx].is_sys = is_sys;
+}
+
+static void input_append_char(char c) {
+    if (g_st.input_len < (int)sizeof(g_st.input_buf) - 2) {
+        g_st.input_buf[g_st.input_len++] = c;
+        g_st.input_buf[g_st.input_len] = '\0';
+    }
+}
+
+static void input_backspace(void) {
+    if (g_st.input_len > 0) {
+        g_st.input_buf[--g_st.input_len] = '\0';
+    }
+}
+
+static void broadcast_udp_beacon(const char *type, const char *msg);
+static void update_qr_if_needed(void);
+static void sync_disk_fallback(void);
+
+static int count_checked_boards(void) {
+    int c = 0;
+    for (int i = 0; i < g_st.board_count; i++) if (g_st.board[i].checked) c++;
+    return c;
+}
+
+static int count_checked_files(void) {
+    int c = 0;
+    for (int i = 0; i < g_st.file_count; i++) if (g_st.files[i].checked) c++;
+    return c;
+}
+
+static void commit_chain_settings(const char *new_secret, int role_idx) {
+    const char *rmode = (role_idx == 1) ? "root" : ((role_idx == 2) ? "member" : "auto");
+    if (new_secret) {
+        snprintf(g_st.chain_secret, sizeof(g_st.chain_secret), "%.50s", new_secret);
+        g_st.chain_has_secret = (g_st.chain_secret[0] != '\0');
+    }
+    g_st.chain_role_idx = role_idx;
+    char cmd[220];
+    snprintf(cmd, sizeof(cmd), "CHAIN_SET|%s|%s|", g_st.chain_secret, rmode);
+    send_bridge_cmd(cmd);
+    set_ui_busy("IN PROCESS: APPLYING CHAIN SECRET & LINKING LAN...", 2600);
+    trigger_chime(840, 65);
+}
+
+static void open_chain_secret_osk(void) {
+    g_st.osk_target = 1;
+    g_st.osk_open = true;
+    snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%.50s", g_st.chain_secret);
+    g_st.input_len = (int)strlen(g_st.input_buf);
+    trigger_chime(740, 45);
+}
+
+static void revert_staged_network_revision(void) {
+    g_st.net_staged_ap = g_st.ap_active;
+    g_st.net_staged_ssid[0] = '\0';
+    for (int i = 0; i < g_st.wifi_count; i++) {
+        if (g_st.wifi_list[i].active && g_st.wifi_list[i].ssid[0]) {
+            snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s", g_st.wifi_list[i].ssid);
+            break;
+        }
+    }
+    g_st.net_staged_pass[0] = '\0';
+    g_st.net_staged_dirty = false;
+    g_st.net_staged_init = true;
+}
+
+static void apply_staged_network_revision(void) {
+    uint64_t now = monotonic_ms();
+    if (now < g_st.radio_lock_until_ms) {
+        set_ui_busy("IN PROCESS: RADIO BUSY, WAIT A MOMENT...", 1600);
+        trigger_chime(340, 45);
+        return;
+    }
+    g_st.radio_lock_until_ms = now + 5500ULL;
+    if (g_st.net_staged_ap) {
+        g_st.ap_active = true;
+        send_bridge_cmd("NET_APPLY|AP");
+        g_st.suppress_poll_frames = 300;
+        set_ui_busy("IN PROCESS: TURNING THE HOTSPOT ON...", 5200);
+        snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg),
+                 "HOTSPOT ON: %.40s", g_st.ap_ssid[0] ? g_st.ap_ssid : "STUMP");
+        trigger_chime(880, 85);
+    } else {
+        g_st.ap_active = false;
+        char cmd[256];
+        const char *pw = (g_st.osk_target == 0 && g_st.input_len > 0) ? g_st.input_buf : g_st.net_staged_pass;
+        snprintf(cmd, sizeof(cmd), "NET_APPLY|LAN|%s|%s", g_st.net_staged_ssid, pw);
+        send_bridge_cmd(cmd);
+        g_st.suppress_poll_frames = 300;
+        char bmsg[64];
+        snprintf(bmsg, sizeof(bmsg), "IN PROCESS: APPLYING LOCAL LAN (%.22s)...",
+                 g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "SAVED DHCP");
+        set_ui_busy(bmsg, 5200);
+        snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg),
+                 "LAN APPLIED: %.26s",
+                 g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "SAVED DHCP");
+        trigger_chime(784, 80);
+    }
+    g_st.net_staged_dirty = false;
+    g_st.osk_open = false;
+    update_qr_if_needed();
+}
+
+static void open_network_revision_confirm(void) {
+    g_st.confirm_open = true;
+    g_st.confirm_type = 3;
+    g_st.confirm_choice = 1; /* Default highlight on YES, APPLY so [A] accepts and [B] cancels */
+    if (g_st.net_staged_ap) {
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label),
+                 "HOTSPOT: %.40s", g_st.ap_ssid[0] ? g_st.ap_ssid : "STUMP");
+    } else {
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label),
+                 "LOCAL LAN WIFI: %s",
+                 g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "SAVED WIFI DHCP");
+    }
+    trigger_chime(660, 45);
+}
+
+static void action_wifi_tab_confirm(void) {
+    if (g_st.wifi_cursor <= 0) {
+        /* Row 0: Stage selected radio mode and jump to Panel 5 (5:SETUP) for review before applying */
+        g_st.net_staged_dirty = true;
+        g_st.tab_idx = 4;
+        g_st.rev_cursor = 3; /* Highlight [APPLY REVISION] row in Panel 5 */
+        set_ui_busy("STAGED IN PANEL 5: PRESS [A] TO APPLY OR [B] TO CANCEL", 2200);
+        trigger_chime(740, 55);
+    } else if (g_st.wifi_cursor == 1) {
+        /* Row 1: Utility Toggle Bar (0=Set Chain Secret OSK, 1=Scan LAN Chain, 2=Rescan Wi-Fi, 3=Wi-Fi Pass OSK) */
+        int m = g_st.wifi_bar_mode % 4;
+        if (m == 0) {
+            open_chain_secret_osk();
+        } else if (m == 1) {
+            send_bridge_cmd("CHAIN_SCAN");
+            set_ui_busy("IN PROCESS: SCANNING LAN FOR STUMP CHAIN PEERS...", 3000);
+            trigger_chime(880, 65);
+        } else if (m == 2) {
+            send_bridge_cmd("WIFI_SCAN");
+            set_ui_busy("IN PROCESS: SCANNING 2.4GHZ WIFI...", 4000);
+            snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "SCANNING 2.4GHZ WIFI NETWORKS...");
+            trigger_chime(700, 50);
+        } else {
+            g_st.osk_target = 0;
+            g_st.input_len = (int)strlen(g_st.net_staged_pass);
+            snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%s", g_st.net_staged_pass);
+            g_st.osk_open = !g_st.osk_open;
+            trigger_chime(g_st.osk_open ? 740 : 520, 45);
+        }
+    } else if (g_st.wifi_cursor - 2 < g_st.wifi_count) {
+        /* Rows 2..: Stage selected Wi-Fi SSID (+ optional password) into Panel 5 for revision! */
+        int widx = g_st.wifi_cursor - 2;
+        g_st.net_staged_ap = false;
+        snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s", g_st.wifi_list[widx].ssid);
+        if (g_st.input_len > 0 && g_st.osk_target == 0) {
+            snprintf(g_st.net_staged_pass, sizeof(g_st.net_staged_pass), "%.63s", g_st.input_buf);
+        }
+        g_st.net_staged_dirty = true;
+        g_st.osk_open = false;
+        g_st.tab_idx = 4;
+        g_st.rev_cursor = 3; /* Jump to Panel 5 [APPLY REVISION] row */
+        char bmsg[64];
+        snprintf(bmsg, sizeof(bmsg), "STAGED LAN SSID %.22s -> REVIEW IN PANEL 5", g_st.net_staged_ssid);
+        set_ui_busy(bmsg, 2400);
+        trigger_chime(780, 60);
+    }
+}
+
+static void send_typed_chat(void) {
+    if (g_st.tab_idx == 4 || g_st.osk_target == 1) {
+        commit_chain_settings(g_st.input_buf, g_st.chain_role_idx);
+        g_st.osk_open = false;
+        g_st.osk_target = 0;
+        g_st.input_len = 0;
+        g_st.input_buf[0] = '\0';
+        return;
+    }
+    if (g_st.tab_idx == 3) {
+        snprintf(g_st.net_staged_pass, sizeof(g_st.net_staged_pass), "%.63s", g_st.input_buf);
+        g_st.osk_open = false;
+        set_ui_busy("WIFI PASSWORD SAVED TO STAGED REVISION", 1500);
+        trigger_chime(740, 45);
+        return;
+    }
+    if (g_st.input_len <= 0) return;
+    int r = g_st.room_idx;
+    const char *rslug = ROOM_SLUGS[r];
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "RRC|%s|%s", rslug, g_st.input_buf);
+    send_bridge_cmd(cmd);
+    broadcast_udp_beacon("CHAT", g_st.input_buf);
+    push_chat_local(r, "r36max", g_st.input_buf, false);
+    g_st.input_len = 0;
+    g_st.input_buf[0] = '\0';
+    set_ui_busy("IN PROCESS: SENDING MESSAGE TO MESH...", 1000);
+    trigger_chime(840, 55);
+}
+
+static void execute_osk_key(void) {
+    int r = g_st.osk_row;
+    int c = g_st.osk_col;
+    if (r == 3 && c == 7) {
+        input_append_char(' ');
+        trigger_chime(520, 20);
+    } else if (r == 3 && c == 8) {
+        input_backspace();
+        trigger_chime(420, 25);
+    } else if (r == 3 && c == 9) {
+        send_typed_chat();
+    } else {
+        const char *lbl = OSK_LABELS[r][c];
+        if (lbl && lbl[0]) {
+            char ch = lbl[0];
+            if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+            input_append_char(ch);
+            trigger_chime(600, 20);
+        }
+    }
+}
+
+static char translate_linux_key(uint16_t code, bool shift) {
+    switch (code) {
+        case KEY_1: return shift ? '!' : '1';
+        case KEY_2: return shift ? '@' : '2';
+        case KEY_3: return shift ? '#' : '3';
+        case KEY_4: return shift ? '$' : '4';
+        case KEY_5: return shift ? '%' : '5';
+        case KEY_6: return shift ? '^' : '6';
+        case KEY_7: return shift ? '&' : '7';
+        case KEY_8: return shift ? '*' : '8';
+        case KEY_9: return shift ? '(' : '9';
+        case KEY_0: return shift ? ')' : '0';
+        case KEY_MINUS: return shift ? '_' : '-';
+        case KEY_EQUAL: return shift ? '+' : '=';
+        case KEY_Q: return shift ? 'Q' : 'q';
+        case KEY_W: return shift ? 'W' : 'w';
+        case KEY_E: return shift ? 'E' : 'e';
+        case KEY_R: return shift ? 'R' : 'r';
+        case KEY_T: return shift ? 'T' : 't';
+        case KEY_Y: return shift ? 'Y' : 'y';
+        case KEY_U: return shift ? 'U' : 'u';
+        case KEY_I: return shift ? 'I' : 'i';
+        case KEY_O: return shift ? 'O' : 'o';
+        case KEY_P: return shift ? 'P' : 'p';
+        case KEY_A: return shift ? 'A' : 'a';
+        case KEY_S: return shift ? 'S' : 's';
+        case KEY_D: return shift ? 'D' : 'd';
+        case KEY_F: return shift ? 'F' : 'f';
+        case KEY_G: return shift ? 'G' : 'g';
+        case KEY_H: return shift ? 'H' : 'h';
+        case KEY_J: return shift ? 'J' : 'j';
+        case KEY_K: return shift ? 'K' : 'k';
+        case KEY_L: return shift ? 'L' : 'l';
+        case KEY_Z: return shift ? 'Z' : 'z';
+        case KEY_X: return shift ? 'X' : 'x';
+        case KEY_C: return shift ? 'C' : 'c';
+        case KEY_V: return shift ? 'V' : 'v';
+        case KEY_B: return shift ? 'B' : 'b';
+        case KEY_N: return shift ? 'N' : 'n';
+        case KEY_M: return shift ? 'M' : 'm';
+        case KEY_SPACE: return ' ';
+        case KEY_SLASH: return shift ? '?' : '/';
+        case KEY_DOT: return shift ? '>' : '.';
+        case KEY_COMMA: return shift ? '<' : ',';
+        case KEY_SEMICOLON: return shift ? ':' : ';';
+        case KEY_APOSTROPHE: return shift ? (char)34 : (char)39;
+        case KEY_LEFTBRACE: return '[';
+        case KEY_RIGHTBRACE: return ']';
+        default: return 0;
+    }
+}
+
+static void sync_disk_fallback(void) {
+    /* v2.0: no live file means the feed (and so the Stump) isn't up yet:
+     * say so, rather than reading the Stump's card behind its back. */
+    snprintf(g_st.node_lxmf, sizeof(g_st.node_lxmf), "WAITING FOR THE STUMP");
+}
+
+static void poll_live_bridge(void) {
+    if (g_st.suppress_poll_frames > 0) return;
+    FILE *f = fopen(LIVE_STATE_FILE, "r");
+    if (!f) {
+        sync_disk_fallback();
+        return;
+    }
+    /* Preserve existing checked [X] states by ID / filename across live refreshes */
+    char checked_board_ids[8][28];
+    int checked_board_n = 0;
+    for (int i = 0; i < g_st.board_count && i < 8; i++) {
+        if (g_st.board[i].checked && g_st.board[i].id[0]) {
+            snprintf(checked_board_ids[checked_board_n++], 28, "%s", g_st.board[i].id);
+        }
+    }
+    char checked_file_names[8][36];
+    int checked_file_n = 0;
+    for (int i = 0; i < g_st.file_count && i < 8; i++) {
+        if (g_st.files[i].checked && g_st.files[i].name[0]) {
+            snprintf(checked_file_names[checked_file_n++], 36, "%s", g_st.files[i].name);
+        }
+    }
+
+    int r_counts[3] = {0, 0, 0};
+    int b_count = 0;
+    int f_count = 0;
+    int w_count = 0;
+    int d_count = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strncmp(line, "META|", 5) == 0) {
+            char *p1 = line + 5;
+            char *p2 = strchr(p1, '|');
+            if (p2) {
+                *p2++ = '\0';
+                snprintf(g_st.node_lxmf, sizeof(g_st.node_lxmf), "%.35s", p1);
+                char *p3 = strchr(p2, '|');
+                if (p3) {
+                    *p3++ = '\0';
+                    snprintf(g_st.rnode_status, sizeof(g_st.rnode_status), "%.23s", p3);
+                }
+                g_st.mesh_peers = atoi(p2);
+            }
+        } else if (strncmp(line, "VER|", 4) == 0) {
+            /* VER|<version>|<build>|<http80>|<http8080>|<lan_ip>|<tf_backup_count> */
+            char *p1 = line + 4;
+            char *p2 = strchr(p1, '|');
+            if (p2) {
+                *p2++ = '\0';
+                snprintf(g_st.ver_str, sizeof(g_st.ver_str), "%.27s", p1);
+                char *p3 = strchr(p2, '|');
+                if (p3) {
+                    *p3++ = '\0';
+                    snprintf(g_st.build_str, sizeof(g_st.build_str), "%.27s", p2);
+                    char *p4 = strchr(p3, '|');
+                    if (p4) {
+                        *p4++ = '\0';
+                        g_st.http80_ok = (atoi(p3) != 0);
+                        char *p5 = strchr(p4, '|');
+                        if (p5) {
+                            *p5++ = '\0';
+                            g_st.http8080_ok = (atoi(p4) != 0);
+                            char *p6 = strchr(p5, '|');
+                            if (p6) {
+                                *p6++ = '\0';
+                                snprintf(g_st.bridge_lan_ip, sizeof(g_st.bridge_lan_ip), "%.27s", p5);
+                                g_st.tf_backup_count = atoi(p6);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (strncmp(line, "BUSY|", 5) == 0) {
+            char *p1 = line + 5;
+            char *p2 = strchr(p1, '|');
+            if (p2) {
+                *p2++ = '\0';
+                g_st.py_busy = (atoi(p1) != 0);
+                if (g_st.py_busy && p2[0]) {
+                    snprintf(g_st.busy_msg, sizeof(g_st.busy_msg), "%.62s", p2);
+                }
+            }
+        } else if (strncmp(line, "AP|", 3) == 0) {
+            char *p1 = line + 3;
+            char *p2 = strchr(p1, '|');
+            if (p2) {
+                *p2++ = '\0';
+                if (monotonic_ms() >= g_st.radio_lock_until_ms) {
+                    g_st.ap_active = (atoi(p1) != 0);
+                }
+                char *p3 = strchr(p2, '|');
+                if (p3) {
+                    *p3++ = '\0';
+                    snprintf(g_st.ap_if, sizeof(g_st.ap_if), "%.19s", p2);
+                    char *p4 = strchr(p3, '|');
+                    if (p4) {
+                        *p4++ = '\0';
+                        snprintf(g_st.ap_mac, sizeof(g_st.ap_mac), "%.23s", p3);
+                        char *p5 = strchr(p4, '|');
+                        if (p5) {
+                            *p5++ = '\0';
+                            snprintf(g_st.ap_driver, sizeof(g_st.ap_driver), "%.19s", p4);
+                            char *p6 = strchr(p5, '|');
+                            if (p6) {
+                                *p6++ = '\0';
+                                snprintf(g_st.ap_ssid, sizeof(g_st.ap_ssid), "%.23s", p5);
+                                g_st.ap_clients = atoi(p6);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (strncmp(line, "CHAIN|", 6) == 0) {
+            /* CHAIN|<enabled>|<role_idx>|<has_secret>|<secret>|<chain_id>|<peers_count>|<peer_ip>|<status_msg> */
+            char *p1 = line + 6;
+            char *p2 = strchr(p1, '|');
+            if (p2) {
+                *p2++ = '\0';
+                g_st.chain_enabled = (atoi(p1) != 0);
+                char *p3 = strchr(p2, '|');
+                if (p3) {
+                    *p3++ = '\0';
+                    g_st.chain_role_idx = atoi(p2);
+                    char *p4 = strchr(p3, '|');
+                    if (p4) {
+                        *p4++ = '\0';
+                        g_st.chain_has_secret = (atoi(p3) != 0);
+                        char *p5 = strchr(p4, '|');
+                        if (p5) {
+                            *p5++ = '\0';
+                            if (!g_st.osk_open || g_st.osk_target != 1) {
+                                snprintf(g_st.chain_secret, sizeof(g_st.chain_secret), "%.50s", p4);
+                            }
+                            char *p6 = strchr(p5, '|');
+                            if (p6) {
+                                *p6++ = '\0';
+                                snprintf(g_st.chain_id, sizeof(g_st.chain_id), "%.18s", p5);
+                                char *p7 = strchr(p6, '|');
+                                if (p7) {
+                                    *p7++ = '\0';
+                                    g_st.chain_peers = atoi(p6);
+                                    char *p8 = strchr(p7, '|');
+                                    if (p8) {
+                                        *p8++ = '\0';
+                                        snprintf(g_st.chain_peer_ip, sizeof(g_st.chain_peer_ip), "%.26s", p7);
+                                        snprintf(g_st.chain_status_msg, sizeof(g_st.chain_status_msg), "%.62s", p8);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (strncmp(line, "SSID|", 5) == 0 && w_count < 6) {
+            char *p1 = line + 5;
+            char *p2 = strchr(p1, '|');
+            if (p2) {
+                *p2++ = '\0';
+                char *p3 = strchr(p2, '|');
+                if (p3) {
+                    *p3++ = '\0';
+                    char *p4 = strchr(p3, '|');
+                    if (p4) {
+                        *p4++ = '\0';
+                        g_st.wifi_list[w_count].active = (atoi(p1) != 0);
+                        g_st.wifi_list[w_count].signal = atoi(p2);
+                        snprintf(g_st.wifi_list[w_count].sec, sizeof(g_st.wifi_list[w_count].sec), "%.9s", p3);
+                        snprintf(g_st.wifi_list[w_count].ssid, sizeof(g_st.wifi_list[w_count].ssid), "%.31s", p4);
+                        w_count++;
+                    }
+                }
+            }
+        } else if (strncmp(line, "ROOM|", 5) == 0) {
+            int r_idx = atoi(line + 5);
+            char *p2 = strchr(line + 5, '|');
+            if (p2 && r_idx >= 0 && r_idx < 3) {
+                char *p3 = strchr(p2 + 1, '|');
+                if (p3) g_st.room_users[r_idx] = atoi(p3 + 1);
+            }
+        } else if (strncmp(line, "MSG|", 4) == 0) {
+            int r_idx = atoi(line + 4);
+            char *p1 = strchr(line + 4, '|');
+            if (p1 && r_idx >= 0 && r_idx < 3 && r_counts[r_idx] < MAX_LOG_LINES) {
+                int is_sys = atoi(p1 + 1);
+                char *p2 = strchr(p1 + 1, '|');
+                if (p2) {
+                    *p2++ = '\0';
+                    char *p3 = strchr(p2, '|');
+                    if (p3) {
+                        *p3++ = '\0';
+                        int slot = r_counts[r_idx]++;
+                        snprintf(g_st.rooms[r_idx][slot].nick, sizeof(g_st.rooms[r_idx][slot].nick), "%.17s", p2);
+                        snprintf(g_st.rooms[r_idx][slot].body, sizeof(g_st.rooms[r_idx][slot].body), "%.45s", p3);
+                        g_st.rooms[r_idx][slot].is_sys = (is_sys != 0);
+                    }
+                }
+            }
+        } else if (strncmp(line, "BOARD|", 6) == 0 && b_count < 8) {
+            char *p1 = line + 6;
+            char *p2 = strchr(p1, '|');
+            if (p2) {
+                *p2++ = '\0';
+                char *p3 = strchr(p2, '|');
+                if (p3) {
+                    *p3++ = '\0';
+                    char *p4 = strchr(p3, '|');
+                    if (p4) *p4++ = '\0';
+                    snprintf(g_st.board[b_count].id, sizeof(g_st.board[b_count].id), "%.27s", p1);
+                    snprintf(g_st.board[b_count].sig, sizeof(g_st.board[b_count].sig), "%.15s", p2);
+                    snprintf(g_st.board[b_count].title, sizeof(g_st.board[b_count].title), "%.45s", p3);
+                    snprintf(g_st.board[b_count].body, sizeof(g_st.board[b_count].body), "%.49s", p4 ? p4 : "");
+                    bool was_chk = false;
+                    for (int k = 0; k < checked_board_n; k++) {
+                        if (strcmp(checked_board_ids[k], g_st.board[b_count].id) == 0) { was_chk = true; break; }
+                    }
+                    g_st.board[b_count].checked = was_chk;
+                    b_count++;
+                }
+            }
+        } else if (strncmp(line, "FILE|", 5) == 0 && f_count < 8) {
+            char *p1 = line + 5;
+            char *p2 = strchr(p1, '|');
+            if (p2) {
+                *p2++ = '\0';
+                char *p3 = strchr(p2, '|');
+                if (p3) *p3++ = '\0';
+                snprintf(g_st.files[f_count].name, sizeof(g_st.files[f_count].name), "%.35s", p1);
+                g_st.files[f_count].size_kb = atoi(p2);
+                snprintf(g_st.files[f_count].cat, sizeof(g_st.files[f_count].cat), "%.7s", p3 ? p3 : "DOC");
+                bool was_chk = false;
+                for (int k = 0; k < checked_file_n; k++) {
+                    if (strcmp(checked_file_names[k], g_st.files[f_count].name) == 0) { was_chk = true; break; }
+                }
+                g_st.files[f_count].checked = was_chk;
+                f_count++;
+            }
+        } else if (strncmp(line, "STORAGE|", 8) == 0) {
+            int u = 0, c = 0, t = 0;
+            if (sscanf(line + 8, "%d|%d|%d", &u, &c, &t) >= 2) {
+                g_st.used_kb = u;
+                g_st.ceil_kb = c;
+            }
+        } else if (strncmp(line, "LOG|", 4) == 0 && d_count < MAX_DBG_LINES) {
+            snprintf(g_st.debug_logs[d_count++], 64, "%.62s", line + 4);
+        }
+    }
+    fclose(f);
+    for (int r = 0; r < 3; r++) g_st.room_counts[r] = r_counts[r];
+    g_st.board_count = b_count;
+    g_st.file_count = f_count;
+    g_st.wifi_count = w_count;
+    g_st.debug_log_count = d_count;
+    if (!g_st.net_staged_init || !g_st.net_staged_dirty) {
+        revert_staged_network_revision();
+    }
+    if (g_st.board_cursor > g_st.board_count) g_st.board_cursor = g_st.board_count;
+    if (g_st.file_cursor > g_st.file_count) g_st.file_cursor = g_st.file_count;
+    if (g_st.wifi_cursor > 1 + g_st.wifi_count) g_st.wifi_cursor = 1 + g_st.wifi_count;
+}
+
+/* v2.0: the cockpit no longer broadcasts or accepts chat on a LAN UDP port
+ * (it used to post any datagram on :42420 into #wifi-mesh). The Stump's own
+ * chain and discovery (UDP 4244) carry everything between Stumps. */
+static void broadcast_udp_beacon(const char *type, const char *msg) {
+    (void)type;
+    (void)msg;
+}
+
+static void poll_udp_mesh(void) {
+}
+
+static void *alsa_chime_thread(void *arg) {
+    (void)arg;
+    snd_pcm_t *pcm = NULL;
+    if (snd_pcm_open(&pcm, "plughw:0,0", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) == 0) {
+        snd_pcm_nonblock(pcm, 0);
+        if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SR, 1, 80000) < 0) {
+            snd_pcm_close(pcm);
+            pcm = NULL;
+        }
+    }
+    int16_t buf[ALSA_PERIOD * 2];
+    uint32_t phase = 0;
+    while (g_st.running) {
+        int freq = g_st.chime_freq;
+        int ms = g_st.chime_ms;
+        if (freq > 0 && ms > 0) {
+            int periods = (ms * SR) / (1000 * ALSA_PERIOD) + 1;
+            for (int p = 0; p < periods && g_st.running; p++) {
+                uint32_t ps = SR / (uint32_t)freq;
+                if (ps < 4) ps = 4;
+                for (int i = 0; i < ALSA_PERIOD; i++) {
+                    int16_t s = ((phase % ps) < (ps / 2)) ? 5500 : -5500;
+                    buf[i * 2] = s;
+                    buf[i * 2 + 1] = s;
+                    phase++;
+                }
+                if (pcm) {
+                    snd_pcm_sframes_t f = snd_pcm_writei(pcm, buf, ALSA_PERIOD);
+                    if (f < 0) snd_pcm_recover(pcm, (int)f, 1);
+                } else {
+                    usleep(11000);
+                }
+            }
+            g_st.chime_ms = 0;
+        } else {
+            usleep(20000);
+        }
+    }
+    if (pcm) snd_pcm_close(pcm);
+    return NULL;
+}
+
+static void execute_rrc_deck_action(void) {
+    int r = g_st.room_idx;
+    const char *rslug = ROOM_SLUGS[r];
+    int c = g_st.cmd_cursor;
+    char cmd[256];
+    set_ui_busy("IN PROCESS: DISPATCHING MESH COMMAND...", 1200);
+
+    if (c == 0) {
+        snprintf(cmd, sizeof(cmd), "RRC|%s|/whoami", rslug);
+        send_bridge_cmd(cmd);
+        snprintf(cmd, sizeof(cmd), "RRC|%s|/names", rslug);
+        send_bridge_cmd(cmd);
+        push_chat_local(r, "r36max", "/whoami + /names", false);
+        trigger_chime(660, 50);
+    } else if (c == 1) {
+        g_st.verified = true;
+        snprintf(cmd, sizeof(cmd), "RRC|%s|/auth", rslug);
+        send_bridge_cmd(cmd);
+        push_chat_local(r, "r36max", "/auth (local operator verified)", true);
+        trigger_chime(880, 80);
+    } else if (c == 2) {
+        snprintf(cmd, sizeof(cmd), "RRC|%s|!find jardinage", rslug);
+        send_bridge_cmd(cmd);
+        push_chat_local(r, "r36max", "!find jardinage", false);
+        trigger_chime(587, 60);
+    } else if (c == 3) {
+        snprintf(cmd, sizeof(cmd), "RRC|%s|!roll 2d6", rslug);
+        send_bridge_cmd(cmd);
+        push_chat_local(r, "r36max", "!roll 2d6", false);
+        trigger_chime(740, 60);
+    } else if (c == 4) {
+        g_st.beacons_sent++;
+        broadcast_udp_beacon("BEACON", "STUMP.NODE ANNOUNCE");
+        snprintf(cmd, sizeof(cmd), "ANNOUNCE|%s", rslug);
+        send_bridge_cmd(cmd);
+        push_chat_local(r, "r36max", "[BEACON] Announced on Wi-Fi + Mesh", true);
+        trigger_chime(987, 80);
+    } else {
+        broadcast_udp_beacon("CHAT", "Hello from R36MAX handheld operator!");
+        snprintf(cmd, sizeof(cmd), "RRC|%s|Hello from R36MAX handheld operator!", rslug);
+        send_bridge_cmd(cmd);
+        push_chat_local(r, "r36max", "Hello from R36MAX handheld operator!", false);
+        trigger_chime(784, 50);
+    }
+}
+
+static void action_board_add(void) {
+    int p = g_st.board_preset_idx % 5;
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "BOARD_ADD|%s|%s", BOARD_PRESET_TITLES[p], BOARD_PRESET_BODIES[p]);
+    send_bridge_cmd(cmd);
+    set_ui_busy("IN PROCESS: POSTING NOTICE TO BILLBOARD...", 1600);
+    g_st.board_preset_idx = (g_st.board_preset_idx + 1) % 5;
+    trigger_chime(880, 65);
+}
+
+static void action_board_backup_checked_tf(void) {
+    int chk = count_checked_boards();
+    if (chk <= 0) {
+        set_ui_busy("CHECK [X] A NOTICE FIRST (PRESS [A] ON ITEM)!", 2200);
+        trigger_chime(320, 70);
+        return;
+    }
+    char ids[256] = "";
+    for (int i = 0; i < g_st.board_count; i++) {
+        if (g_st.board[i].checked) {
+            if (ids[0]) strncat(ids, ",", sizeof(ids) - strlen(ids) - 1);
+            strncat(ids, g_st.board[i].id, sizeof(ids) - strlen(ids) - 1);
+            g_st.board[i].checked = false;
+        }
+    }
+    char cmd[300];
+    snprintf(cmd, sizeof(cmd), "BOARD_BACKUP_TF|%s", ids);
+    send_bridge_cmd(cmd);
+    set_ui_busy("IN PROCESS: BACKING UP CHECKED NOTICES TO TF CARD...", 2600);
+    trigger_chime(860, 75);
+}
+
+static void action_board_delete_checked(void) {
+    char ids[256] = "";
+    for (int i = 0; i < g_st.board_count; i++) {
+        if (g_st.board[i].checked) {
+            if (ids[0]) strncat(ids, ",", sizeof(ids) - strlen(ids) - 1);
+            strncat(ids, g_st.board[i].id, sizeof(ids) - strlen(ids) - 1);
+            g_st.board[i].checked = false;
+        }
+    }
+    if (!ids[0]) return;
+    char cmd[300];
+    snprintf(cmd, sizeof(cmd), "BOARD_DEL_MULTI|%s", ids);
+    send_bridge_cmd(cmd);
+    set_ui_busy("IN PROCESS: ERASING CHECKED NOTICES...", 2000);
+    trigger_chime(440, 70);
+}
+
+static void action_file_add(void) {
+    int m = g_st.file_action_idx % 3;
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "FILE_ADD|%d", m);
+    send_bridge_cmd(cmd);
+    set_ui_busy("IN PROCESS: SHARING THE NEXT FILE FROM drop/...", 1800);
+    g_st.file_action_idx = (g_st.file_action_idx + 1) % 3;
+    trigger_chime(880, 65);
+}
+
+static void action_file_backup_checked_tf(void) {
+    int chk = count_checked_files();
+    if (chk <= 0) {
+        set_ui_busy("CHECK [X] A FILE FIRST (PRESS [A] ON ITEM)!", 2200);
+        trigger_chime(320, 70);
+        return;
+    }
+    char names[320] = "";
+    for (int i = 0; i < g_st.file_count; i++) {
+        if (g_st.files[i].checked) {
+            if (names[0]) strncat(names, ",", sizeof(names) - strlen(names) - 1);
+            strncat(names, g_st.files[i].name, sizeof(names) - strlen(names) - 1);
+            g_st.files[i].checked = false;
+        }
+    }
+    char cmd[360];
+    snprintf(cmd, sizeof(cmd), "FILE_BACKUP_TF|%s", names);
+    send_bridge_cmd(cmd);
+    set_ui_busy("IN PROCESS: BACKING UP CHECKED FILES TO TF CARD...", 2600);
+    trigger_chime(860, 75);
+}
+
+static void action_file_delete_checked(void) {
+    char names[320] = "";
+    for (int i = 0; i < g_st.file_count; i++) {
+        if (g_st.files[i].checked) {
+            if (names[0]) strncat(names, ",", sizeof(names) - strlen(names) - 1);
+            strncat(names, g_st.files[i].name, sizeof(names) - strlen(names) - 1);
+            g_st.files[i].checked = false;
+        }
+    }
+    if (!names[0]) return;
+    char cmd[360];
+    snprintf(cmd, sizeof(cmd), "FILE_DEL_MULTI|%s", names);
+    send_bridge_cmd(cmd);
+    set_ui_busy("IN PROCESS: ERASING CHECKED FILES...", 2000);
+    trigger_chime(440, 70);
+}
+
+static void open_delete_confirm(int type) {
+    if (type == 1) {
+        int chk = count_checked_boards();
+        if (chk <= 0) {
+            set_ui_busy("CHECK [X] A NOTICE FIRST BEFORE DELETING!", 2200);
+            trigger_chime(320, 70);
+            return;
+        }
+        g_st.confirm_open = true;
+        g_st.confirm_type = 1;
+        g_st.confirm_choice = 0; /* Default to NO, KEEP */
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "%d CHECKED BILLBOARD NOTICE(S)", chk);
+        trigger_chime(540, 45);
+    } else if (type == 2) {
+        int chk = count_checked_files();
+        if (chk <= 0) {
+            set_ui_busy("CHECK [X] A FILE FIRST BEFORE DELETING!", 2200);
+            trigger_chime(320, 70);
+            return;
+        }
+        g_st.confirm_open = true;
+        g_st.confirm_type = 2;
+        g_st.confirm_choice = 0; /* Default to NO, KEEP */
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "%d CHECKED SHARED FILE(S) IN /SD/SHARED", chk);
+        trigger_chime(540, 45);
+    }
+}
+
+static void execute_debug_tab_action(void) {
+    if (g_st.debug_bar_mode == 0) {
+        send_bridge_cmd("CHAIN_SCAN");
+        set_ui_busy("IN PROCESS: SCANNING LAN FOR STUMP CHAIN PEERS...", 3000);
+        trigger_chime(880, 75);
+    } else if (g_st.debug_bar_mode == 1) {
+        open_chain_secret_osk();
+    } else if (g_st.debug_bar_mode == 2) {
+        send_bridge_cmd("DEBUG_EXPORT_TF");
+        set_ui_busy("IN PROCESS: EXPORTING LOGS & DIAG TO TF CARD...", 3000);
+        trigger_chime(880, 75);
+    } else {
+        send_bridge_cmd("DEBUG_HEAL_NET");
+        set_ui_busy("IN PROCESS: HEALING HTTP :80/:8080 & CHAIN...", 3000);
+        trigger_chime(784, 70);
+    }
+}
+
+static void update_qr_if_needed(void) {
+    char target_url[64];
+    const char *lan_ip = (g_st.bridge_lan_ip[0] && strcmp(g_st.bridge_lan_ip, "127.0.0.1") != 0)
+                         ? g_st.bridge_lan_ip : g_st.net.primary_ip;
+    if (g_st.qr_mode == 1) {
+        snprintf(target_url, sizeof(target_url), "WIFI:S:%s;T:nopass;;",
+                 g_st.ap_ssid[0] ? g_st.ap_ssid : "Stump");
+    } else if (!g_st.http80_ok && g_st.http8080_ok) {
+        snprintf(target_url, sizeof(target_url), "http://%s:8080/", lan_ip);
+    } else {
+        snprintf(target_url, sizeof(target_url), "http://%s/", lan_ip);
+    }
+    if (strcmp(target_url, g_st.qr_url) != 0) {
+        snprintf(g_st.qr_url, sizeof(g_st.qr_url), "%s", target_url);
+        encode_qr_v2_l(g_st.qr_url, g_st.qr_grid);
+    }
+}
+
+
+int main(int argc, char **argv) {
+    umask(0);
+    signal(SIGTERM, handle_sig);
+    signal(SIGINT, handle_sig);
+    srand((unsigned int)time(NULL));
+    memset(&g_st, 0, sizeof(g_st));
+    g_st.running = true;
+    g_st.udp_sock = -1;
+    g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.0.0-r36max");
+    snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
+    g_st.http80_ok = true;
+    g_st.http8080_ok = true;
+    g_st.chain_enabled = true;
+    g_st.room_idx = 2; /* Default Chat Room: #WIFI-MESH (Stump Chain room) so console writes reach all Chain Stumps */
+    g_st.chain_role_idx = 2; /* Default Role: MEMBER (Connects to another Stump on LAN, NOT parent/host) */
+    snprintf(g_st.chain_id, sizeof(g_st.chain_id), "none");
+    snprintf(g_st.chain_status_msg, sizeof(g_st.chain_status_msg), "MEMBER MODE: CONNECTING TO PARENT STUMP (:4242)");
+    snprintf(g_st.node_lxmf, sizeof(g_st.node_lxmf), "A7F391C208B4E6D1");
+    snprintf(g_st.rnode_status, sizeof(g_st.rnode_status), "WAIT-USB");
+    snprintf(g_st.ap_ssid, sizeof(g_st.ap_ssid), "Stump");
+    snprintf(g_st.ap_mac, sizeof(g_st.ap_mac), "00:0f:00:5e:11:ee");
+    snprintf(g_st.ap_driver, sizeof(g_st.ap_driver), "rt2800usb");
+    snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "STAGE IN PANEL 4 -> APPLY IN PANEL 5 ([A]=ACCEPT [B]=CANCEL)");
+
+    scan_transports(&g_st.net);
+    poll_live_bridge();
+    revert_staged_network_revision();
+    update_qr_if_needed();
+
+
+    int max_frames = (argc > 1 && strcmp(argv[1], "--smoke") == 0) ? 10 : 0;
+    bool use_shm_only = (argc > 1 && strcmp(argv[1], "--shm") == 0);
+    const char *fb0_pan_env = getenv("STUMP_FB0_PAN");
+    bool force_fb0_pan = (fb0_pan_env && strcmp(fb0_pan_env, "1") == 0);
+
+    /* Open /dev/shm/stump_fb.rgba (720x720x4 RGBA shared memory) for FireFly pygame.display.flip() presenter */
+    uint8_t *shm_rgba = NULL;
+    int shm_fd = open(SHM_FB_FILE, O_RDWR | O_CREAT, 0666);
+    if (shm_fd >= 0) {
+        if (ftruncate(shm_fd, PANEL_BYTES) == 0) {
+            void *sm = mmap(NULL, PANEL_BYTES, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+            if (sm != MAP_FAILED) shm_rgba = (uint8_t *)sm;
+        }
+    }
+
+    void *sdl = NULL;
+    if (max_frames == 0 && !use_shm_only) {
+        sdl = dlopen("libSDL2-2.0.so.0", RTLD_LAZY | RTLD_GLOBAL);
+        if (!sdl) sdl = dlopen("/usr/lib/aarch64-linux-gnu/libSDL2-2.0.so.0", RTLD_LAZY | RTLD_GLOBAL);
+    }
+
+    pfn_SDL_Init            fn_Init            = sdl ? (pfn_SDL_Init)dlsym(sdl, "SDL_Init") : NULL;
+    pfn_SDL_Quit            fn_Quit            = sdl ? (pfn_SDL_Quit)dlsym(sdl, "SDL_Quit") : NULL;
+    pfn_SDL_CreateWindow    fn_CreateWindow    = sdl ? (pfn_SDL_CreateWindow)dlsym(sdl, "SDL_CreateWindow") : NULL;
+    pfn_SDL_DestroyWindow   fn_DestroyWindow   = sdl ? (pfn_SDL_DestroyWindow)dlsym(sdl, "SDL_DestroyWindow") : NULL;
+    pfn_SDL_CreateRenderer  fn_CreateRenderer  = sdl ? (pfn_SDL_CreateRenderer)dlsym(sdl, "SDL_CreateRenderer") : NULL;
+    pfn_SDL_DestroyRenderer fn_DestroyRenderer = sdl ? (pfn_SDL_DestroyRenderer)dlsym(sdl, "SDL_DestroyRenderer") : NULL;
+    pfn_SDL_CreateTexture   fn_CreateTexture   = sdl ? (pfn_SDL_CreateTexture)dlsym(sdl, "SDL_CreateTexture") : NULL;
+    pfn_SDL_DestroyTexture  fn_DestroyTexture  = sdl ? (pfn_SDL_DestroyTexture)dlsym(sdl, "SDL_DestroyTexture") : NULL;
+    pfn_SDL_UpdateTexture   fn_UpdateTexture   = sdl ? (pfn_SDL_UpdateTexture)dlsym(sdl, "SDL_UpdateTexture") : NULL;
+    pfn_SDL_RenderClear     fn_RenderClear     = sdl ? (pfn_SDL_RenderClear)dlsym(sdl, "SDL_RenderClear") : NULL;
+    pfn_SDL_RenderCopy      fn_RenderCopy      = sdl ? (pfn_SDL_RenderCopy)dlsym(sdl, "SDL_RenderCopy") : NULL;
+    pfn_SDL_RenderPresent   fn_RenderPresent   = sdl ? (pfn_SDL_RenderPresent)dlsym(sdl, "SDL_RenderPresent") : NULL;
+    pfn_SDL_PumpEvents      fn_PumpEvents      = sdl ? (pfn_SDL_PumpEvents)dlsym(sdl, "SDL_PumpEvents") : NULL;
+    pfn_SDL_ShowCursor      fn_ShowCursor      = sdl ? (pfn_SDL_ShowCursor)dlsym(sdl, "SDL_ShowCursor") : NULL;
+
+    void *win = NULL, *ren = NULL, *tex = NULL;
+    if (fn_Init && fn_Init(SDL_INIT_VIDEO) == 0) {
+        if (fn_ShowCursor) fn_ShowCursor(0);
+        win = fn_CreateWindow("LaBuche_Stump", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+                              PANEL_W, PANEL_H, SDL_WINDOW_SHOWN | SDL_WINDOW_FULLSCREEN_DESK);
+        if (win) {
+            ren = fn_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+            if (!ren) ren = fn_CreateRenderer(win, -1, 0);
+        }
+        if (ren) {
+            tex = fn_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, PANEL_W, PANEL_H);
+        }
+        if (!tex) {
+            if (ren && fn_DestroyRenderer) fn_DestroyRenderer(ren);
+            if (win && fn_DestroyWindow) fn_DestroyWindow(win);
+            if (fn_Quit) fn_Quit();
+            win = ren = tex = NULL;
+        }
+    }
+
+    uint32_t *fb0_map = NULL;
+    size_t fb0_map_len = PANEL_BYTES;
+    int fb_fd = -1;
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+    memset(&vinfo, 0, sizeof(vinfo));
+    memset(&finfo, 0, sizeof(finfo));
+    /* CRITICAL (FireFly_RK3326_R36MAX_R36S Display rule):
+     * When running under stump_pygame_display.py (--shm without STUMP_FB0_PAN=1),
+     * NEVER open /dev/fb0 or call ioctl(fb_fd, FBIOBLANK, FB_BLANK_UNBLANK)!
+     * On Rockchip RK3326 (rockchipdrm, Linux 4.4.189), calling FBIOBLANK on /dev/fb0 invokes
+     * drm_fb_helper_restore_fbdev_mode_unlocked(), which detaches pygame's KMSDRM plane
+     * from the VOP CRTC and switches the hardware display back to the black VT1 fbcon console! */
+    if (!tex && max_frames == 0 && (!use_shm_only || force_fb0_pan)) {
+        fb_fd = open("/dev/fb0", O_RDWR);
+        if (fb_fd >= 0) {
+            ioctl(fb_fd, FBIOBLANK, FB_BLANK_UNBLANK);
+            /* Read vinfo/finfo ONLY — never call FBIOPUT_VSCREENINFO which resets RK3326 DSI timings */
+            ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo);
+            if (ioctl(fb_fd, FBIOGET_FSCREENINFO, &finfo) == 0 && finfo.smem_len > 0) {
+                if (finfo.smem_len < fb0_map_len) fb0_map_len = finfo.smem_len;
+            }
+            void *m = mmap(NULL, fb0_map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
+            if (m != MAP_FAILED) fb0_map = (uint32_t *)m;
+        }
+    }
+    fprintf(stderr, "[Stump-R36MAX %s] Display ready (SDL_tex=%p fb0_mmap=%p shm_rgba=%p) WiFi=%s(%s) QR=%s\n",
+            g_st.ver_str, tex, (void *)fb0_map, (void *)shm_rgba, g_st.net.wifi_if[0] ? g_st.net.wifi_if : "none",
+            g_st.net.primary_ip, g_st.qr_url);
+    fflush(stderr);
+
+    int ev_fds[16];
+    for (int i = 0; i < 16; i++) {
+        char p[64];
+        snprintf(p, sizeof(p), "/dev/input/event%d", i);
+        ev_fds[i] = open(p, O_RDONLY | O_NONBLOCK);
+    }
+
+    pthread_t audio_tid = 0;
+    bool audio_started = false;
+    if (max_frames == 0) {
+        if (pthread_create(&audio_tid, NULL, alsa_chime_thread, NULL) == 0) {
+            audio_started = true;
+        }
+        trigger_chime(660, 70);
+    }
+    
+
+    uint32_t *fb = calloc(PANEL_W * PANEL_H, sizeof(uint32_t));
+    bool select_held = false, start_held = false;
+    int frames = 0;
+    int last_room_view = -1;
+
+    while (g_st.running) {
+        if (fn_PumpEvents && tex) fn_PumpEvents();
+
+        if (g_st.suppress_poll_frames > 0) g_st.suppress_poll_frames--;
+
+        /* The room on screen: the feed joins it (the Stump keeps one current room per client). */
+        if (g_st.room_idx != last_room_view || frames % 300 == 0) {
+            char rv[48];
+            snprintf(rv, sizeof(rv), "ROOM_VIEW|%s", ROOM_SLUGS[g_st.room_idx]);
+            send_bridge_cmd(rv);
+            g_st.suppress_poll_frames = 0;
+            last_room_view = g_st.room_idx;
+        }
+
+        /* Poll live Python Stump state every 10 frames (~160ms) */
+        if (frames % 10 == 0) {
+            poll_live_bridge();
+            update_qr_if_needed();
+        }
+
+        /* Re-scan hardware network transports, Blueway RT3070, Heltec V3 RNode, and USB Keyboards every 120 frames (~2s) */
+        if (frames % 120 == 0) {
+            scan_transports(&g_st.net);
+            update_qr_if_needed();
+            for (int i = 0; i < 16; i++) {
+                if (ev_fds[i] < 0) {
+                    char p[64];
+                    snprintf(p, sizeof(p), "/dev/input/event%d", i);
+                    ev_fds[i] = open(p, O_RDONLY | O_NONBLOCK);
+                }
+            }
+        }
+        poll_udp_mesh();
+
+        struct input_event ev;
+        for (int e = 0; e < 16; e++) {
+            if (ev_fds[e] < 0) continue;
+            while (read(ev_fds[e], &ev, sizeof(ev)) == sizeof(ev)) {
+                uint64_t now_ms = monotonic_ms();
+                if (ev.type == EV_KEY) {
+                    bool pressed = (ev.value == 1);
+                    bool key_press_or_rep = (ev.value == 1 || ev.value == 2);
+
+                    /* Track USB Keyboard Shift keys */
+                    if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
+                        g_st.shift_held = (ev.value != 0);
+                        continue;
+                    }
+
+                    /* Hardware Debounce for Handheld Action Buttons (220ms) and D-Pad Keys (130ms) */
+                    if (pressed && ev.code >= 256) {
+                        bool is_dpad_key = (ev.code == BTN_DPAD_UP || ev.code == BTN_DPAD_DOWN ||
+                                            ev.code == BTN_DPAD_LEFT || ev.code == BTN_DPAD_RIGHT ||
+                                            (ev.code >= 544 && ev.code <= 547));
+                        if (is_dpad_key) {
+                            if (now_ms - g_st.last_dpad_ms < 130) continue;
+                            g_st.last_dpad_ms = now_ms;
+                        } else if (ev.code == R36_BTN_B_CANCEL || ev.code == R36_BTN_A_ACCEPT || ev.code == 306 ||
+                                   ev.code == 307 || ev.code == 308 ||
+                                   ev.code == BTN_TL || ev.code == BTN_TR ||
+                                   ev.code == 310 || ev.code == 311) {
+                            if (now_ms - g_st.last_btn_ms < 220) continue;
+                            g_st.last_btn_ms = now_ms;
+                        }
+                        g_st.last_ev_code = (int)ev.code;
+                    }
+
+                    /* If Confirmation Modal is open: [A] (305) = Accept, [B] (304) = Cancel */
+                    if (g_st.confirm_open && pressed) {
+                        if (ev.code == BTN_DPAD_LEFT || ev.code == 546 || ev.code == KEY_LEFT ||
+                            ev.code == BTN_DPAD_UP || ev.code == 544 || ev.code == KEY_UP) {
+                            g_st.confirm_choice = 0;
+                            trigger_chime(520, 20);
+                            continue;
+                        } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547 || ev.code == KEY_RIGHT ||
+                                   ev.code == BTN_DPAD_DOWN || ev.code == 545 || ev.code == KEY_DOWN) {
+                            g_st.confirm_choice = 1;
+                            trigger_chime(520, 20);
+                            continue;
+                        } else if (ev.code == R36_BTN_B_CANCEL || ev.code == 307 || ev.code == 308 || ev.code == KEY_ESC) {
+                            /* Physical B (304), X (307), Y (308), or ESC ALWAYS CANCELS safely! */
+                            g_st.confirm_open = false;
+                            set_ui_busy("CANCELLED (NO CHANGES MADE)", 1000);
+                            trigger_chime(480, 35);
+                            continue;
+                        } else if (ev.code == R36_BTN_A_ACCEPT || ev.code == KEY_ENTER || ev.code == KEY_KPENTER) {
+                            /* Physical A (305) or ENTER confirms the highlighted NO/YES choice */
+                            if (g_st.confirm_choice == 1) {
+                                if (g_st.confirm_type == 1) action_board_delete_checked();
+                                else if (g_st.confirm_type == 2) action_file_delete_checked();
+                                else if (g_st.confirm_type == 3) apply_staged_network_revision();
+                            } else {
+                                set_ui_busy("CANCELLED (NO CHANGES MADE)", 1000);
+                                trigger_chime(480, 35);
+                            }
+                            g_st.confirm_open = false;
+                            continue;
+                        }
+                        continue;
+                    }
+
+                    /* Direct Kernel USB Keyboard typing (KEY_1..KEY_SLASH, KEY_BACKSPACE, KEY_ENTER, KEY_ESC) */
+                    if (ev.code < 256) {
+                        if ((ev.code == KEY_BACKSPACE || ev.code == 111 /* KEY_DELETE */) && pressed && (g_st.tab_idx == 1 || g_st.tab_idx == 2)) {
+                            open_delete_confirm(g_st.tab_idx);
+                            continue;
+                        } else if (ev.code == KEY_BACKSPACE && key_press_or_rep) {
+                            input_backspace();
+                            trigger_chime(420, 15);
+                            continue;
+                        } else if ((ev.code == KEY_ENTER || ev.code == KEY_KPENTER) && pressed) {
+                            if (g_st.tab_idx == 1) action_board_add();
+                            else if (g_st.tab_idx == 2) action_file_add();
+                            else if (g_st.tab_idx == 3) action_wifi_tab_confirm();
+                            else if (g_st.tab_idx == 4) {
+                                if (g_st.osk_open || g_st.input_len > 0) send_typed_chat();
+                                else if (g_st.rev_cursor == 2) open_chain_secret_osk();
+                                else if (g_st.rev_cursor == 3) open_network_revision_confirm();
+                                else execute_debug_tab_action();
+                            }
+                            else if (g_st.input_len > 0) send_typed_chat();
+                            else execute_rrc_deck_action();
+                            continue;
+                        } else if (ev.code == KEY_ESC && pressed) {
+                            if (g_st.osk_open) { g_st.osk_open = false; g_st.osk_target = 0; }
+                            else if (g_st.tab_idx == 4) revert_staged_network_revision();
+                            trigger_chime(480, 30);
+                            continue;
+                        } else if (ev.code == KEY_TAB && pressed) {
+                            g_st.room_idx = (g_st.room_idx + 1) % 3;
+                            trigger_chime(520, 25);
+                            continue;
+                        } else if (key_press_or_rep) {
+                            char kch = translate_linux_key(ev.code, g_st.shift_held);
+                            if (kch != 0) {
+                                if ((g_st.tab_idx == 1 || g_st.tab_idx == 2) && (kch == ' ')) {
+                                    if (g_st.tab_idx == 1 && g_st.board_cursor < g_st.board_count) {
+                                        g_st.board[g_st.board_cursor].checked = !g_st.board[g_st.board_cursor].checked;
+                                        trigger_chime(580, 25);
+                                    } else if (g_st.tab_idx == 2 && g_st.file_cursor < g_st.file_count) {
+                                        g_st.files[g_st.file_cursor].checked = !g_st.files[g_st.file_cursor].checked;
+                                        trigger_chime(580, 25);
+                                    }
+                                    continue;
+                                }
+                                if ((g_st.tab_idx == 1 || g_st.tab_idx == 2) && (kch == 'x' || kch == 'X')) {
+                                    open_delete_confirm(g_st.tab_idx);
+                                    continue;
+                                }
+                                if (g_st.tab_idx == 4) {
+                                    g_st.osk_target = 1;
+                                } else if (g_st.tab_idx != 0 && g_st.tab_idx != 3) {
+                                    g_st.tab_idx = 0;
+                                    g_st.osk_target = 0;
+                                }
+                                input_append_char(kch);
+                                trigger_chime(620, 12);
+                                continue;
+                            }
+                        }
+                    }
+
+                    /* Handheld Gamepad Buttons: A (305)=Accept, B (304)=Cancel, X (307), Y (308) */
+                    if (ev.code == BTN_SELECT || ev.code == BTN_MODE || ev.code == 314 || ev.code == 704 || ev.code == 706) {
+                        select_held = (ev.value != 0);
+                    }
+                    if (ev.code == BTN_START || ev.code == 315 || ev.code == 705 || ev.code == 707) {
+                        start_held = (ev.value != 0);
+                        if (pressed && !select_held) {
+                            if (g_st.tab_idx == 3) {
+                                action_wifi_tab_confirm();
+                            } else if (g_st.tab_idx == 4) {
+                                if (g_st.osk_open) send_typed_chat();
+                                else open_network_revision_confirm();
+                            } else if (g_st.input_len > 0) {
+                                send_typed_chat();
+                            } else {
+                                g_st.cmd_cursor = 4;
+                                execute_rrc_deck_action();
+                            }
+                        }
+                    }
+                    if (select_held && start_held) {
+                        int qfd = open("/dev/shm/stump_user_quit", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+                        if (qfd >= 0) close(qfd);
+                        g_st.running = false;
+                    }
+
+                    if (pressed) {
+                        /* L1 / R1 cycle across all 5 Panels */
+                        if (ev.code == BTN_TL || ev.code == 310) {
+                            g_st.confirm_open = false;
+                            g_st.osk_open = false;
+                            g_st.tab_idx = (g_st.tab_idx + 4) % 5;
+                            trigger_chime(523, 35);
+                        } else if (ev.code == BTN_TR || ev.code == 311) {
+                            g_st.confirm_open = false;
+                            g_st.osk_open = false;
+                            g_st.tab_idx = (g_st.tab_idx + 1) % 5;
+                            trigger_chime(659, 35);
+                        } else if (ev.code == BTN_TL2 || ev.code == BTN_TR2 || ev.code == 312 || ev.code == 313) {
+                            g_st.theme_idx = (g_st.theme_idx + 1) % 5;
+                            trigger_chime(784, 35);
+                        } else if (g_st.tab_idx == 0) {
+                            /* Panel 1: RRC Chat & Quick Mesh Command Deck (A=Accept/Send, B=Cancel/Clear) */
+                            if (ev.code == 308) {
+                                g_st.osk_target = 0;
+                                g_st.osk_open = !g_st.osk_open;
+                                trigger_chime(g_st.osk_open ? 740 : 520, 45);
+                            } else if (g_st.osk_open) {
+                                if (ev.code == BTN_DPAD_LEFT || ev.code == 546) { g_st.osk_col = (g_st.osk_col + 9) % 10; }
+                                else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) { g_st.osk_col = (g_st.osk_col + 1) % 10; }
+                                else if (ev.code == BTN_DPAD_UP || ev.code == 544) { g_st.osk_row = (g_st.osk_row + 3) % 4; }
+                                else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) { g_st.osk_row = (g_st.osk_row + 1) % 4; }
+                                else if (ev.code == R36_BTN_A_ACCEPT) { execute_osk_key(); }
+                                else if (ev.code == R36_BTN_B_CANCEL) { g_st.osk_open = false; trigger_chime(480, 35); }
+                                else if (ev.code == 307) { input_backspace(); trigger_chime(420, 25); }
+                            } else {
+                                if (ev.code == BTN_DPAD_LEFT || ev.code == 546) { g_st.room_idx = (g_st.room_idx + 2) % 3; trigger_chime(520, 20); }
+                                else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) { g_st.room_idx = (g_st.room_idx + 1) % 3; trigger_chime(520, 20); }
+                                else if (ev.code == BTN_DPAD_UP || ev.code == 544) { g_st.cmd_cursor = (g_st.cmd_cursor + 5) % 6; trigger_chime(500, 20); }
+                                else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) { g_st.cmd_cursor = (g_st.cmd_cursor + 1) % 6; trigger_chime(500, 20); }
+                                else if (ev.code == R36_BTN_A_ACCEPT) {
+                                    if (g_st.input_len > 0) send_typed_chat();
+                                    else execute_rrc_deck_action();
+                                } else if (ev.code == R36_BTN_B_CANCEL) {
+                                    if (g_st.input_len > 0) {
+                                        g_st.input_len = 0;
+                                        g_st.input_buf[0] = '\0';
+                                        set_ui_busy("CANCELLED DRAFT MESSAGE", 900);
+                                    } else {
+                                        g_st.cmd_cursor = 0;
+                                    }
+                                    trigger_chime(460, 30);
+                                } else if (ev.code == 307) {
+                                    g_st.cmd_cursor = 1;
+                                    execute_rrc_deck_action();
+                                }
+                            }
+                        } else if (g_st.tab_idx == 1) {
+                            /* Panel 2: Bulletin Board — [A]=Accept/Check [X], [B]=Cancel/Uncheck */
+                            int total_rows = g_st.board_count + 1;
+                            if (g_st.board_cursor >= total_rows) g_st.board_cursor = total_rows - 1;
+                            if (ev.code == BTN_DPAD_UP || ev.code == 544) {
+                                g_st.board_cursor = (g_st.board_cursor + total_rows - 1) % total_rows;
+                                trigger_chime(500, 20);
+                            } else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) {
+                                g_st.board_cursor = (g_st.board_cursor + 1) % total_rows;
+                                trigger_chime(500, 20);
+                            } else if (ev.code == BTN_DPAD_LEFT || ev.code == 546) {
+                                if (g_st.board_cursor < g_st.board_count) {
+                                    g_st.board[g_st.board_cursor].checked = !g_st.board[g_st.board_cursor].checked;
+                                    trigger_chime(600, 25);
+                                } else {
+                                    g_st.board_bar_mode = (g_st.board_bar_mode + 2) % 3;
+                                    trigger_chime(540, 25);
+                                }
+                            } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
+                                if (g_st.board_cursor < g_st.board_count) {
+                                    g_st.board[g_st.board_cursor].checked = !g_st.board[g_st.board_cursor].checked;
+                                    trigger_chime(600, 25);
+                                } else {
+                                    g_st.board_bar_mode = (g_st.board_bar_mode + 1) % 3;
+                                    trigger_chime(540, 25);
+                                }
+                            } else if (ev.code == R36_BTN_A_ACCEPT) {
+                                if (g_st.board_cursor < g_st.board_count) {
+                                    g_st.board[g_st.board_cursor].checked = !g_st.board[g_st.board_cursor].checked;
+                                    trigger_chime(620, 30);
+                                } else {
+                                    if (g_st.board_bar_mode == 0) action_board_backup_checked_tf();
+                                    else if (g_st.board_bar_mode == 1) open_delete_confirm(1);
+                                    else action_board_add();
+                                }
+                            } else if (ev.code == R36_BTN_B_CANCEL) {
+                                /* B (304): Cancel / Uncheck all or return from Action Bar to list */
+                                if (g_st.board_cursor >= g_st.board_count && g_st.board_count > 0) {
+                                    g_st.board_cursor = 0;
+                                } else {
+                                    for (int i = 0; i < g_st.board_count; i++) g_st.board[i].checked = false;
+                                    set_ui_busy("CLEARED CHECKED [X] SELECTION", 900);
+                                }
+                                trigger_chime(460, 30);
+                            } else if (ev.code == 308) {
+                                action_board_backup_checked_tf();
+                            } else if (ev.code == 307) {
+                                open_delete_confirm(1);
+                            }
+                        } else if (g_st.tab_idx == 2) {
+                            /* Panel 3: Shared File Shelf — [A]=Accept/Check [X], [B]=Cancel/Uncheck */
+                            int total_rows = g_st.file_count + 1;
+                            if (g_st.file_cursor >= total_rows) g_st.file_cursor = total_rows - 1;
+                            if (ev.code == BTN_DPAD_UP || ev.code == 544) {
+                                g_st.file_cursor = (g_st.file_cursor + total_rows - 1) % total_rows;
+                                trigger_chime(500, 20);
+                            } else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) {
+                                g_st.file_cursor = (g_st.file_cursor + 1) % total_rows;
+                                trigger_chime(500, 20);
+                            } else if (ev.code == BTN_DPAD_LEFT || ev.code == 546) {
+                                if (g_st.file_cursor < g_st.file_count) {
+                                    g_st.files[g_st.file_cursor].checked = !g_st.files[g_st.file_cursor].checked;
+                                    trigger_chime(600, 25);
+                                } else {
+                                    g_st.file_bar_mode = (g_st.file_bar_mode + 2) % 3;
+                                    trigger_chime(540, 25);
+                                }
+                            } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
+                                if (g_st.file_cursor < g_st.file_count) {
+                                    g_st.files[g_st.file_cursor].checked = !g_st.files[g_st.file_cursor].checked;
+                                    trigger_chime(600, 25);
+                                } else {
+                                    g_st.file_bar_mode = (g_st.file_bar_mode + 1) % 3;
+                                    trigger_chime(540, 25);
+                                }
+                            } else if (ev.code == R36_BTN_A_ACCEPT) {
+                                if (g_st.file_cursor < g_st.file_count) {
+                                    g_st.files[g_st.file_cursor].checked = !g_st.files[g_st.file_cursor].checked;
+                                    trigger_chime(620, 30);
+                                } else {
+                                    if (g_st.file_bar_mode == 0) action_file_backup_checked_tf();
+                                    else if (g_st.file_bar_mode == 1) open_delete_confirm(2);
+                                    else action_file_add();
+                                }
+                            } else if (ev.code == R36_BTN_B_CANCEL) {
+                                /* B (304): Cancel / Uncheck all or return from Action Bar to list */
+                                if (g_st.file_cursor >= g_st.file_count && g_st.file_count > 0) {
+                                    g_st.file_cursor = 0;
+                                } else {
+                                    for (int i = 0; i < g_st.file_count; i++) g_st.files[i].checked = false;
+                                    set_ui_busy("CLEARED CHECKED [X] SELECTION", 900);
+                                }
+                                trigger_chime(460, 30);
+                            } else if (ev.code == 308) {
+                                action_file_backup_checked_tf();
+                            } else if (ev.code == 307) {
+                                open_delete_confirm(2);
+                            }
+                        } else if (g_st.tab_idx == 3) {
+                            /* Panel 4: Stage Wi-Fi / AP + Stump Chain Secret ([A]=Accept/Stage, [B]=Cancel, [Y]=Chain/WiFi OSK) */
+                            if (g_st.osk_open) {
+                                if (ev.code == BTN_DPAD_LEFT || ev.code == 546) { g_st.osk_col = (g_st.osk_col + 9) % 10; }
+                                else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) { g_st.osk_col = (g_st.osk_col + 1) % 10; }
+                                else if (ev.code == BTN_DPAD_UP || ev.code == 544) { g_st.osk_row = (g_st.osk_row + 3) % 4; }
+                                else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) { g_st.osk_row = (g_st.osk_row + 1) % 4; }
+                                else if (ev.code == R36_BTN_A_ACCEPT) { execute_osk_key(); }
+                                else if (ev.code == R36_BTN_B_CANCEL || ev.code == 308) {
+                                    g_st.osk_open = false;
+                                    g_st.osk_target = 0;
+                                    trigger_chime(480, 35);
+                                }
+                                else if (ev.code == 307) { input_backspace(); trigger_chime(420, 25); }
+                            } else if (ev.code == 308) {
+                                if (g_st.wifi_cursor >= 2) {
+                                    g_st.osk_target = 0;
+                                    g_st.input_len = (int)strlen(g_st.net_staged_pass);
+                                    snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%s", g_st.net_staged_pass);
+                                    g_st.osk_open = true;
+                                    trigger_chime(740, 45);
+                                } else {
+                                    open_chain_secret_osk();
+                                }
+                            } else {
+                                int total_rows = 2 + g_st.wifi_count;
+                                if (g_st.wifi_cursor >= total_rows) g_st.wifi_cursor = total_rows - 1;
+                                if (ev.code == BTN_DPAD_UP || ev.code == 544) {
+                                    g_st.wifi_cursor = (g_st.wifi_cursor + total_rows - 1) % total_rows;
+                                    trigger_chime(520, 20);
+                                } else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) {
+                                    g_st.wifi_cursor = (g_st.wifi_cursor + 1) % total_rows;
+                                    trigger_chime(520, 20);
+                                } else if (ev.code == BTN_DPAD_LEFT || ev.code == 546) {
+                                    if (g_st.wifi_cursor == 0) {
+                                        /* Stage mode toggle only — never switches live radio until Panel 5 [A] Apply! */
+                                        g_st.net_staged_ap = !g_st.net_staged_ap;
+                                        g_st.net_staged_dirty = true;
+                                        trigger_chime(580, 25);
+                                    } else if (g_st.wifi_cursor == 1) {
+                                        g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 3) % 4;
+                                        trigger_chime(540, 25);
+                                    }
+                                } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
+                                    if (g_st.wifi_cursor == 0) {
+                                        /* Stage mode toggle only — never switches live radio until Panel 5 [A] Apply! */
+                                        g_st.net_staged_ap = !g_st.net_staged_ap;
+                                        g_st.net_staged_dirty = true;
+                                        trigger_chime(580, 25);
+                                    } else if (g_st.wifi_cursor == 1) {
+                                        g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 1) % 4;
+                                        trigger_chime(540, 25);
+                                    }
+                                } else if (ev.code == R36_BTN_A_ACCEPT) {
+                                    action_wifi_tab_confirm();
+                                } else if (ev.code == R36_BTN_B_CANCEL) {
+                                    revert_staged_network_revision();
+                                    g_st.wifi_cursor = 0;
+                                    set_ui_busy("CANCELLED STAGED WIFI CHANGES (LIVE UNCHANGED)", 1400);
+                                    trigger_chime(460, 35);
+                                } else if (ev.code == 307) {
+                                    g_st.qr_mode = (g_st.qr_mode + 1) % 2;
+                                    update_qr_if_needed();
+                                    trigger_chime(660, 45);
+                                }
+                            }
+                        } else if (g_st.tab_idx == 4) {
+                            /* Panel 5 (5:SETUP): Network Revision + Stump Chain Secret/Role + Debug ([A]=Accept, [B]=Cancel) */
+                            if (g_st.osk_open) {
+                                if (ev.code == BTN_DPAD_LEFT || ev.code == 546) { g_st.osk_col = (g_st.osk_col + 9) % 10; }
+                                else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) { g_st.osk_col = (g_st.osk_col + 1) % 10; }
+                                else if (ev.code == BTN_DPAD_UP || ev.code == 544) { g_st.osk_row = (g_st.osk_row + 3) % 4; }
+                                else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) { g_st.osk_row = (g_st.osk_row + 1) % 4; }
+                                else if (ev.code == R36_BTN_A_ACCEPT) { execute_osk_key(); }
+                                else if (ev.code == R36_BTN_B_CANCEL || ev.code == 308) {
+                                    g_st.osk_open = false;
+                                    g_st.osk_target = 0;
+                                    g_st.input_len = 0;
+                                    g_st.input_buf[0] = '\0';
+                                    set_ui_busy("CANCELLED CHAIN SECRET EDIT", 1000);
+                                    trigger_chime(480, 35);
+                                } else if (ev.code == 307) { input_backspace(); trigger_chime(420, 25); }
+                            } else if (ev.code == BTN_DPAD_UP || ev.code == 544) {
+                                if (g_st.rev_cursor == 5 && g_st.debug_scroll > 0) {
+                                    g_st.debug_scroll--;
+                                } else {
+                                    g_st.rev_cursor = (g_st.rev_cursor + 5) % 6;
+                                }
+                                trigger_chime(500, 20);
+                            } else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) {
+                                if (g_st.rev_cursor == 5 && g_st.debug_scroll + 1 < g_st.debug_log_count) {
+                                    g_st.debug_scroll++;
+                                } else {
+                                    g_st.rev_cursor = (g_st.rev_cursor + 1) % 6;
+                                }
+                                trigger_chime(500, 20);
+                            } else if (ev.code == BTN_DPAD_LEFT || ev.code == 546) {
+                                if (g_st.rev_cursor == 0) {
+                                    g_st.net_staged_ap = !g_st.net_staged_ap;
+                                    g_st.net_staged_dirty = true;
+                                    trigger_chime(580, 25);
+                                } else if (g_st.rev_cursor == 1 && g_st.wifi_count > 0) {
+                                    g_st.net_ssid_cycle_idx = (g_st.net_ssid_cycle_idx + g_st.wifi_count - 1) % g_st.wifi_count;
+                                    snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s",
+                                             g_st.wifi_list[g_st.net_ssid_cycle_idx].ssid);
+                                    g_st.net_staged_ap = false;
+                                    g_st.net_staged_dirty = true;
+                                    trigger_chime(580, 25);
+                                } else if (g_st.rev_cursor == 2) {
+                                    int next_role = (g_st.chain_role_idx + 2) % 3;
+                                    commit_chain_settings(g_st.chain_secret, next_role);
+                                } else if (g_st.rev_cursor == 4) {
+                                    g_st.debug_bar_mode = (g_st.debug_bar_mode + 3) % 4;
+                                    trigger_chime(540, 25);
+                                }
+                            } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
+                                if (g_st.rev_cursor == 0) {
+                                    g_st.net_staged_ap = !g_st.net_staged_ap;
+                                    g_st.net_staged_dirty = true;
+                                    trigger_chime(580, 25);
+                                } else if (g_st.rev_cursor == 1 && g_st.wifi_count > 0) {
+                                    g_st.net_ssid_cycle_idx = (g_st.net_ssid_cycle_idx + 1) % g_st.wifi_count;
+                                    snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s",
+                                             g_st.wifi_list[g_st.net_ssid_cycle_idx].ssid);
+                                    g_st.net_staged_ap = false;
+                                    g_st.net_staged_dirty = true;
+                                    trigger_chime(580, 25);
+                                } else if (g_st.rev_cursor == 2) {
+                                    int next_role = (g_st.chain_role_idx + 1) % 3;
+                                    commit_chain_settings(g_st.chain_secret, next_role);
+                                } else if (g_st.rev_cursor == 4) {
+                                    g_st.debug_bar_mode = (g_st.debug_bar_mode + 1) % 4;
+                                    trigger_chime(540, 25);
+                                }
+                            } else if (ev.code == R36_BTN_A_ACCEPT) {
+                                if (g_st.rev_cursor == 0) {
+                                    g_st.net_staged_ap = !g_st.net_staged_ap;
+                                    g_st.net_staged_dirty = true;
+                                    trigger_chime(600, 30);
+                                } else if (g_st.rev_cursor == 1) {
+                                    g_st.tab_idx = 3;
+                                    g_st.wifi_cursor = (g_st.wifi_count > 0) ? 2 : 1;
+                                    trigger_chime(620, 35);
+                                } else if (g_st.rev_cursor == 2) {
+                                    open_chain_secret_osk();
+                                } else if (g_st.rev_cursor == 3) {
+                                    open_network_revision_confirm();
+                                } else {
+                                    execute_debug_tab_action();
+                                }
+                            } else if (ev.code == R36_BTN_B_CANCEL) {
+                                revert_staged_network_revision();
+                                g_st.rev_cursor = 0;
+                                set_ui_busy("REVERTED STAGED NETWORK REVISION TO LIVE STATE", 1500);
+                                trigger_chime(460, 35);
+                            } else if (ev.code == 308) {
+                                open_chain_secret_osk();
+                            } else if (ev.code == 307) {
+                                g_st.debug_bar_mode = 0;
+                                execute_debug_tab_action();
+                            }
+                        }
+                    }
+                } else if (ev.type == EV_ABS && ev.value != 0) {
+                    /* Hardware Debounce for D-Pad Hat Switch (130ms) */
+                    if (now_ms - g_st.last_dpad_ms < 130) continue;
+                    g_st.last_dpad_ms = now_ms;
+                    g_st.last_ev_code = (int)ev.code;
+
+                    if (g_st.confirm_open) {
+                        if (ev.code == ABS_HAT0X && ev.value < 0) { g_st.confirm_choice = 0; trigger_chime(520, 20); }
+                        if (ev.code == ABS_HAT0X && ev.value > 0) { g_st.confirm_choice = 1; trigger_chime(520, 20); }
+                    } else if (g_st.tab_idx == 0) {
+                        if (g_st.osk_open) {
+                            if (ev.code == ABS_HAT0X && ev.value < 0) g_st.osk_col = (g_st.osk_col + 9) % 10;
+                            if (ev.code == ABS_HAT0X && ev.value > 0) g_st.osk_col = (g_st.osk_col + 1) % 10;
+                            if (ev.code == ABS_HAT0Y && ev.value < 0) g_st.osk_row = (g_st.osk_row + 3) % 4;
+                            if (ev.code == ABS_HAT0Y && ev.value > 0) g_st.osk_row = (g_st.osk_row + 1) % 4;
+                        } else {
+                            if (ev.code == ABS_HAT0X && ev.value < 0) g_st.room_idx = (g_st.room_idx + 2) % 3;
+                            if (ev.code == ABS_HAT0X && ev.value > 0) g_st.room_idx = (g_st.room_idx + 1) % 3;
+                            if (ev.code == ABS_HAT0Y && ev.value < 0) g_st.cmd_cursor = (g_st.cmd_cursor + 5) % 6;
+                            if (ev.code == ABS_HAT0Y && ev.value > 0) g_st.cmd_cursor = (g_st.cmd_cursor + 1) % 6;
+                        }
+                    } else if (g_st.tab_idx == 1) {
+                        int total_rows = g_st.board_count + 1;
+                        if (ev.code == ABS_HAT0Y && ev.value < 0)
+                            g_st.board_cursor = (g_st.board_cursor + total_rows - 1) % total_rows;
+                        if (ev.code == ABS_HAT0Y && ev.value > 0)
+                            g_st.board_cursor = (g_st.board_cursor + 1) % total_rows;
+                        if (ev.code == ABS_HAT0X) {
+                            if (g_st.board_cursor < g_st.board_count) {
+                                g_st.board[g_st.board_cursor].checked = !g_st.board[g_st.board_cursor].checked;
+                                trigger_chime(600, 25);
+                            } else {
+                                g_st.board_bar_mode = (g_st.board_bar_mode + (ev.value > 0 ? 1 : 2)) % 3;
+                                trigger_chime(540, 25);
+                            }
+                        }
+                    } else if (g_st.tab_idx == 2) {
+                        int total_rows = g_st.file_count + 1;
+                        if (ev.code == ABS_HAT0Y && ev.value < 0)
+                            g_st.file_cursor = (g_st.file_cursor + total_rows - 1) % total_rows;
+                        if (ev.code == ABS_HAT0Y && ev.value > 0)
+                            g_st.file_cursor = (g_st.file_cursor + 1) % total_rows;
+                        if (ev.code == ABS_HAT0X) {
+                            if (g_st.file_cursor < g_st.file_count) {
+                                g_st.files[g_st.file_cursor].checked = !g_st.files[g_st.file_cursor].checked;
+                                trigger_chime(600, 25);
+                            } else {
+                                g_st.file_bar_mode = (g_st.file_bar_mode + (ev.value > 0 ? 1 : 2)) % 3;
+                                trigger_chime(540, 25);
+                            }
+                        }
+                    } else if (g_st.tab_idx == 3) {
+                        if (g_st.osk_open) {
+                            if (ev.code == ABS_HAT0X && ev.value < 0) g_st.osk_col = (g_st.osk_col + 9) % 10;
+                            if (ev.code == ABS_HAT0X && ev.value > 0) g_st.osk_col = (g_st.osk_col + 1) % 10;
+                            if (ev.code == ABS_HAT0Y && ev.value < 0) g_st.osk_row = (g_st.osk_row + 3) % 4;
+                            if (ev.code == ABS_HAT0Y && ev.value > 0) g_st.osk_row = (g_st.osk_row + 1) % 4;
+                        } else {
+                            int total_rows = 2 + g_st.wifi_count;
+                            if (ev.code == ABS_HAT0Y && ev.value < 0) {
+                                g_st.wifi_cursor = (g_st.wifi_cursor + total_rows - 1) % total_rows;
+                                trigger_chime(520, 20);
+                            } else if (ev.code == ABS_HAT0Y && ev.value > 0) {
+                                g_st.wifi_cursor = (g_st.wifi_cursor + 1) % total_rows;
+                                trigger_chime(520, 20);
+                            } else if (ev.code == ABS_HAT0X) {
+                                if (g_st.wifi_cursor == 0) {
+                                    g_st.net_staged_ap = !g_st.net_staged_ap;
+                                    g_st.net_staged_dirty = true;
+                                    trigger_chime(580, 25);
+                                } else if (g_st.wifi_cursor == 1) {
+                                    g_st.wifi_bar_mode = (g_st.wifi_bar_mode + (ev.value > 0 ? 1 : 3)) % 4;
+                                    trigger_chime(540, 25);
+                                }
+                            }
+                        }
+                    } else if (g_st.tab_idx == 4) {
+                        if (g_st.osk_open) {
+                            if (ev.code == ABS_HAT0X && ev.value < 0) g_st.osk_col = (g_st.osk_col + 9) % 10;
+                            if (ev.code == ABS_HAT0X && ev.value > 0) g_st.osk_col = (g_st.osk_col + 1) % 10;
+                            if (ev.code == ABS_HAT0Y && ev.value < 0) g_st.osk_row = (g_st.osk_row + 3) % 4;
+                            if (ev.code == ABS_HAT0Y && ev.value > 0) g_st.osk_row = (g_st.osk_row + 1) % 4;
+                        } else if (ev.code == ABS_HAT0Y && ev.value < 0) {
+                            if (g_st.rev_cursor == 5 && g_st.debug_scroll > 0) g_st.debug_scroll--;
+                            else g_st.rev_cursor = (g_st.rev_cursor + 5) % 6;
+                            trigger_chime(500, 20);
+                        } else if (ev.code == ABS_HAT0Y && ev.value > 0) {
+                            if (g_st.rev_cursor == 5 && g_st.debug_scroll + 1 < g_st.debug_log_count) g_st.debug_scroll++;
+                            else g_st.rev_cursor = (g_st.rev_cursor + 1) % 6;
+                            trigger_chime(500, 20);
+                        } else if (ev.code == ABS_HAT0X) {
+                            if (g_st.rev_cursor == 0) {
+                                g_st.net_staged_ap = !g_st.net_staged_ap;
+                                g_st.net_staged_dirty = true;
+                                trigger_chime(580, 25);
+                            } else if (g_st.rev_cursor == 1 && g_st.wifi_count > 0) {
+                                g_st.net_ssid_cycle_idx = (g_st.net_ssid_cycle_idx + (ev.value > 0 ? 1 : g_st.wifi_count - 1)) % g_st.wifi_count;
+                                snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s",
+                                         g_st.wifi_list[g_st.net_ssid_cycle_idx].ssid);
+                                g_st.net_staged_ap = false;
+                                g_st.net_staged_dirty = true;
+                                trigger_chime(580, 25);
+                            } else if (g_st.rev_cursor == 2) {
+                                int next_role = (g_st.chain_role_idx + (ev.value > 0 ? 1 : 2)) % 3;
+                                commit_chain_settings(g_st.chain_secret, next_role);
+                            } else if (g_st.rev_cursor == 4) {
+                                g_st.debug_bar_mode = (g_st.debug_bar_mode + (ev.value > 0 ? 1 : 3)) % 4;
+                                trigger_chime(540, 25);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        const ThemeColors *th = &g_themes[g_st.theme_idx];
+        fill_rect(fb, 0, 0, PANEL_W, PANEL_H, th->bg);
+
+        /* ---- FireFly_RK3326_R36MAX_R36S Header Bar (firefly/ui/app.py + theme.py) ---- */
+        fill_rect(fb, 0, 0, PANEL_W, 82, th->panel2);
+        fill_rect(fb, 0, 80, PANEL_W, 2, th->border);
+        draw_text_s(fb, 14, 10, "FIREFLY * STUMP", th->ember, 3, 16);
+        draw_text_s(fb, 306, 14, g_st.ver_str, th->muted, 2, 14);
+
+        const char *disp_ip = (g_st.bridge_lan_ip[0] && strcmp(g_st.bridge_lan_ip, "127.0.0.1") != 0)
+                               ? g_st.bridge_lan_ip : g_st.net.primary_ip;
+
+        /* Right-aligned FireFly link indicator ("* AP <ip>" or "* LAN <ip>") */
+        fill_rect(fb, 486, 8, 222, 26, th->panel);
+        draw_border(fb, 486, 8, 222, 26, 1, g_st.ap_active ? th->ok : th->ember);
+        char link_pill[40];
+        snprintf(link_pill, sizeof(link_pill), "* %s %s",
+                 g_st.ap_active ? "AP" : "LAN", disp_ip);
+        draw_text_s(fb, 496, 14, link_pill, g_st.ap_active ? th->ok : th->ember_bright, 2, 17);
+
+        char line2[160];
+        snprintf(line2, sizeof(line2), "STUMP WEB: HTTP://%s%s/  %s  STUMPS:%d",
+                 disp_ip, (!g_st.http80_ok && g_st.http8080_ok) ? ":8080" : "",
+                 (g_st.http80_ok || g_st.http8080_ok) ? "UP" : "WAITING", g_st.mesh_peers);
+        draw_text_s(fb, 14, 40, line2, th->text, 2, 56);
+
+        char line3[160];
+        if (g_st.ap_active) {
+            snprintf(line3, sizeof(line3), "HOTSPOT:%s (%s on %s) CLIENTS:%d  TF-BAK:%d",
+                     g_st.ap_ssid, g_st.bridge_lan_ip, g_st.ap_if, g_st.ap_clients, g_st.tf_backup_count);
+            draw_text_s(fb, 14, 60, line3, th->ok, 2, 56);
+        } else {
+            snprintf(line3, sizeof(line3), "RT3070 LAN:%s (%s)  RNODE:%s  TF-BAK:%d",
+                     g_st.net.wifi_if[0] ? g_st.net.wifi_if : "wlan0", disp_ip,
+                     g_st.net.lora_online ? g_st.net.lora_dev : g_st.rnode_status,
+                     g_st.tf_backup_count);
+            draw_text_s(fb, 14, 60, line3, th->ok, 2, 56);
+        }
+
+        /* ---- 5 FireFly Navigation Tab Pills (L1 / R1) ---- */
+        const char *tabs[5] = { "1:CHATS", "2:BOARD", "3:FILES", "4:NETWORK", g_st.net_staged_dirty ? "5:SETUP*" : "5:SETUP" };
+        for (int t = 0; t < 5; t++) {
+            int tx = 10 + t * 141;
+            bool act = (t == g_st.tab_idx);
+            fill_rect(fb, tx, 88, 136, 34, act ? th->ember : th->panel2);
+            draw_border(fb, tx, 88, 136, 34, 2, act ? th->ember_bright : (t == 4 && g_st.net_staged_dirty ? th->ok : th->border));
+            draw_text_s(fb, tx + 10, 98, tabs[t], act ? th->bg : (t == 4 && g_st.net_staged_dirty ? th->ok : th->muted), 2, 10);
+        }
+
+        if (g_st.tab_idx == 0) {
+            /* Panel 1: FireFly_RK3326_R36MAX_R36S Chat Screen (firefly/ui/screens.py) */
+            for (int r = 0; r < 3; r++) {
+                int rx = 12 + r * 234;
+                bool ract = (r == g_st.room_idx);
+                fill_rect(fb, rx, 130, 228, 30, ract ? th->panel : th->panel2);
+                draw_border(fb, rx, 130, 228, 30, 2, ract ? th->ember : th->border);
+                char rlabel[48];
+                snprintf(rlabel, sizeof(rlabel), "%s (%d)", ROOM_NAMES[r], g_st.room_users[r]);
+                draw_text_s(fb, rx + 12, 138, rlabel, ract ? th->ember_bright : th->muted, 2, 18);
+            }
+
+            fill_rect(fb, 12, 166, PANEL_W - 24, 294, th->bg);
+            draw_border(fb, 12, 166, PANEL_W - 24, 294, 2, th->border);
+            int r = g_st.room_idx;
+            if (g_st.room_counts[r] == 0) {
+                draw_text_s(fb, 28, 192, "NO MESSAGES YET - L/R: ROOM, [Y]: OSK, [A]: SEND, [B]: CANCEL.", th->muted, 2, 54);
+            }
+            /* Render FireFly-style chat bubbles with Stump line coloring ([DM], * action, outgoing right-aligned) */
+            int start_m = (g_st.room_counts[r] > 7) ? (g_st.room_counts[r] - 7) : 0;
+            for (int idx_m = start_m; idx_m < g_st.room_counts[r]; idx_m++) {
+                int slot_vis = idx_m - start_m;
+                int by = 172 + slot_vis * 40;
+                const char *nk = g_st.rooms[r][idx_m].nick;
+                const char *bd = g_st.rooms[r][idx_m].body;
+                bool is_sys = g_st.rooms[r][idx_m].is_sys;
+                bool is_out = (!is_sys && (strcmp(nk, "r36max") == 0 || strcmp(nk, "you") == 0));
+                bool is_dm  = (strncmp(bd, "[DM]", 4) == 0);
+                bool is_act = (strncmp(bd, "* ", 2) == 0);
+
+                int bx = is_out ? 132 : 20;
+                int bw = PANEL_W - 152;
+                uint32_t b_bg = is_out ? th->panel : th->panel2;
+                uint32_t b_bd = is_out ? th->ember : (is_sys ? th->ok : th->border);
+                fill_rect(fb, bx, by, bw, 35, b_bg);
+                draw_border(fb, bx, by, bw, 35, 1, b_bd);
+
+                uint32_t fg = th->text;
+                if (is_dm) fg = 0xFFC8A2C8u;        /* FireFly DM_BODY purple */
+                else if (is_act) fg = 0xFFC8B48Fu;  /* FireFly ACTION tan */
+                else if (is_sys) fg = th->ember_bright;
+
+                char row_txt[128];
+                if (is_out) {
+                    snprintf(row_txt, sizeof(row_txt), "<%s> %-31.31s OK", nk, bd);
+                } else {
+                    snprintf(row_txt, sizeof(row_txt), "<%s> %s", nk, bd);
+                }
+                draw_text_s(fb, bx + 10, by + 10, row_txt, fg, 2, 45);
+            }
+
+            /* FireFly Composer Bar with byte & LoRa packet counter ("%d/295 B * 1 LORA PKT") */
+            fill_rect(fb, 12, 466, PANEL_W - 24, 38, th->panel2);
+            draw_border(fb, 12, 466, PANEL_W - 24, 38, 2, (g_st.osk_open || g_st.input_len > 0) ? th->ember : th->border);
+            char comp_line[160];
+            if (g_st.input_len > 0) {
+                snprintf(comp_line, sizeof(comp_line), "> %-26.26s_  %d/295B 1PKT ([A]SEND [B]CLR)",
+                         g_st.input_buf, g_st.input_len);
+                draw_text_s(fb, 22, 478, comp_line, th->ok, 2, 55);
+            } else {
+                snprintf(comp_line, sizeof(comp_line), "> Type message...  0/295B * 1 LORA PKT  ([Y]:OSK [A]:SEND)");
+                draw_text_s(fb, 22, 478, comp_line, th->muted, 2, 55);
+            }
+
+            if (g_st.osk_open) {
+                fill_rect(fb, 12, 510, PANEL_W - 24, 154, th->panel2);
+                draw_border(fb, 12, 510, PANEL_W - 24, 154, 2, th->ember);
+                draw_text_s(fb, 24, 518, "VIRTUAL KEYBOARD (DPAD MOVE, [A]:TYPE, [B]:CANCEL/CLOSE, [X]:DEL):", th->ember_bright, 2, 56);
+                for (int kr = 0; kr < 4; kr++) {
+                    for (int kc = 0; kc < 10; kc++) {
+                        int kx = 22 + kc * 67;
+                        int ky = 540 + kr * 29;
+                        bool ksel = (kr == g_st.osk_row && kc == g_st.osk_col);
+                        fill_rect(fb, kx, ky, 62, 24, ksel ? th->ember : th->panel);
+                        draw_border(fb, kx, ky, 62, 24, 1, ksel ? th->ember_bright : th->border);
+                        const char *klbl = OSK_LABELS[kr][kc];
+                        int xoff = (strlen(klbl) == 1) ? 24 : 8;
+                        draw_text_s(fb, kx + xoff, ky + 5, klbl, ksel ? th->bg : th->text, 2, 4);
+                    }
+                }
+            } else {
+                fill_rect(fb, 12, 510, PANEL_W - 24, 154, th->panel2);
+                draw_border(fb, 12, 510, PANEL_W - 24, 154, 2, th->border);
+                draw_text_s(fb, 24, 520, "QUICK MESH DECK (UP/DN SELECT, [A]: ACCEPT/SEND, [B]: CANCEL):", th->muted, 2, 56);
+                for (int c = 0; c < 6; c++) {
+                    int col = c % 2, row = c / 2;
+                    int cx = 24 + col * 340, cy = 548 + row * 36;
+                    bool sel = (c == g_st.cmd_cursor);
+                    fill_rect(fb, cx - 6, cy - 5, 326, 26, sel ? th->ember : th->panel);
+                    if (!sel) draw_border(fb, cx - 6, cy - 5, 326, 26, 1, th->border);
+                    draw_text_s(fb, cx + 4, cy + 1, QUICK_CMDS[c], sel ? th->bg : th->text, 2, 26);
+                }
+            }
+        } else if (g_st.tab_idx == 1) {
+            /* Panel 2: Bulletin Board — [A]=Check [X] / Accept, [B]=Cancel / Clear [X] */
+            fill_rect(fb, 12, 130, PANEL_W - 24, 534, th->panel);
+            draw_border(fb, 12, 130, PANEL_W - 24, 534, 2, th->border);
+            int chk_cnt = count_checked_boards();
+            char bhead[96];
+            snprintf(bhead, sizeof(bhead), "BULLETIN BOARD (%d POSTS | %d CHECKED [X]) - [A]=CHECK [B]=CLEAR",
+                     g_st.board_count, chk_cnt);
+            draw_text_s(fb, 24, 142, bhead, th->ember_bright, 2, 55);
+
+            if (g_st.board_count == 0) {
+                draw_text_s(fb, 28, 196, "NO NOTICES ON BOARD YET. SELECT ACTION BAR BELOW TO POST!", th->muted, 2, 52);
+            }
+            for (int b = 0; b < g_st.board_count && b < 4; b++) {
+                int by = 172 + b * 88;
+                bool sel = (b == g_st.board_cursor);
+                bool chk = g_st.board[b].checked;
+                fill_rect(fb, 24, by, PANEL_W - 48, 78, th->panel2);
+                draw_border(fb, 24, by, PANEL_W - 48, 78, sel ? 3 : 1, chk ? th->ok : (sel ? th->ember_bright : th->border));
+                char tline[96], bline[96];
+                snprintf(tline, sizeof(tline), "%s[%c] %s [%s]",
+                         sel ? ">" : " ", chk ? 'X' : ' ', g_st.board[b].title, g_st.board[b].sig);
+                snprintf(bline, sizeof(bline), "     %s (ID:%s)", g_st.board[b].body, g_st.board[b].id);
+                draw_text_s(fb, 32, by + 12, tline, chk ? th->ok : (sel ? th->ember_bright : th->text), 2, 52);
+                draw_text_s(fb, 32, by + 44, bline, th->muted, 2, 52);
+            }
+
+            /* Action Toggle Bar at Row == board_count */
+            bool bar_sel = (g_st.board_cursor >= g_st.board_count);
+            fill_rect(fb, 24, 534, PANEL_W - 48, 118, th->panel2);
+            draw_border(fb, 24, 534, PANEL_W - 48, 118, bar_sel ? 3 : 2, bar_sel ? th->ember_bright : th->ember);
+            draw_text_s(fb, 34, 544, "[A]: CHECK [X] / ACCEPT  |  [B]: CANCEL / CLEAR [X]  |  [Y]: TF  |  [X]: DEL", th->ok, 2, 54);
+
+            const char *bmodes[3] = {
+                "1: BACKUP CHECKED -> TF CARD",
+                "2: DELETE CHECKED (CONFIRM)",
+                "3: POST NEW NOTICE"
+            };
+            char mline[96];
+            snprintf(mline, sizeof(mline), "%sACTION (L/R, [A] ACCEPT): < %s >",
+                     bar_sel ? "> " : "  ", bmodes[g_st.board_bar_mode]);
+            draw_text_s(fb, 34, 576, mline, bar_sel ? th->ember_bright : th->text, 2, 53);
+
+            char subline[96];
+            if (g_st.board_bar_mode == 0) {
+                snprintf(subline, sizeof(subline), "SAVES %d CHECKED NOTICE(S) TO /roms/ports/stump_r36max/tf_backup/", chk_cnt);
+            } else if (g_st.board_bar_mode == 1) {
+                snprintf(subline, sizeof(subline), "OPENS CONFIRMATION POPUP ([A]=ACCEPT [B]=CANCEL) FOR %d NOTICE(S)", chk_cnt);
+            } else {
+                snprintf(subline, sizeof(subline), "NEXT NOTICE PRESET: %s", BOARD_PRESET_TITLES[g_st.board_preset_idx]);
+            }
+            draw_text_s(fb, 34, 608, subline, th->muted, 2, 53);
+        } else if (g_st.tab_idx == 2) {
+            /* Panel 3: Shared File Shelf (/sd/shared) — [A]=Check [X] / Accept, [B]=Cancel / Clear [X] */
+            fill_rect(fb, 12, 130, PANEL_W - 24, 534, th->panel);
+            draw_border(fb, 12, 130, PANEL_W - 24, 534, 2, th->border);
+            int chk_files = count_checked_files();
+            char fhead[96];
+            snprintf(fhead, sizeof(fhead), "SHARED FILE SHELF (%d FILES | %d CHECKED [X] | %d/%d KB)",
+                     g_st.file_count, chk_files, g_st.used_kb, g_st.ceil_kb);
+            draw_text_s(fb, 24, 142, fhead, th->ember_bright, 2, 55);
+
+            if (g_st.file_count == 0) {
+                draw_text_s(fb, 28, 196, "NO FILES IN /SD/SHARED YET. USE ACTION BAR BELOW TO SHARE!", th->muted, 2, 52);
+            }
+            for (int f = 0; f < g_st.file_count && f < 5; f++) {
+                int fy = 172 + f * 70;
+                bool sel = (f == g_st.file_cursor);
+                bool chk = g_st.files[f].checked;
+                fill_rect(fb, 24, fy, PANEL_W - 48, 60, th->panel2);
+                draw_border(fb, 24, fy, PANEL_W - 48, 60, sel ? 3 : 1, chk ? th->ok : (sel ? th->ember_bright : th->border));
+                char fline[96];
+                snprintf(fline, sizeof(fline), "%s[%c] %-26.26s [%s] %d KB",
+                         sel ? ">" : " ", chk ? 'X' : ' ', g_st.files[f].name, g_st.files[f].cat, g_st.files[f].size_kb);
+                draw_text_s(fb, 32, fy + 10, fline, chk ? th->ok : (sel ? th->ember_bright : th->text), 2, 52);
+                draw_text_s(fb, 32, fy + 36, "     [A] OR L/R: CHECK [X]   [B]: CLEAR [X]   [Y]: TF   [X]: DELETE", th->muted, 2, 52);
+            }
+
+            /* Action Toggle Bar at Row == file_count */
+            bool bar_sel = (g_st.file_cursor >= g_st.file_count);
+            fill_rect(fb, 24, 534, PANEL_W - 48, 118, th->panel2);
+            draw_border(fb, 24, 534, PANEL_W - 48, 118, bar_sel ? 3 : 2, bar_sel ? th->ember_bright : th->ember);
+            draw_text_s(fb, 34, 544, "[A]: CHECK [X] / ACCEPT  |  [B]: CANCEL / CLEAR [X]  |  [Y]: TF  |  [X]: DEL", th->ok, 2, 54);
+
+            const char *fmodes[3] = {
+                "1: BACKUP CHECKED -> TF CARD",
+                "2: DELETE CHECKED (CONFIRM)",
+                "3: SHARE NEW FIELD FILE"
+            };
+            char mline[96];
+            snprintf(mline, sizeof(mline), "%sACTION (L/R, [A] ACCEPT): < %s >",
+                     bar_sel ? "> " : "  ", fmodes[g_st.file_bar_mode]);
+            draw_text_s(fb, 34, 576, mline, bar_sel ? th->ember_bright : th->text, 2, 53);
+
+            char subline[96];
+            if (g_st.file_bar_mode == 0) {
+                snprintf(subline, sizeof(subline), "COPIES %d CHECKED FILE(S) TO /roms/ports/stump_r36max/tf_backup/", chk_files);
+            } else if (g_st.file_bar_mode == 1) {
+                snprintf(subline, sizeof(subline), "OPENS CONFIRMATION POPUP ([A]=ACCEPT [B]=CANCEL) FOR %d FILE(S)", chk_files);
+            } else {
+                snprintf(subline, sizeof(subline), "NEXT FILE GENERATOR: %s", FILE_ACTION_LABELS[g_st.file_action_idx]);
+            }
+            draw_text_s(fb, 34, 608, subline, th->muted, 2, 53);
+        } else if (g_st.tab_idx == 3) {
+            /* Panel 4: Stage Wi-Fi / AP Settings -> Review & Apply in Panel 5 */
+            fill_rect(fb, 12, 130, PANEL_W - 24, 534, th->panel);
+            draw_border(fb, 12, 130, PANEL_W - 24, 534, 2, th->border);
+
+            fill_rect(fb, 24, 140, PANEL_W - 48, 66, th->panel2);
+            draw_border(fb, 24, 140, PANEL_W - 48, 66, 2, th->border);
+            char t1[160], t2[160];
+            snprintf(t1, sizeof(t1), "LIVE NOW: %s (%s)  |  STAGED: %s%s",
+                     g_st.ap_active ? "HOTSPOT" : "LOCAL LAN WIFI",
+                     disp_ip,
+                     g_st.net_staged_ap ? "HOTSPOT" : (g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "LOCAL LAN DHCP"),
+                     g_st.net_staged_dirty ? " [*PENDING*]" : " [SYNCED]");
+            snprintf(t2, sizeof(t2), "CHAIN: %s (ID:%s PEERS:%d)  |  STAGE HERE -> APPLY IN PANEL 5",
+                     g_st.chain_has_secret ? g_st.chain_secret : "NO SECRET (SET IN PANEL 5)",
+                     g_st.chain_id,
+                     g_st.chain_peers);
+            draw_text_s(fb, 34, 150, t1, g_st.net_staged_dirty ? th->ok : th->text, 2, 54);
+            draw_text_s(fb, 34, 178, t2, g_st.chain_has_secret ? th->ok : th->ember_bright, 2, 54);
+
+            /* Left Box: Row 0 = Stage Mode, Row 1 = Wi-Fi Utility Toggle, Rows 2..N = Stage SSID */
+            fill_rect(fb, 24, 214, 426, 248, th->panel2);
+            draw_border(fb, 24, 214, 426, 248, 2, th->border);
+            draw_text_s(fb, 34, 222, "STAGE NETWORK ([A]=REVIEW IN TAB 5, [B]=CANCEL):", th->ember_bright, 2, 34);
+
+            /* Row 0: Stage Radio Mode (never switches live radio directly!) */
+            {
+                bool sel0 = (g_st.wifi_cursor == 0);
+                int ry0 = 246;
+                fill_rect(fb, 32, ry0, 410, 30, sel0 ? th->ember : th->panel);
+                draw_border(fb, 32, ry0, 410, 30, 1, sel0 ? th->ember_bright : th->border);
+                char r0txt[96];
+                snprintf(r0txt, sizeof(r0txt), "%sSTAGE: < %s >",
+                         sel0 ? ">" : " ",
+                         g_st.net_staged_ap ? "HOTSPOT ON" : "LOCAL LAN WIFI DHCP");
+                draw_text_s(fb, 38, ry0 + 8, r0txt, sel0 ? th->bg : (g_st.net_staged_ap ? th->ok : th->ember_bright), 2, 33);
+            }
+
+            /* Row 1: Chain & Wi-Fi Utility Bar (0=Set Chain Secret OSK, 1=Scan LAN Chain, 2=Rescan Wi-Fi, 3=Wi-Fi Pass OSK) */
+            {
+                bool sel1 = (g_st.wifi_cursor == 1);
+                int ry1 = 280;
+                fill_rect(fb, 32, ry1, 410, 28, sel1 ? th->ember : th->panel);
+                draw_border(fb, 32, ry1, 410, 28, 1, sel1 ? th->ember_bright : th->border);
+                const char *wtools[4] = {
+                    "SET CHAIN SECRET (OSK)",
+                    "SCAN LAN STUMP CHAIN",
+                    "RESCAN 2.4GHZ WIFI",
+                    "OPEN WIFI PASSWORD OSK"
+                };
+                char r1txt[96];
+                snprintf(r1txt, sizeof(r1txt), "%sTOOL (L/R, [A]): < %s >", sel1 ? ">" : " ", wtools[g_st.wifi_bar_mode % 4]);
+                draw_text_s(fb, 38, ry1 + 7, r1txt, sel1 ? th->bg : th->text, 2, 33);
+            }
+
+            /* Rows 2..N: Discovered Wi-Fi Networks (Press [A] to stage into Panel 5) */
+            for (int w = 0; w < g_st.wifi_count && w < 4; w++) {
+                bool selw = (g_st.wifi_cursor == (w + 2));
+                int ry = 314 + w * 34;
+                fill_rect(fb, 32, ry, 410, 30, selw ? th->ember : th->panel);
+                draw_border(fb, 32, ry, 410, 30, 1, selw ? th->ember_bright : th->border);
+                char wtxt[96];
+                snprintf(wtxt, sizeof(wtxt), "%s%s%-17.17s [%s %d%%]",
+                         selw ? ">" : " ",
+                         g_st.wifi_list[w].active ? "*" : " ",
+                         g_st.wifi_list[w].ssid,
+                         g_st.wifi_list[w].sec,
+                         g_st.wifi_list[w].signal);
+                draw_text_s(fb, 38, ry + 8, wtxt,
+                            selw ? th->bg : (g_st.wifi_list[w].active ? th->ok : th->text), 2, 33);
+            }
+
+            /* Right Box: Scannable ISO 18004 QR Code */
+            fill_rect(fb, 458, 214, 238, 248, th->panel2);
+            draw_border(fb, 458, 214, 238, 248, 2, th->border);
+            draw_text_s(fb, 468, 222, g_st.qr_mode == 1 ? "WIFI JOIN QR [X]" : "PORTAL :80 QR [X]", th->ok, 2, 18);
+            int qs = 7;
+            int qx = 458 + (238 - (25 * qs)) / 2;
+            int qy = 254;
+            fill_rect(fb, qx - 2 * qs, qy - 2 * qs, (25 + 4) * qs, (25 + 4) * qs, 0xFFFFFFFFu);
+            for (int r = 0; r < 25; r++) {
+                for (int c = 0; c < 25; c++) {
+                    if (g_st.qr_grid[r][c]) {
+                        fill_rect(fb, qx + c * qs, qy + r * qs, qs, qs, 0xFF000000u);
+                    }
+                }
+            }
+            draw_text_s(fb, 466, 440, g_st.qr_url, th->muted, 1, 36);
+
+            /* Chain Secret / Wi-Fi Password Composer Bar */
+            fill_rect(fb, 24, 468, PANEL_W - 48, 38, th->panel2);
+            draw_border(fb, 24, 468, PANEL_W - 48, 38, 2, (g_st.osk_open || g_st.input_len > 0) ? th->ember_bright : th->border);
+            char pw_line[160];
+            if (g_st.osk_open && g_st.osk_target == 1) {
+                snprintf(pw_line, sizeof(pw_line), "CHAIN SECRET > %s_  ([A] ON 'OK' TO SAVE & LINK, [B]: CANCEL)", g_st.input_buf);
+                draw_text_s(fb, 34, 480, pw_line, th->ok, 2, 54);
+            } else if (g_st.input_len > 0) {
+                snprintf(pw_line, sizeof(pw_line), "WIFI PASS > %s_  ([A]: STAGE SSID -> PANEL 5  [B]: CANCEL)", g_st.input_buf);
+                draw_text_s(fb, 34, 480, pw_line, th->ok, 2, 54);
+            } else {
+                snprintf(pw_line, sizeof(pw_line), "CHAIN SECRET: %s  ([Y]: EDIT SECRET / WIFI PASS  [A]: STAGE)",
+                         g_st.chain_has_secret ? g_st.chain_secret : "NONE (PRESS [Y] TO SET)");
+                draw_text_s(fb, 34, 480, pw_line, g_st.chain_has_secret ? th->ok : th->ember_bright, 2, 54);
+            }
+
+            if (g_st.osk_open) {
+                fill_rect(fb, 24, 512, PANEL_W - 48, 146, th->panel2);
+                draw_border(fb, 24, 512, PANEL_W - 48, 146, 2, th->ember);
+                draw_text_s(fb, 34, 518,
+                            g_st.osk_target == 1
+                                ? "STUMP CHAIN SECRET KEYBOARD ([A]:TYPE, 'OK':SAVE & LINK, [B]:CANCEL):"
+                                : "WIFI PASSWORD KEYBOARD ([A]:TYPE, 'OK':SAVE, [B]:CANCEL, [X]:DEL):",
+                            th->ember_bright, 2, 54);
+                for (int kr = 0; kr < 4; kr++) {
+                    for (int kc = 0; kc < 10; kc++) {
+                        int kx = 30 + kc * 66;
+                        int ky = 538 + kr * 28;
+                        bool ksel = (kr == g_st.osk_row && kc == g_st.osk_col);
+                        fill_rect(fb, kx, ky, 61, 23, ksel ? th->ember : th->panel);
+                        draw_border(fb, kx, ky, 61, 23, 1, ksel ? th->ember_bright : th->border);
+                        const char *klbl = OSK_LABELS[kr][kc];
+                        int xoff = (strlen(klbl) == 1) ? 24 : 8;
+                        draw_text_s(fb, kx + xoff, ky + 5, klbl, ksel ? th->bg : th->text, 2, 4);
+                    }
+                }
+            } else {
+                fill_rect(fb, 24, 514, PANEL_W - 48, 142, th->panel2);
+                draw_border(fb, 24, 514, PANEL_W - 48, 142, 2, th->border);
+                draw_text_s(fb, 36, 526, "STUMP CHAIN (:4242) + SAFE 2-STEP NETWORK REVISION:", th->ember_bright, 2, 52);
+                draw_text_s(fb, 36, 554, "1. PRESS [Y] (OR TOOL ROW [A]) TO SET SHARED STUMP CHAIN SECRET.", th->ok, 2, 53);
+                draw_text_s(fb, 36, 582, "2. PICK WIFI/AP ABOVE & PRESS [A] TO REVIEW & APPLY IN PANEL 5.", th->text, 2, 53);
+                draw_text_s(fb, 36, 610, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->ember_bright, 2, 53);
+            }
+        } else {
+            /* Panel 5 (5:REV/DBG): Network + Stump Chain Revision + Debug Tools + Live Logs */
+            fill_rect(fb, 12, 130, PANEL_W - 24, 534, th->panel);
+            draw_border(fb, 12, 130, PANEL_W - 24, 534, 2, th->border);
+
+            /* Top Box: Network & Stump Chain Settings Revision (LIVE vs STAGED) */
+            fill_rect(fb, 24, 136, PANEL_W - 48, 224, th->panel2);
+            draw_border(fb, 24, 136, PANEL_W - 48, 224, 2, g_st.net_staged_dirty ? th->ok : th->ember);
+            char rev_hdr[128];
+            snprintf(rev_hdr, sizeof(rev_hdr), "NETWORK & STUMP CHAIN REVISION (%s)  |  %s",
+                     g_st.net_staged_dirty ? "*PENDING*" : "SYNCED",
+                     g_st.ver_str);
+            draw_text_s(fb, 34, 143, rev_hdr, g_st.net_staged_dirty ? th->ok : th->ember_bright, 2, 54);
+
+            char live_sum[140];
+            snprintf(live_sum, sizeof(live_sum), "LIVE: %s (%s) | CHAIN:%s PEERS:%d (%s)",
+                     g_st.ap_active ? "STUMP AP" : "LAN WIFI",
+                     disp_ip,
+                     g_st.chain_has_secret ? g_st.chain_id : "NO-SECRET",
+                     g_st.chain_peers,
+                     g_st.chain_peer_ip[0] && strcmp(g_st.chain_peer_ip, "-") != 0 ? g_st.chain_peer_ip : "SCANNING");
+            draw_text_s(fb, 34, 165, live_sum, g_st.chain_peers > 0 ? th->ok : th->text, 2, 54);
+
+            /* Row 0: Staged Radio Mode */
+            {
+                bool r0 = (g_st.rev_cursor == 0);
+                fill_rect(fb, 32, 188, PANEL_W - 64, 28, r0 ? th->ember : th->panel);
+                draw_border(fb, 32, 188, PANEL_W - 64, 28, 1, r0 ? th->ember_bright : th->border);
+                char r0line[120];
+                snprintf(r0line, sizeof(r0line), "%s1. STAGED MODE (L/R): < %s >",
+                         r0 ? "> " : "  ",
+                         g_st.net_staged_ap ? "HOTSPOT (OPEN, 10.42.0.1)" : "LOCAL LAN WIFI CLIENT (DHCP)");
+                draw_text_s(fb, 38, 195, r0line, r0 ? th->bg : (g_st.net_staged_ap ? th->ok : th->ember_bright), 2, 52);
+            }
+
+            /* Row 1: Staged Target SSID / AP Channel */
+            {
+                bool r1 = (g_st.rev_cursor == 1);
+                fill_rect(fb, 32, 220, PANEL_W - 64, 28, r1 ? th->ember : th->panel);
+                draw_border(fb, 32, 220, PANEL_W - 64, 28, 1, r1 ? th->ember_bright : th->border);
+                char r1line[120];
+                if (g_st.net_staged_ap) {
+                    snprintf(r1line, sizeof(r1line), "%s2. HOTSPOT: SSID=PC_HOTSPOT_NAME (config.py), OPEN, 10.42.0.1",
+                             r1 ? "> " : "  ");
+                } else {
+                    snprintf(r1line, sizeof(r1line), "%s2. TARGET LAN SSID (L/R OR [A] PICK): < %s >",
+                             r1 ? "> " : "  ",
+                             g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "SAVED SYSTEM WIFI DHCP");
+                }
+                draw_text_s(fb, 38, 227, r1line, r1 ? th->bg : th->text, 2, 52);
+            }
+
+            /* Row 2: Stump Chain Secret & Role (SandBox_Stump_On provisioner.py parity) */
+            {
+                bool r2 = (g_st.rev_cursor == 2);
+                fill_rect(fb, 32, 252, PANEL_W - 64, 30, r2 ? th->ember : th->panel);
+                draw_border(fb, 32, 252, PANEL_W - 64, 30, 1, r2 ? th->ember_bright : (g_st.chain_has_secret ? th->ok : th->warn));
+                const char *roles[3] = { "AUTO(HUB+UPLINK)", "ROOT(:4242)", "MEMBER" };
+                const char *shown_sec = g_st.chain_secret[0] ? g_st.chain_secret : "NONE [PRESS A/Y TO SET]";
+                char r2line[140];
+                snprintf(r2line, sizeof(r2line), "%s3. CHAIN SECRET ([A]/[Y]=EDIT, L/R=ROLE): <%s> [%s]",
+                         r2 ? "> " : "  ",
+                         shown_sec,
+                         roles[g_st.chain_role_idx % 3]);
+                draw_text_s(fb, 38, 260, r2line, r2 ? th->bg : (g_st.chain_has_secret ? th->ok : th->warn), 2, 52);
+            }
+
+            /* Row 3: [A] ACCEPT & APPLY REVISION  |  [B] CANCEL & REVERT STAGED */
+            {
+                bool r3 = (g_st.rev_cursor == 3);
+                fill_rect(fb, 32, 286, PANEL_W - 64, 32, r3 ? th->ok : th->panel);
+                draw_border(fb, 32, 286, PANEL_W - 64, 32, 2, r3 ? th->text : (g_st.net_staged_dirty ? th->ok : th->border));
+                char r3line[120];
+                snprintf(r3line, sizeof(r3line), "%s4. [A] ACCEPT & APPLY REVISION + CHAIN  |  [B] CANCEL / REVERT",
+                         r3 ? "> " : "  ");
+                draw_text_s(fb, 38, 295, r3line, r3 ? th->bg : th->ok, 2, 52);
+            }
+
+            draw_text_s(fb, 34, 326, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->muted, 2, 54);
+
+            /* Row 4: Debug & Chain Action Toggle Bar */
+            {
+                bool r4 = (g_st.rev_cursor == 4);
+                fill_rect(fb, 24, 366, PANEL_W - 48, 54, r4 ? th->ember : th->panel2);
+                draw_border(fb, 24, 366, PANEL_W - 48, 54, 2, r4 ? th->ember_bright : th->border);
+                const char *dtools[4] = {
+                    "SCAN & LINK LAN CHAIN (:4244/:4242)",
+                    "EDIT CHAIN SECRET (ON-SCREEN KEYBOARD)",
+                    "EXPORT DIAG + LOGS -> TF CARD",
+                    "HEAL VISITOR HTTP :80/:8080"
+                };
+                char dtline[128];
+                snprintf(dtline, sizeof(dtline), "%s5. TOOL (L/R, [A] RUN): < %s >",
+                         r4 ? "> " : "  ", dtools[g_st.debug_bar_mode % 4]);
+                draw_text_s(fb, 34, 373, dtline, r4 ? th->bg : th->ember_bright, 2, 52);
+                char dt2[128];
+                snprintf(dt2, sizeof(dtline), "   CHAIN ID:%s  PEERS:%d  ([Y]=SET CHAIN SECRET  [X]=SCAN LAN CHAIN)",
+                         g_st.chain_id, g_st.chain_peers);
+                draw_text_s(fb, 34, 396, dt2, r4 ? th->bg : th->ok, 2, 52);
+            }
+
+            /* Row 5: Either Chain Secret OSK Overlay OR Live System & Chain Log Viewport */
+            if (g_st.osk_open) {
+                fill_rect(fb, 24, 426, PANEL_W - 48, 228, th->panel2);
+                draw_border(fb, 24, 426, PANEL_W - 48, 228, 2, th->ember_bright);
+                char sec_line[160];
+                snprintf(sec_line, sizeof(sec_line), "CHAIN SECRET > %s_  ([A] ON 'OK' TO SAVE, [B]=CANCEL, [X]=BACKSPACE)", g_st.input_buf);
+                draw_text_s(fb, 34, 436, sec_line, th->ok, 2, 54);
+                draw_text_s(fb, 34, 460, "SHARED PASSPHRASE FOR ALL STUMPS ON YOUR LAN (HMAC + AES-128-CBC):", th->muted, 2, 54);
+                for (int kr = 0; kr < 4; kr++) {
+                    for (int kc = 0; kc < 10; kc++) {
+                        int kx = 30 + kc * 66;
+                        int ky = 486 + kr * 38;
+                        bool ksel = (kr == g_st.osk_row && kc == g_st.osk_col);
+                        fill_rect(fb, kx, ky, 61, 32, ksel ? th->ember : th->panel);
+                        draw_border(fb, kx, ky, 61, 32, 1, ksel ? th->ember_bright : th->border);
+                        const char *klbl = OSK_LABELS[kr][kc];
+                        int xoff = (strlen(klbl) == 1) ? 24 : 8;
+                        draw_text_s(fb, kx + xoff, ky + 9, klbl, ksel ? th->bg : th->text, 2, 4);
+                    }
+                }
+            } else {
+                bool r5 = (g_st.rev_cursor == 5);
+                fill_rect(fb, 24, 426, PANEL_W - 48, 228, th->panel2);
+                draw_border(fb, 24, 426, PANEL_W - 48, 228, 2, r5 ? th->ember_bright : th->border);
+                char lhead[96];
+                snprintf(lhead, sizeof(lhead), "%s6. LIVE SYSTEM, RADIO & CHAIN LOGS (%d ENTRIES - UP/DN SCROLL):",
+                         r5 ? "> " : "  ", g_st.debug_log_count);
+                draw_text_s(fb, 34, 434, lhead, r5 ? th->ember_bright : th->muted, 2, 54);
+
+                if (g_st.debug_log_count == 0) {
+                    draw_text_s(fb, 34, 468, "NO LOGS YET - PRESS [X] TO SCAN LAN STUMP CHAIN OR [Y] FOR SECRET.", th->muted, 2, 52);
+                }
+                int start_idx = g_st.debug_scroll;
+                if (start_idx > g_st.debug_log_count - 1) start_idx = 0;
+                for (int i = 0; i < 6 && (start_idx + i) < g_st.debug_log_count; i++) {
+                    int ly = 462 + i * 28;
+                    draw_text_s(fb, 34, ly, g_st.debug_logs[start_idx + i], th->text, 2, 54);
+                }
+            }
+        }
+
+        /* ---- Prominent "IN PROCESS..." State Banner Overlay ---- */
+        if (is_ui_busy()) {
+            const char *bmsg = g_st.busy_msg[0] ? g_st.busy_msg : "IN PROCESS: PLEASE WAIT...";
+            fill_rect(fb, 36, 126, PANEL_W - 72, 44, th->bg);
+            fill_rect(fb, 40, 130, PANEL_W - 80, 36, th->ember);
+            draw_border(fb, 40, 130, PANEL_W - 80, 36, 3, th->ember_bright);
+            draw_text_s(fb, 54, 140, bmsg, th->bg, 2, 50);
+        }
+
+        /* ---- Confirmation Modal Overlay ([A] = ACCEPT, [B] = CANCEL) ---- */
+        if (g_st.confirm_open) {
+            fill_rect(fb, 56, 206, PANEL_W - 112, 258, th->bg);
+            fill_rect(fb, 62, 212, PANEL_W - 124, 246, th->panel);
+            draw_border(fb, 62, 212, PANEL_W - 124, 246, 4, g_st.confirm_type == 3 ? th->ok : th->warn);
+
+            if (g_st.confirm_type == 3) {
+                draw_text_s(fb, 92, 234, "APPLY STAGED NETWORK REVISION?", th->ok, 3, 32);
+                draw_text_s(fb, 88, 282, "PROPOSED NETWORK CONFIGURATION TO APPLY:", th->muted, 2, 44);
+            } else {
+                draw_text_s(fb, 110, 234, "ARE YOU SURE YOU WANT TO ERASE?", th->warn, 3, 32);
+                draw_text_s(fb, 88, 282,
+                            g_st.confirm_type == 1 ? "CHECKED BILLBOARD NOTICES TO ERASE:" : "CHECKED SHARED FILES TO ERASE:",
+                            th->muted, 2, 44);
+            }
+            draw_text_s(fb, 88, 314, g_st.confirm_label, th->ember_bright, 2, 44);
+
+            /* Choice 0: NO / CANCEL */
+            bool c0 = (g_st.confirm_choice == 0);
+            fill_rect(fb, 90, 362, 250, 54, c0 ? th->ember : th->panel2);
+            draw_border(fb, 90, 362, 250, 54, 3, c0 ? th->text : th->border);
+            draw_text_s(fb, 108, 382, c0 ? "> [B] NO, CANCEL <" : "  [B] NO, CANCEL  ", c0 ? th->bg : th->text, 2, 18);
+
+            /* Choice 1: YES / ACCEPT */
+            bool c1 = (g_st.confirm_choice == 1);
+            uint32_t c1_col = (g_st.confirm_type == 3) ? th->ok : th->warn;
+            fill_rect(fb, 380, 362, 250, 54, c1 ? c1_col : th->panel2);
+            draw_border(fb, 380, 362, 250, 54, 3, c1 ? th->text : th->border);
+            draw_text_s(fb, 396, 382,
+                        g_st.confirm_type == 3 ? (c1 ? "> [A] YES, APPLY <" : "  [A] YES, APPLY  ")
+                                               : (c1 ? "> [A] YES, ERASE <" : "  [A] YES, ERASE  "),
+                        c1 ? th->bg : c1_col, 2, 18);
+
+            draw_text_s(fb, 92, 430, "LEFT/RIGHT: SELECT   [A]: ACCEPT CHOICE   [B]: CANCEL IMMEDIATELY", th->muted, 2, 50);
+        }
+
+        /* ---- FireFly_RK3326_R36MAX_R36S Bottom Hints Bar (firefly/ui/widgets.py) ---- */
+        fill_rect(fb, 0, PANEL_H - 42, PANEL_W, 42, th->panel2);
+        fill_rect(fb, 0, PANEL_H - 42, PANEL_W, 2, th->border);
+        if (g_st.confirm_open) {
+            draw_text_s(fb, 16, PANEL_H - 28, "CONFIRM: [A]=ACCEPT HIGHLIGHTED   [B]=CANCEL IMMEDIATELY   L/R:NO/YES", th->ember_bright, 2, 58);
+        } else {
+            const char *hk[5] = { "A", "B", "Y", "X", "L/R" };
+            const char *hv0[5] = { "Send/Act", "Cancel", "Keyboard", "/Auth", "Room/Tab" };
+            const char *hv1[5] = { "Check[X]", "Clear",  "TF-Save",  "Delete", "Toggle" };
+            const char *hv3[5] = { "Stage->5", "Cancel", "PassOSK",  "QRMode", "Toggle" };
+            const char *hv4[5] = { "Apply/Act","Revert", "ChainSec", "ScanLAN","Cycle" };
+            const char **hv = (g_st.tab_idx == 1 || g_st.tab_idx == 2) ? hv1
+                            : (g_st.tab_idx == 3) ? hv3
+                            : (g_st.tab_idx == 4) ? hv4 : hv0;
+            int hx = 14;
+            for (int hi = 0; hi < 5; hi++) {
+                int kw = (int)strlen(hk[hi]) * 12 + 12;
+                fill_rect(fb, hx, PANEL_H - 34, kw, 24, th->panel);
+                draw_border(fb, hx, PANEL_H - 34, kw, 24, 1, th->border);
+                draw_text_s(fb, hx + 6, PANEL_H - 28, hk[hi], th->text, 2, 4);
+                hx += kw + 6;
+                draw_text_s(fb, hx, PANEL_H - 28, hv[hi], th->muted, 2, 10);
+                hx += (int)strlen(hv[hi]) * 12 + 14;
+            }
+        }
+
+        /* Always publish RGBA buffer to /dev/shm/stump_fb.rgba for FireFly pygame.display.flip() presenter */
+        if (shm_rgba) {
+            const uint32_t *src = fb;
+            uint8_t *dst = shm_rgba;
+            for (int i = 0; i < PANEL_W * PANEL_H; i++) {
+                uint32_t px = src[i];
+                dst[0] = (uint8_t)((px >> 16) & 0xFFu);
+                dst[1] = (uint8_t)((px >> 8) & 0xFFu);
+                dst[2] = (uint8_t)(px & 0xFFu);
+                dst[3] = 0xFFu;
+                dst += 4;
+            }
+        }
+
+        if (tex && fn_UpdateTexture && fn_RenderCopy && fn_RenderPresent) {
+            fn_UpdateTexture(tex, NULL, fb, PANEL_W * 4);
+            if (fn_RenderClear) fn_RenderClear(ren);
+            fn_RenderCopy(ren, tex, NULL, NULL);
+            fn_RenderPresent(ren);
+        } else if (fb0_map) {
+            /* Always mirror 720x720 ARGB8888 pixels into /dev/fb0's CMA buffer so even if the CRTC is on fbdev
+             * (or KMSDRM is unavailable), the panel never displays black zeros. Only call FBIOPAN_DISPLAY when
+             * not using KMSDRM (--shm) or when STUMP_FB0_PAN=1 is signaled by stump_pygame_display.py. */
+            memcpy(fb0_map, fb, fb0_map_len);
+            if (!use_shm_only || force_fb0_pan) {
+                vinfo.xoffset = 0;
+                vinfo.yoffset = 0;
+                ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
+            }
+            if (max_frames == 0) usleep(16000);
+        } else {
+            if (max_frames == 0) usleep(16000);
+        }
+
+        frames++;
+        if (frames == 1) {
+            fprintf(stderr, "[Stump-R36MAX] First 720x720 frame rendered (%s)!\n", g_st.ver_str);
+            fflush(stderr);
+        }
+        if (max_frames > 0 && frames >= max_frames) {
+            fprintf(stderr, "[Stump-R36MAX] Smoke test rendered %d frames cleanly.\n", frames);
+            fflush(stderr);
+            g_st.running = false;
+            break;
+        }
+    }
+
+    if (audio_started) pthread_join(audio_tid, NULL);
+    free(fb);
+    if (shm_rgba) munmap(shm_rgba, PANEL_BYTES);
+    if (shm_fd >= 0) close(shm_fd);
+    if (max_frames == 0) unlink(SHM_FB_FILE);
+    if (g_st.udp_sock >= 0) close(g_st.udp_sock);
+    if (g_st.ipc_sock >= 0) close(g_st.ipc_sock);
+    if (tex && fn_DestroyTexture) fn_DestroyTexture(tex);
+    if (ren && fn_DestroyRenderer) fn_DestroyRenderer(ren);
+    if (win && fn_DestroyWindow) fn_DestroyWindow(win);
+    if (sdl && fn_Quit) fn_Quit();
+    if (fb0_map) munmap(fb0_map, fb0_map_len);
+    if (fb_fd >= 0) close(fb_fd);
+    for (int i = 0; i < 16; i++) {
+        if (ev_fds[i] >= 0) close(ev_fds[i]);
+    }
+    return 0;
+}
