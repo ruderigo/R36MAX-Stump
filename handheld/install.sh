@@ -234,6 +234,14 @@ PY
   [ -n "$NODE" ] && break; sleep 2
 done
 if [ -n "$NODE" ]; then ok "Stump up: $NODE"; else warn "the Stump isn't answering yet: see $STUMP_DIR/stump.log"; fi
+# 1.0.0-beta.43: a restarted Stump is re-introduced at once (asked by Team R36MAX;
+# SandBox_Stump_On PR #11). Older, the R36MAX names the others "mesh-xxxx" for
+# minutes after each restart, and lists them only at their half-hourly beacon.
+REL="$(echo "$NODE" | grep -oE '1\.0\.0-beta\.[0-9]+' | head -1)"
+if [ -n "$REL" ] && [ "${REL##*.}" -lt 43 ] 2>/dev/null; then
+  warn "this Stump runs $REL: 1.0.0-beta.43 or newer re-introduces it to the chain at once after a restart"
+fi
+echo "    (The others need 1.0.0-beta.43 too, LaBuche3 included: a Stump answers a restarted one only if it runs it.)"
 echo
 echo "Done. Open it from EmulationStation: Ports -> LaBuche_Stump. SELECT+START goes back."
 echo "The Stump runs in the background from boot, like any computer Stump:"

@@ -74,6 +74,10 @@ that's been saved.
 - **Deleting** notices or files uses the Stump's `/admin` delete with the admin
   password from `~/Stump/config.py`, which never leaves the handheld.
 - **TF backups and diagnostics** go to `/roms/ports/stump_r36max/tf_backup/`.
+- **After a restart** the R36MAX names and lists the other Stumps within about 10 s, when every
+  Stump runs SandBox_Stump_On 1.0.0-beta.43 or newer (PR #11, asked by Team R36MAX). With older
+  Stumps it shows them as `mesh-xxxx` for up to 2 minutes and lists them only at their
+  half-hourly beacon: the chain works, it just looks broken. The CAM (LaBuche3) needs it too.
 - Logs: `~/Stump/stump.log` (the Stump), `/roms/ports/stump_r36max/cockpit.log` (the cockpit).
 - Stop and start the Stump: `~/Stump/stop-stump.sh` / `~/Stump/start-stump.sh`, or
   `systemctl --user stop|start stump`.
