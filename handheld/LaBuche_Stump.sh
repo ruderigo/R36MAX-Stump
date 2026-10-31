@@ -92,5 +92,6 @@ done
 pkill -TERM -f "$FEED_PAT" 2>/dev/null
 pkill -TERM -x stump_r36max_engine 2>/dev/null
 rm -f /dev/shm/stump_user_quit /dev/shm/stump_live.txt /dev/shm/stump_cmd.txt /dev/shm/stump_fb.rgba 2>/dev/null
+sync
 printf '\033c' | $SUDO tee /dev/tty1 >/dev/null 2>&1
 echo "=== cockpit closed $(date); the Stump keeps running ===" >> "$LOG"

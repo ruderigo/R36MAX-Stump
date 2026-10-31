@@ -3234,6 +3234,7 @@ class Feed:
         self.hw = {}
         self.chain = {"enabled": False}
         self.stumps = []
+        self.chat_stumps = set()           # Stumps the chat knows (they can be ahead of the beacons)
         self.board = []
         self.files = []
         self.net = {"ap": False, "ap_if": "", "ap_mac": "", "ap_driver": "", "clients": 0,
@@ -3314,6 +3315,7 @@ class Feed:
                     log("DM", "%s: %s" % (m.get("nick"), m.get("body")))
             if room in self.users:
                 self.users[room] = len(d.get("users") or [])
+            self.chat_stumps = set(d.get("stumps") or [])
             st.fail = 0
             st.next_poll = time.time() + POLL_S * (1 + 0.3 * (os.getpid() % 10) / 10)
         except Exception as e:
@@ -3619,7 +3621,9 @@ class Feed:
         else:
             lora = (hw.get("lora") or {}).get("state")
             rlabel = "VIA CHAIN" if lora in ("up", "connecting") else "NO RADIO"
-        peers = len(self.stumps)
+        # Other Stumps: from their beacons (/stumps.json), or already from the
+        # chain's chat; a "mesh-xxxx" is one whose name hasn't arrived yet.
+        peers = len(set(s.get("name") for s in self.stumps) | self.chat_stumps)
         out = ["META|%s|%d|%s" % (clean(node.get("lxmf") or "STUMP OFFLINE", 32), peers, clean(rlabel, 23))]
         ip =clean(node.get("ap_ip") or self.net.get("ip") or "127.0.0.1", 20)
         out.append("VER|%s|%s|%d|%d|%s|%d" % (
@@ -3908,6 +3912,7 @@ done
 pkill -TERM -f "$FEED_PAT" 2>/dev/null
 pkill -TERM -x stump_r36max_engine 2>/dev/null
 rm -f /dev/shm/stump_user_quit /dev/shm/stump_live.txt /dev/shm/stump_cmd.txt /dev/shm/stump_fb.rgba 2>/dev/null
+sync
 printf '\\033c' | $SUDO tee /dev/tty1 >/dev/null 2>&1
 echo "=== cockpit closed $(date); the Stump keeps running ===" >> "$LOG"
 `;
