@@ -3366,6 +3366,9 @@ class Feed:
         settings: its own user service (provisioner --pc), else its Start file."""
         log("STUMP", "restarting (%s)" % why)
         ok, out = run(["systemctl", "--user", "restart", "stump"], timeout=30)
+        if not ok:      # no user manager (dArkOS): install.sh's system service
+            import getpass
+            ok, out = run(["sudo", "-n", "systemctl", "restart", "stump-" + getpass.getuser()], timeout=30)
         if not ok:
             start = os.path.join(STUMP_DIR, "start-stump.sh")
             stop = os.path.join(STUMP_DIR, "stop-stump.sh")
@@ -3845,6 +3848,8 @@ STUMP_DIR="$USER_HOME/Stump"
 LOG="$APP_DIR/cockpit.log"
 mkdir -p "$APP_DIR/drop" "$APP_DIR/tf_backup" 2>/dev/null
 echo "=== R36MAX Stump cockpit v2.0.0-r36max, $(date) ===" > "$LOG"
+# For diagnosing a black screen: who we are, and whether we can open the display.
+{ echo "user: $(id)"; ls -l /dev/dri/ /dev/fb0 /dev/tty1 2>&1; } >> "$LOG"
 
 # The display and gamepad, for the cockpit (as the old launcher did).
 $SUDO chmod 666 /dev/tty1 /dev/fb0 /dev/dri/card* /dev/dri/render* /dev/input/event* 2>/dev/null
@@ -3866,6 +3871,9 @@ rm -f /dev/shm/stump_user_quit /dev/shm/stump_live.txt /dev/shm/stump_cmd.txt /d
 # The Stump: started if it isn't running (normally it is, since boot).
 if [ ! -f "$STUMP_DIR/stump_pc.py" ]; then
   echo "No Stump in $STUMP_DIR: run handheld/install.sh first." >> "$LOG"
+elif systemctl cat "stump-$USER_NAME" >/dev/null 2>&1; then
+  # dArkOS has no systemd user manager: install.sh's system service.
+  systemctl is-active --quiet "stump-$USER_NAME" || { echo "Starting stump-$USER_NAME" >> "$LOG"; $SUDO systemctl start "stump-$USER_NAME" >> "$LOG" 2>&1; }
 elif ! as_user systemctl --user is-active --quiet stump 2>/dev/null; then
   echo "Starting the Stump (systemctl --user start stump)" >> "$LOG"
   as_user systemctl --user start stump >> "$LOG" 2>&1 || as_user sh "$STUMP_DIR/start-stump.sh" >> "$LOG" 2>&1
@@ -4046,14 +4054,59 @@ if [ "$CAP" = 1 ] && [ -d /etc/NetworkManager ]; then
                 "port=0" "dhcp-option=option:dns-server,10.42.0.1" | sudo tee /etc/NetworkManager/dnsmasq-shared.d/stump.conf >/dev/null
   ok "hotspot phones use the Stump's DNS (sign-in pop-up)"
 fi
-# Passwordless sudo for exactly what the cockpit does (devices, cursor, Wi-Fi).
+# The screen and gamepad for the user who runs the cockpit: its groups (they
+# apply from the next boot), and the devices opened up now for this boot.
+for g in video render input tty; do
+  getent group "$g" >/dev/null && sudo usermod -aG "$g" "$ME"
+done
+sudo chmod 666 /dev/dri/card* /dev/dri/render* /dev/fb0 /dev/input/event* 2>/dev/null
+ok "screen and gamepad: $ME is in $(id -nG "$ME" | tr ' ' ',')"
+
+# Passwordless sudo for exactly what the cockpit does (devices, cursor, Wi-Fi,
+# restarting the Stump's service).
+SYSTEMCTL="$(command -v systemctl || echo /usr/bin/systemctl)"
 SUDOERS=/etc/sudoers.d/stump-r36max
 TMP="$(mktemp)"
 printf '%s\\n' "# R36MAX Stump cockpit (R36MAX-Stump/handheld/install.sh)" \\
-  "$ME ALL=(root) NOPASSWD: /usr/bin/nmcli, /usr/bin/chmod, /usr/bin/tee, /usr/sbin/iw, /usr/bin/iw" > "$TMP"
-if sudo visudo -cf "$TMP" >/dev/null; then sudo install -m 0440 "$TMP" "$SUDOERS" && ok "sudoers: $SUDOERS"; else warn "sudoers check failed: not installed"; fi
+  "$ME ALL=(root) NOPASSWD: /usr/bin/nmcli, /usr/bin/chmod, /usr/bin/tee, /usr/sbin/iw, /usr/bin/iw, $SYSTEMCTL start stump-$ME, $SYSTEMCTL restart stump-$ME" > "$TMP"
+chmod 644 "$TMP"
+VISUDO=""
+for v in "$(command -v visudo 2>/dev/null)" /usr/sbin/visudo /sbin/visudo; do [ -n "$v" ] && [ -x "$v" ] && VISUDO="$v" && break; done
+if [ -n "$VISUDO" ]; then
+  if sudo "$VISUDO" -cf "$TMP" >/dev/null; then sudo install -m 0440 "$TMP" "$SUDOERS" && ok "sudoers: $SUDOERS"
+  else warn "sudoers check failed: not installed"; fi
+else
+  # No visudo here (dArkOS): put it in place and have sudo itself read it, as
+  # root, in the same shell; any error and it's removed there, so sudo never
+  # breaks. (sudo exits 0 even on a syntax error: its message is what counts.)
+  if sudo sh -c 'install -m 0440 "$1" "$2" || exit 1
+                 if sudo -l -U "$3" 2>&1 | grep -qiE "syntax error|parse error|no valid sudoers"; then rm -f "$2"; exit 1; fi' \\
+       sh "$TMP" "$SUDOERS" "$ME"; then
+    ok "sudoers: $SUDOERS (checked by sudo itself; no visudo here)"
+  else
+    warn "sudoers not installed (sudo couldn't read it)"
+  fi
+fi
 rm -f "$TMP"
-systemctl --user restart stump 2>/dev/null && ok "the Stump restarted with its ports" || warn "couldn't restart the stump service (start it with $STUMP_DIR/start-stump.sh)"
+
+# How the Stump starts at boot: the Provisioner's user service when this system
+# has a user manager; otherwise (dArkOS) a system service that runs it as $ME.
+if systemctl --user is-enabled stump >/dev/null 2>&1 && systemctl --user restart stump 2>/dev/null; then
+  ok "the Stump restarted with its ports (systemd --user: stump)"
+else
+  UNIT="/etc/systemd/system/stump-$ME.service"
+  printf '%s\\n' "[Unit]" "Description=Stump ($STUMP_DIR, R36MAX-Stump/handheld/install.sh)" \\
+    "After=network-online.target" "Wants=network-online.target" "" "[Service]" "User=$ME" \\
+    "WorkingDirectory=$STUMP_DIR" "Environment=PYTHONUNBUFFERED=1" \\
+    "ExecStart=$STUMP_DIR/venv/bin/python $STUMP_DIR/stump_pc.py --service" \\
+    "Restart=on-failure" "RestartSec=5" "" "[Install]" "WantedBy=multi-user.target" | sudo tee "$UNIT" >/dev/null
+  # A copy started by hand or by the Start file, stopped first (radio off).
+  [ -x "$STUMP_DIR/stop-stump.sh" ] && sh "$STUMP_DIR/stop-stump.sh" >/dev/null 2>&1
+  pkill -TERM -f "^[^ ]*python[^ ]* .*$STUMP_DIR/stump_pc\\.py" 2>/dev/null; sleep 2
+  sudo systemctl daemon-reload && sudo systemctl enable "stump-$ME" >/dev/null 2>&1 && sudo systemctl restart "stump-$ME" \\
+    && ok "the Stump runs from boot as a system service: stump-$ME (no user manager here)" \\
+    || warn "couldn't start stump-$ME: sudo systemctl status stump-$ME"
+fi
 
 # ── 6. The cockpit ──────────────────────────────────────────────────────────
 step "6/6 The cockpit (720x720 screen, gamepad, Ports launcher)"

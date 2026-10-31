@@ -358,6 +358,9 @@ class Feed:
         settings: its own user service (provisioner --pc), else its Start file."""
         log("STUMP", "restarting (%s)" % why)
         ok, out = run(["systemctl", "--user", "restart", "stump"], timeout=30)
+        if not ok:      # no user manager (dArkOS): install.sh's system service
+            import getpass
+            ok, out = run(["sudo", "-n", "systemctl", "restart", "stump-" + getpass.getuser()], timeout=30)
         if not ok:
             start = os.path.join(STUMP_DIR, "start-stump.sh")
             stop = os.path.join(STUMP_DIR, "stop-stump.sh")

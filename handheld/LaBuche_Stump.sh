@@ -32,6 +32,8 @@ STUMP_DIR="$USER_HOME/Stump"
 LOG="$APP_DIR/cockpit.log"
 mkdir -p "$APP_DIR/drop" "$APP_DIR/tf_backup" 2>/dev/null
 echo "=== R36MAX Stump cockpit v2.0.0-r36max, $(date) ===" > "$LOG"
+# For diagnosing a black screen: who we are, and whether we can open the display.
+{ echo "user: $(id)"; ls -l /dev/dri/ /dev/fb0 /dev/tty1 2>&1; } >> "$LOG"
 
 # The display and gamepad, for the cockpit (as the old launcher did).
 $SUDO chmod 666 /dev/tty1 /dev/fb0 /dev/dri/card* /dev/dri/render* /dev/input/event* 2>/dev/null
@@ -53,6 +55,9 @@ rm -f /dev/shm/stump_user_quit /dev/shm/stump_live.txt /dev/shm/stump_cmd.txt /d
 # The Stump: started if it isn't running (normally it is, since boot).
 if [ ! -f "$STUMP_DIR/stump_pc.py" ]; then
   echo "No Stump in $STUMP_DIR: run handheld/install.sh first." >> "$LOG"
+elif systemctl cat "stump-$USER_NAME" >/dev/null 2>&1; then
+  # dArkOS has no systemd user manager: install.sh's system service.
+  systemctl is-active --quiet "stump-$USER_NAME" || { echo "Starting stump-$USER_NAME" >> "$LOG"; $SUDO systemctl start "stump-$USER_NAME" >> "$LOG" 2>&1; }
 elif ! as_user systemctl --user is-active --quiet stump 2>/dev/null; then
   echo "Starting the Stump (systemctl --user start stump)" >> "$LOG"
   as_user systemctl --user start stump >> "$LOG" 2>&1 || as_user sh "$STUMP_DIR/start-stump.sh" >> "$LOG" 2>&1
