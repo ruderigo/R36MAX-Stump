@@ -49,7 +49,7 @@ To release, set `handheld/VERSION`, add its `## v…` section to
 `CHANGELOG.md` (the tests fail until every file agrees), merge, then:
 
 ```sh
-git tag v2.0.0-r36max && git push origin v2.0.0-r36max
+git tag v2.1.0-r36max && git push origin v2.1.0-r36max
 ```
 
 The tag runs every test, then publishes a GitHub release with
@@ -91,10 +91,17 @@ that's been saved.
 - **Chain secret, role, parent:** in `/admin` or with
   `python3 ~/SandBox_Stump_On/provisioner.py --pc --reconfigure`, as on every
   Stump. The cockpit shows the chain's state but doesn't edit it.
+- **Wi-Fi: EmulationStation's.** Choose the network and type its password in
+  dArkOS's own Wi-Fi settings, as for anything else on the handheld. The
+  Stump uses whatever network the handheld is on and follows a change by
+  itself (new address, announced to the other Stumps, chain parent found
+  again). The cockpit shows that network; it doesn't join or change networks.
 - **Hotspot** (NETWORK/SETUP panels): an open Wi-Fi named `PC_HOTSPOT_NAME`
   (from `config.py`) at `10.42.0.1`, which is the Linux hotspot in `docs/PC.md`.
-  With two Wi-Fi adapters (internal + RT3070) it goes on the free one, so the
-  handheld stays on your network. The Stump restarts to pick up the address.
+  It only goes on an adapter EmulationStation's Wi-Fi isn't using (the RT3070
+  next to the internal one), so the handheld stays on its network; with one
+  adapter in use it says so and does nothing. The Stump restarts to pick up
+  the address.
 - **Sharing files:** put them in `/roms/ports/stump_r36max/drop/` (on the TF
   card), then FILES → share. Each file goes through the Stump's own `/upload`.
   Files the old v1.x node had shared were copied there for you.
@@ -124,11 +131,11 @@ keyboard, key for key:
 | X | space |
 | Y (or ⇧ on screen) | shift: the next letter in upper case |
 | L / R | page: `abc`, symbols, accents (à é ç ñ ß ✓ → …) |
-| START | send (chat) or OK (Wi-Fi password, chain secret) |
+| START | send (chat) or OK (chain secret) |
 | SELECT | cancel |
 
-Upper and lower case are real, so a Wi-Fi password is typed, and sent,
-exactly. The password field stops at 63 bytes (the WPA limit).
+Upper and lower case are real: what you type is sent exactly. (Wi-Fi
+passwords are typed in EmulationStation's Wi-Fi settings, not here.)
 
 **A USB keyboard** works too, on the OTG port or on a hub plugged into it:
 Shift, Caps Lock and the usual symbols (`{ } | \ ~` included). On the chat tab

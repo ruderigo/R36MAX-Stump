@@ -20,10 +20,11 @@ On the Stump's side it is "the person on this computer" (a localhost
 client keeping the Stump's cookie, as a browser does), the same standing
 the owner of any computer Stump has in their own browser.
 
-The handheld's Wi-Fi (hotspot on/off, joining a network) is the operating
-system's, as on every computer Stump (docs/PC.md "Visitors' Wi-Fi"): that
-part goes through NetworkManager (nmcli), then the Stump is restarted so
-it picks up its new address, as /admin does after a settings change.
+The handheld's Wi-Fi is EmulationStation's: the network and its password
+are chosen there, and the Stump uses whatever the handheld is on (it
+follows a change of network by itself). The cockpit only shows it, and
+turns the Stump's hotspot on or off through NetworkManager (nmcli), on an
+adapter that network isn't using.
 
 Python 3.8+, standard library only.
 """
@@ -45,9 +46,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.0.0-r36max"
+            return f.read().strip() or "2.1.0-r36max"
     except OSError:
-        return "2.0.0-r36max"
+        return "2.1.0-r36max"
 
 
 FEED_VERSION = _version()
@@ -397,15 +398,18 @@ class Feed:
         if ap_dev and shutil.which("iw"):
             ok, out = run(["iw", "dev", ap_dev, "station", "dump"], timeout=5)
             self.net["clients"] = out.count("Station ") if ok else 0
+        # The Wi-Fi is EmulationStation's: the network(s) the handheld is on
+        # now, shown, never chosen here (the hotspot's own network left out).
         ok, out = self._nmcli("-t", "-f", "IN-USE,SIGNAL,SECURITY,SSID", "device", "wifi", "list", "--rescan", "no")
+        hotspot = str(read_config().get("PC_HOTSPOT_NAME") or "") if ap_dev else ""
         ssids, seen = [], set()
         for line in out.splitlines() if ok else []:
             p = _split_nm(line)
-            if len(p) >= 4 and p[3] and p[3] not in seen:
+            if len(p) >= 4 and p[0] == "*" and p[3] and p[3] not in seen and p[3] != hotspot:
                 seen.add(p[3])
-                ssids.append({"active": p[0] == "*", "signal": int(p[1] or 0) if p[1].isdigit() else 0,
+                ssids.append({"active": True, "signal": int(p[1] or 0) if p[1].isdigit() else 0,
                               "sec": p[2] or "OPEN", "ssid": p[3]})
-        self.net["ssids"] = sorted(ssids, key=lambda s: (not s["active"], -s["signal"]))[:6]
+        self.net["ssids"] = ssids[:2]
 
     def restart_stump(self, why):
         """The Stump picks up a new address on restart, as after /admin's
@@ -438,12 +442,15 @@ class Feed:
         if not devs:
             self.busy("No Wi-Fi adapter found", 3)
             return
-        # Two Wi-Fi adapters (internal + RT3070): the hotspot on the one not in
-        # use, so the handheld stays on its network (PC.md: two networks).
+        # The hotspot only on an adapter EmulationStation's Wi-Fi isn't using
+        # (two adapters: internal + RT3070), so the handheld stays on the
+        # network chosen there. With one adapter on a network, it waits.
         free = [d for d, s, c in devs if not s.startswith("connected") or c == HOTSPOT_CON]
-        dev = free[-1] if free else devs[-1][0]
         if not free:
-            log("NET", "one Wi-Fi adapter: the hotspot replaces the network on %s" % dev)
+            self.busy("No hotspot: EmulationStation's Wi-Fi uses the adapter", 6)
+            log("NET", "no hotspot: every Wi-Fi adapter is on EmulationStation's network")
+            return
+        dev = free[-1]
         ssid = cfg.get("PC_HOTSPOT_NAME") or "%s-Stump" % (cfg.get("NODE_NAME") or "R36MAX")
         ssid = str(ssid)[:32]
         self._nmcli("connection", "delete", HOTSPOT_CON)
@@ -457,17 +464,6 @@ class Feed:
         self.busy(("HOTSPOT ON: %s" % ssid) if ok else ("HOTSPOT FAILED: %s" % out), 4)
         if ok:
             self.restart_stump("hotspot on")
-
-    def join_wifi(self, ssid, password):
-        ssid = self.full_ssids.get(ssid, ssid)
-        if not ssid:
-            return
-        self._nmcli("connection", "down", HOTSPOT_CON)
-        args = ["device", "wifi", "connect", ssid] + (["password", password] if password else [])
-        ok, out = self._nmcli(*args, timeout=60)
-        self.busy(("JOINED %s" % ssid) if ok else ("JOIN FAILED: %s" % out), 4)
-        if ok:
-            self.restart_stump("joined %s" % ssid)
 
     # -- the TF card --
     def tf_count(self):
@@ -551,22 +547,14 @@ class Feed:
                 if parts[1].strip().upper() == "AP":
                     self.busy("Hotspot on\u2026", 8)
                     self.hotspot(True)
-                else:
-                    ssid = parts[2].strip() if len(parts) > 2 else ""
-                    if ssid:
-                        self.busy("Joining %s\u2026" % ssid, 15)
-                        self.join_wifi(ssid, parts[3] if len(parts) > 3 else "")
-                    else:
-                        self.busy("Hotspot off\u2026", 8)
-                        self.hotspot(False)
+                else:                    # back to EmulationStation's Wi-Fi only
+                    self.busy("Hotspot off\u2026", 8)
+                    self.hotspot(False)
                 self.next_net = 0
-            elif op == "WIFI_SCAN":
-                self.busy("Scanning Wi-Fi\u2026", 6)
-                self._nmcli("device", "wifi", "rescan", timeout=15)
-                self.next_net = time.time() + 4
-            elif op == "WIFI_JOIN" and len(parts) >= 2:
-                self.busy("Joining %s\u2026" % parts[1], 15)
-                self.join_wifi(parts[1].strip(), parts[2] if len(parts) > 2 else "")
+            elif op in ("WIFI_SCAN", "WIFI_JOIN"):
+                # The Wi-Fi (network and password) is chosen in EmulationStation;
+                # the Stump follows whatever it's on, by itself.
+                self.busy("Wi-Fi is set in EmulationStation: the Stump follows it", 4)
                 self.next_net = 0
             elif op == "CHAIN_SCAN":
                 found = discover_stumps()

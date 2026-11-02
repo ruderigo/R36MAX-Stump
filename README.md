@@ -97,6 +97,9 @@ listed yet, restart EmulationStation (or the handheld).
   in the background, and it starts by itself at every boot.
 - Its web pages: `http://r36max.local/` from any device on the same Wi-Fi
   (or the address in the cockpit's header). `/admin` works as on every Stump.
+- **Wi-Fi:** choose the network, and type its password, in dArkOS's own Wi-Fi
+  settings (as in step 1). The Stump uses whatever network the handheld is on
+  and follows a change by itself; the cockpit just shows which one.
 
 ### Controls
 

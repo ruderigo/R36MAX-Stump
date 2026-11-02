@@ -2,6 +2,7 @@
  * button codes and a USB keyboard's, checked on what ends up typed.
  *   gcc -O2 -Dmain=engine_main -o test_keyboard tests/test_keyboard.c -lasound -lpthread -ldl -lm && ./test_keyboard
  */
+#define CMD_QUEUE_FILE "/tmp/stump_test_keyboard_cmd.txt"   /* never the real one */
 #include "../stump_r36max_engine.c"
 #undef main
 
@@ -25,7 +26,7 @@ static void go(int row, int col) {
 int main(void) {
     load_fonts();
     /* 1. Lower case by default, shift for one capital (Y), A types the key. */
-    open_kb(3);
+    open_kb(4);
     go(1, 0); key(R36_BTN_A_ACCEPT);                         /* q */
     key(308); go(1, 1); key(R36_BTN_A_ACCEPT);              /* Y then w -> W */
     go(1, 2); key(R36_BTN_A_ACCEPT);                         /* e (shift was one-shot) */
@@ -55,29 +56,34 @@ int main(void) {
     key(311); key(311); go(0, 0); key(308); key(R36_BTN_A_ACCEPT);
     CHECK("shifted accent", strcmp(g_st.input_buf, "\xc3\x80") == 0);
 
-    /* 5. A USB keyboard: Shift, Caps Lock, and the keys passwords use. */
-    open_kb(3);
+    /* 5. A USB keyboard: Shift, Caps Lock, and the keys secrets use. */
+    open_kb(4);
     keyx(KEY_P, true); keyx(KEY_A, false);
     g_caps_lock = true; keyx(KEY_S, false); keyx(KEY_S, true); g_caps_lock = false;
     keyx(KEY_LEFTBRACE, true); keyx(KEY_BACKSLASH, true); keyx(KEY_GRAVE, true); keyx(KEY_KP7, false);
     CHECK("USB keyboard: Shift, Caps Lock, { | ~ and keypad", strcmp(g_st.input_buf, "PaSs{|~7") == 0);
 
-    /* 6. The WPA limit: 63 bytes, no more. */
-    open_kb(3);
+    /* 6. The chain secret's limit: 50 bytes, no more. */
+    open_kb(4);
     for (int i = 0; i < 70; i++) key(307);
-    CHECK("Wi-Fi password stops at 63 bytes", g_st.input_len == 63);
+    CHECK("chain secret stops at 50 bytes", g_st.input_len == 50);
 
-    /* 7. START finishes a Wi-Fi password: staged, keyboard closed, exact case. */
-    open_kb(3);
+    /* 7. START finishes a chain secret: keyboard closed, sent with its exact case. */
+    unlink(CMD_QUEUE_FILE);
+    open_kb(4);
     snprintf(g_st.input_buf, sizeof(g_st.input_buf), "Tr0ub4dor&3"); g_st.input_len = 11;
     key(315);
-    CHECK("START stages the password exactly", !g_st.osk_open && strcmp(g_st.net_staged_pass, "Tr0ub4dor&3") == 0);
+    char sent[200] = "";
+    FILE *cf = fopen(CMD_QUEUE_FILE, "r");
+    if (cf) { if (!fgets(sent, sizeof(sent), cf)) sent[0] = '\0'; fclose(cf); }
+    unlink(CMD_QUEUE_FILE);
+    CHECK("START sends the chain secret exactly", !g_st.osk_open && strcmp(sent, "CHAIN_SET|Tr0ub4dor&3|auto|\n") == 0);
 
-    /* 8. SELECT cancels: closed, nothing staged, the draft gone. */
-    open_kb(3);
+    /* 8. SELECT cancels: closed, nothing sent, the draft gone. */
+    open_kb(4);
     snprintf(g_st.input_buf, sizeof(g_st.input_buf), "oops"); g_st.input_len = 4;
     key(314);
-    CHECK("SELECT cancels", !g_st.osk_open && g_st.input_len == 0 && g_st.net_staged_pass[0] == '\0');
+    CHECK("SELECT cancels", !g_st.osk_open && g_st.input_len == 0 && access(CMD_QUEUE_FILE, F_OK) != 0);
 
     /* 9. The D-pad wraps around the keys, rows and the special row. */
     open_kb(0);
