@@ -2,9 +2,11 @@
 """Writes src/engine/stumpNativeCode.ts from the files in handheld/, so the
 web app shows and offers exactly what install.sh installs.
 
-    python3 handheld/sync_app.py
+    python3 handheld/sync_app.py            # write it
+    python3 handheld/sync_app.py --check    # fail if it's out of date (the tests)
 """
 import os
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(os.path.dirname(HERE), "src", "engine", "stumpNativeCode.ts")
@@ -54,6 +56,13 @@ def main():
                    "    content: %s,\n  },\n" % (aid, fname, title, lang, summary, name))
     out.append("];\n")
     text = "".join(out).replace("\r\n", "\n")
+    if "--check" in sys.argv:
+        with open(OUT, encoding="utf-8") as f:
+            current = f.read()
+        if current != text:
+            sys.exit("%s is out of date: run python3 handheld/sync_app.py" % OUT)
+        print("%s matches handheld/" % OUT)
+        return
     with open(OUT, "w", encoding="utf-8") as f:
         f.write(text)
     print("wrote %s (%d KB)" % (OUT, len(text) // 1024))
