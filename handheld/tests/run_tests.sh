@@ -55,6 +55,9 @@ run "shell" lint_shell
 step "The feed (unit tests)"
 run "feed" python3 -I "$HERE/test_cockpit_feed.py"
 
+step "The Wi-Fi cards (limbs.py, with a fake /sys and NetworkManager)"
+run "limbs" python3 -I -W error::ResourceWarning "$HERE/test_limbs.py"
+
 step "The font file"
 check_font() {
   python3 -I - "$HERE/cockpit_font.bin" <<'PY'
@@ -77,7 +80,29 @@ assert sizes == [10, 16, 20, 24, 30], sizes
 print("5 fonts, %s px, ASCII + accents + symbols" % sizes)
 PY
 }
+check_engine_chars() {   # every character the engine writes on screen is in the font
+  python3 -I - "$HERE/cockpit_font.bin" "$HERE/stump_r36max_engine.c" <<'PY'
+import re, struct, sys
+buf = open(sys.argv[1], "rb").read()
+n, pos, have = struct.unpack_from("<I", buf, 8)[0], 12, None
+for _ in range(n):
+    ng, dlen = struct.unpack_from("<II", buf, pos + 12)
+    pos += 20
+    cps = set(struct.unpack_from("<I", buf, pos + 16 * k)[0] for k in range(ng))
+    pos += 16 * ng + dlen
+    have = cps if have is None else have & cps
+src = open(sys.argv[2], encoding="utf-8").read()
+missing = {}
+for m in re.finditer(r'"((?:[^"\\\n]|\\.)*)"', src):
+    for c in m.group(1):
+        if ord(c) > 126 and ord(c) not in have:
+            missing.setdefault(c, src[:m.start()].count("\n") + 1)
+assert not missing, "not in the font: %s" % ", ".join("%s (line %d)" % kv for kv in missing.items())
+print("every character the engine draws is in the font")
+PY
+}
 run "font" check_font
+run "font has the engine's characters" check_engine_chars
 
 step "The engine: strict build and smoke test"
 build_engine() {

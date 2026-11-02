@@ -42,13 +42,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # limbs.py, next to this file (also under -I)
+import limbs  # noqa: E402
+
+
 def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.1.0-r36max"
+            return f.read().strip() or "2.2.0-r36max"
     except OSError:
-        return "2.1.0-r36max"
+        return "2.2.0-r36max"
 
 
 FEED_VERSION = _version()
@@ -62,13 +66,14 @@ LIVE_TXT = os.environ.get("STUMP_LIVE_FILE", "/dev/shm/stump_live.txt")
 CMD_TXT = os.environ.get("STUMP_CMD_FILE", "/dev/shm/stump_cmd.txt")
 IPC_PORT = int(os.environ.get("STUMP_IPC_PORT", "42421"))
 NICK = os.environ.get("STUMP_COCKPIT_NICK", "r36max")
-HOTSPOT_CON = "Stump-Hotspot"
+HOTSPOT_CON = limbs.OLD_HOTSPOT                  # v2.0's single hotspot (limbs.py moves it)
+LIMBS_FILE = os.environ.get("STUMP_LIMBS_FILE", os.path.join(APP_DIR, "limbs.json"))
 
 ROOMS = ("main", "lora-mesh", "wifi-mesh")      # the cockpit's three room tabs, in order
 
 POLL_S = 2.0          # the reference client's cadence (CLIENT_QUICKSTART "Polling cadence")
 INFO_S = 5.0
-NET_S = 12.0
+NET_S = 4.0           # the Wi-Fi cards: often enough to notice one plugged in
 
 
 # ── small helpers ──────────────────────────────────────────────────
@@ -282,7 +287,10 @@ class Feed:
         self.board = []
         self.files = []
         self.net = {"ap": False, "ap_if": "", "ap_mac": "", "ap_driver": "", "clients": 0,
-                    "ip": "", "ssids": []}
+                    "ip": "", "ssids": [], "ap_ssid": ""}
+        self.limbs = limbs.Limbs(nmcli=lambda *a, **k: self._nmcli(*a, **k), iw_phy=_iw_phy, iw_dev=_iw_stations,
+                                 state_file=LIMBS_FILE, config=read_config)
+        self.ap_keys = None                # the cards running an AP at the last look (None: not looked yet)
         self.busy_until, self.busy_msg = 0.0, "READY"
         self.full_names = {}               # shown (truncated) file name -> the real one
         self.full_ssids = {}               # shown SSID -> the real one
@@ -376,36 +384,43 @@ class Feed:
             ok, out = run(["sudo", "-n", "nmcli"] + list(args), timeout=timeout)
         return ok, out
 
-    def wifi_devices(self):
-        """[(device, state, connection)] of the Wi-Fi interfaces."""
-        ok, out = self._nmcli("-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device")
-        devs = []
-        for line in out.splitlines() if ok else []:
-            parts = _split_nm(line)
-            if len(parts) >= 4 and parts[1] == "wifi":
-                devs.append((parts[0], parts[2], parts[3]))
-        return devs
-
     def refresh_net(self):
-        devs = self.wifi_devices()
-        ap_dev = next((d for d, s, c in devs if c == HOTSPOT_CON and s.startswith("connected")), "")
-        self.net["ap"] = bool(ap_dev)
-        self.net["ap_if"] = ap_dev or (devs[-1][0] if devs else "wlan0")
-        self.net["ap_mac"] = _read("/sys/class/net/%s/address" % self.net["ap_if"])
-        drv = "/sys/class/net/%s/device/driver" % self.net["ap_if"]
-        self.net["ap_driver"] = os.path.basename(os.path.realpath(drv)) if os.path.exists(drv) else ""
-        self.net["clients"] = 0
-        if ap_dev and shutil.which("iw"):
-            ok, out = run(["iw", "dev", ap_dev, "station", "dump"], timeout=5)
-            self.net["clients"] = out.count("Station ") if ok else 0
+        cards = self.limbs.scan()
+        aps = [c for c in cards if c["job"] == "ap"]
+        first = aps[0] if aps else (cards[0] if cards else None)
+        self.net["ap"] = bool(aps)
+        self.net["ap_if"] = first["iface"] if first else "wlan0"
+        self.net["ap_mac"] = first["key"] if first else ""
+        self.net["ap_driver"] = first["driver"] if first else ""
+        self.net["ap_ssid"] = aps[0]["info"].split(" \u00b7 ")[0] if aps else ""
+        self.net["clients"] = sum(c["clients"] for c in aps)
+        # Cards plugged in or pulled out: say so; a remembered AP is already
+        # back (NetworkManager), any other AP-capable card is offered a job.
+        new, gone = self.limbs.new_and_gone()
+        for c in new:
+            if c["job"] == "ap":
+                self.busy("%s is back as an AP" % c["name"], 5)
+            elif c["ap_ok"]:
+                self.busy("New Wi-Fi: %s, AP-capable: give it a job (NETWORK)" % c["name"], 8)
+            else:
+                self.busy("New Wi-Fi: %s (no AP mode)" % c["name"], 5)
+        for key in gone:
+            self.busy("A Wi-Fi card was unplugged", 4)
+            log("NET", "card %s unplugged" % key)
+        # The Stump's sign-in DNS answers with its hotspot address, chosen when
+        # it starts: one restart whenever the cards running an AP change.
+        keys = sorted(c["key"] for c in aps)
+        if self.ap_keys is not None and keys != self.ap_keys:
+            self.restart_stump("APs now: %s" % (", ".join(c["name"] for c in aps) or "none"))
+        self.ap_keys = keys
         # The Wi-Fi is EmulationStation's: the network(s) the handheld is on
-        # now, shown, never chosen here (the hotspot's own network left out).
+        # now, shown, never chosen here (the APs' own networks left out).
         ok, out = self._nmcli("-t", "-f", "IN-USE,SIGNAL,SECURITY,SSID", "device", "wifi", "list", "--rescan", "no")
-        hotspot = str(read_config().get("PC_HOTSPOT_NAME") or "") if ap_dev else ""
+        own = set(c["info"].split(" \u00b7 ")[0] for c in aps)
         ssids, seen = [], set()
         for line in out.splitlines() if ok else []:
             p = _split_nm(line)
-            if len(p) >= 4 and p[0] == "*" and p[3] and p[3] not in seen and p[3] != hotspot:
+            if len(p) >= 4 and p[0] == "*" and p[3] and p[3] not in seen and p[3] not in own:
                 seen.add(p[3])
                 ssids.append({"active": True, "signal": int(p[1] or 0) if p[1].isdigit() else 0,
                               "sec": p[2] or "OPEN", "ssid": p[3]})
@@ -432,38 +447,34 @@ class Feed:
         self.next_info = time.time() + 6
 
     def hotspot(self, on):
-        cfg = read_config()
+        """The old one-button hotspot: on = an AP on a free AP-capable card,
+        else on the card EmulationStation is on; off = every AP off."""
+        self.limbs.scan()
         if not on:
-            ok, out = self._nmcli("connection", "down", HOTSPOT_CON)
-            self.busy("Hotspot off" if ok else "Hotspot: " + out, 3)
-            self.restart_stump("hotspot off")
+            aps = [c for c in self.limbs.cards if c["job"] == "ap"]
+            for c in aps:
+                self.limbs.set_off(c["key"])
+            self.busy("AP off" if aps else "No AP was on", 3)
             return
-        devs = self.wifi_devices()
-        if not devs:
-            self.busy("No Wi-Fi adapter found", 3)
+        c = self.limbs.ap_target()
+        if not c:
+            self.busy("No Wi-Fi card here can run an AP", 4)
             return
-        # The hotspot only on an adapter EmulationStation's Wi-Fi isn't using
-        # (two adapters: internal + RT3070), so the handheld stays on the
-        # network chosen there. With one adapter on a network, it waits.
-        free = [d for d, s, c in devs if not s.startswith("connected") or c == HOTSPOT_CON]
-        if not free:
-            self.busy("No hotspot: EmulationStation's Wi-Fi uses the adapter", 6)
-            log("NET", "no hotspot: every Wi-Fi adapter is on EmulationStation's network")
+        self.limb_job(c["key"], "ap", c.get("band") or "bg")
+
+    def limb_job(self, key, job, band="bg"):
+        c = self.limbs.find(key) or (self.limbs.scan() and self.limbs.find(key))
+        if not c:
+            self.busy("That Wi-Fi card is gone", 3)
             return
-        dev = free[-1]
-        ssid = cfg.get("PC_HOTSPOT_NAME") or "%s-Stump" % (cfg.get("NODE_NAME") or "R36MAX")
-        ssid = str(ssid)[:32]
-        self._nmcli("connection", "delete", HOTSPOT_CON)
-        # Open, like a CAM's walk-up Wi-Fi; NetworkManager's "shared" mode gives
-        # it 10.42.0.1 with DHCP (the Linux hotspot of docs/PC.md).
-        ok, out = self._nmcli("connection", "add", "type", "wifi", "ifname", dev, "con-name", HOTSPOT_CON,
-                              "autoconnect", "no", "ssid", ssid, "802-11-wireless.mode", "ap",
-                              "802-11-wireless.band", "bg", "ipv4.method", "shared", "ipv6.method", "ignore")
-        if ok:
-            ok, out = self._nmcli("connection", "up", HOTSPOT_CON, timeout=45)
-        self.busy(("HOTSPOT ON: %s" % ssid) if ok else ("HOTSPOT FAILED: %s" % out), 4)
-        if ok:
-            self.restart_stump("hotspot on")
+        if job == "ap":
+            if c["job"] == "lan":
+                log("NET", "AP on %s: the handheld leaves %s" % (c["name"], c["info"]))
+            ok, msg = self.limbs.set_ap(key, band)
+        else:
+            ok, msg = self.limbs.set_off(key)
+        self.busy(msg, 5)
+        self.next_net = 0                  # look again now (and restart the Stump if the APs changed)
 
     # -- the TF card --
     def tf_count(self):
@@ -538,6 +549,14 @@ class Feed:
                         shutil.copy2(src, os.path.join(TF_DIR, os.path.basename(name)))
                         n += 1
                 self.busy("%d file(s) copied to the TF card" % n, 2.5)
+            elif op == "LIMB_JOB" and len(parts) >= 3:
+                job = parts[2].strip().lower()
+                self.busy("AP on\u2026" if job == "ap" else "AP off\u2026", 10)
+                self.limb_job(parts[1].strip().lower(), job, parts[3].strip() if len(parts) > 3 else "bg")
+            elif op == "LIMB_REMEMBER" and len(parts) >= 3:
+                ok, msg = self.limbs.set_remember(parts[1].strip().lower(), parts[2].strip() == "1")
+                self.busy(msg, 3)
+                self.next_net = 0
             elif op in ("AP_ON", "AP_OFF", "AP_TOGGLE"):
                 on = (op == "AP_ON") or (op == "AP_TOGGLE" and not self.net["ap"])
                 self.busy("Hotspot %s\u2026" % ("on" if on else "off"), 8)
@@ -664,7 +683,7 @@ class Feed:
             1 if port == 80 else 0, 1 if port == 8080 else 0, ip, self.tf_count()))
         busy = time.time() < self.busy_until
         out.append("BUSY|%d|%s" % (1 if busy else 0, clean(self.busy_msg if busy else "READY", 54)))
-        cfg_ssid = read_config().get("PC_HOTSPOT_NAME") or ""
+        cfg_ssid = self.net.get("ap_ssid") or read_config().get("PC_HOTSPOT_NAME") or ""
         out.append("AP|%d|%s|%s|%s|%s|%d" % (1 if self.net["ap"] else 0, clean(self.net["ap_if"] or "wlan0", 16),
                                              clean(self.net["ap_mac"], 20), clean(self.net["ap_driver"], 16),
                                              clean(cfg_ssid or "Stump hotspot", 23), self.net["clients"]))
@@ -694,6 +713,13 @@ class Feed:
             shown = clip(clean(screen_line(w["ssid"]), 31), 31)
             self.full_ssids[shown] = w["ssid"]
             out.append("SSID|%d|%d|%s|%s" % (1 if w["active"] else 0, w["signal"], clean(w["sec"], 8), shown))
+        # The Wi-Fi cards: LIMB|key|name|driver|job|ap_ok|bands|band|remember|iface|info|clients
+        for c in self.limbs.cards[:6]:
+            bands = (1 if 1 in c["bands"] else 0) | (2 if 2 in c["bands"] else 0)
+            out.append("LIMB|%s|%s|%s|%s|%d|%d|%s|%d|%s|%s|%d" % (
+                clean(c["key"], 17), clip(clean(screen_line(c["name"]), 28), 28), clean(c["driver"], 15), c["job"],
+                1 if c["ap_ok"] else 0, bands, "a" if c.get("band") == "a" else "bg", 1 if c["remember"] else 0,
+                clean(c["iface"], 15), clip(clean(screen_line(c["info"]), 44), 44), c["clients"]))
         for i, room in enumerate(ROOMS):
             out.append("ROOM|%d|%s|%d" % (i, room.upper(), self.users[room]))
             for m in self.msgs[room][-10:]:
@@ -814,6 +840,16 @@ def discover_stumps(timeout=1.5):
             continue
     s.close()
     return list(found.values())
+
+
+def _iw_phy(phy):
+    ok, out = run(["iw", "phy", phy, "info"], timeout=5)
+    return out if ok else ""
+
+
+def _iw_stations(iface):
+    ok, out = run(["iw", "dev", iface, "station", "dump"], timeout=5)
+    return out if ok else ""
 
 
 def _split_nm(line):

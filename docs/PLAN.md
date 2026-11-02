@@ -4,8 +4,8 @@ Sandbox for the RK3326 (R36MAX) Stump. Work is iterated here, then released
 in [R36MAX-Stump](https://github.com/ruderigo/R36MAX-Stump), as Team Stump
 does with SandBox_Stump_On and Team FireFly with SandBox_FireFly_RK3326.
 
-Status: **in progress**. The cockpit-side build is under way; the on-device
-checks are listed under [Bench](#bench).
+Status: **built, waiting for the bench** (v2.2.0-r36max, branch `limbs`).
+The on-device checks are under [Bench](#bench).
 
 ## What we want
 
@@ -35,6 +35,8 @@ From `lsusb; iw dev; iw list` on the R36MAX (2026-11-02):
   connected (EmulationStation's network), 2.4 GHz.
 - Its modes include **`AP`**. So "take over the current card" is the main
   case today, not an edge case.
+- **The AP on the Blueway was tested on the handheld (2026-11-02, the v2.0
+  hotspot) and works.**
 - There is no internal Wi-Fi: with the Blueway as the AP, the handheld has
   no other network. A chain over the home Wi-Fi (e.g. to LaBuche3) pauses
   while the AP is on; the cockpit warns before taking the card over.
@@ -131,19 +133,28 @@ SETUP shows the result, read-only. No Wi-Fi password anywhere.
 
 - [x] Read-only ES network; no SSID/password picker (from R36MAX-Stump PR #4)
 - [x] This plan
-- [ ] `limbs.py`: cards (MAC, driver, USB id, AP modes, bands), jobs, AP
+- [x] `limbs.py`: cards (MAC, driver, USB id, AP modes, bands), jobs, AP
       connections per card, slots and channels, remember, hotplug
-- [ ] The feed: `LIMB|` lines, `LIMB_JOB` / `LIMB_REMEMBER`, one Stump restart
+- [x] The feed: `LIMB|` lines, `LIMB_JOB` / `LIMB_REMEMBER`, one Stump restart
       per change; `AP_ON` / `AP_OFF` kept for the old buttons
-- [ ] The engine: NETWORK tab rows per card, the confirm, SETUP read-only
-- [ ] `install.sh`: DNS option `0.0.0.0` for every AP
-- [ ] Tests: `iw` output from the R36MAX itself, a 5 GHz card, sysfs and
-      nmcli fakes, take-over, N APs, remember, hotplug
-- [ ] Bench, then a release in R36MAX-Stump
+- [x] The engine: NETWORK tab rows per card (three lines each, scrolling), the
+      confirm, SETUP read-only
+- [x] `install.sh`: DNS option `0.0.0.0` for every AP; `limbs.py` installed
+- [x] Tests: `iw` output from the R36MAX itself, a 5 GHz card, sysfs and
+      nmcli fakes, take-over, N APs, remember, hotplug (`test_limbs.py`, 19);
+      every character the cockpit draws is in its font
+- [ ] Bench (below)
+- [ ] A release in R36MAX-Stump
 
 ## Bench
 
 On the R36MAX, after installing from this repo:
+
+Install from this repo's `limbs` branch:
+
+```sh
+ssh -t ark@r36max.local 'git clone -b limbs https://github.com/ruderigo/SandBox_RK3326_Stump.git ~/SandBox_RK3326_Stump && bash ~/SandBox_RK3326_Stump/handheld/install.sh'
+```
 
 1. Blueway only: the NETWORK tab lists it as *Local LAN (ES)*, AP-capable.
 2. AP on it: the warning, phones see the AP, sign-in page; AP off → back on
@@ -151,3 +162,9 @@ On the R36MAX, after installing from this repo:
 3. Remember on, unplug and replug: the AP comes back without the cockpit.
 4. With a second card (when there is one): two APs, `10.42.0.x` and
    `10.42.1.x`, the sign-in page on both.
+
+Not proven off the bench (written from the tools' documentation, tested only
+against fakes): NetworkManager binding an AP to a card by MAC with
+`ifname "*"`; dnsmasq handing out "its own address" for `0.0.0.0`; the
+Blueway's driver bringing an AP up right after leaving a network. Step 2
+covers all three.

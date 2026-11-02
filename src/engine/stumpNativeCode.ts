@@ -9,7 +9,7 @@ import { CodeFileArtifact } from './nativeEngineCode';
 
 export const STUMP_R36MAX_C_SOURCE = `/*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.1.0-r36max.
+ * (RK3326 / dArkOS), v2.2.0-r36max.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -713,7 +713,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.1.0-r36max"
+#define STUMP_ENGINE_VERSION "v2.2.0-r36max"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 10
 #define MAX_DBG_LINES 16
@@ -754,6 +754,21 @@ typedef struct {
     int  signal;
     bool active;
 } WifiSsidItem;
+
+/* A Wi-Fi card on the handheld (a "limb"), from the feed's LIMB| lines. */
+typedef struct {
+    char key[18];        /* its permanent MAC: the card, whatever wlanN it is */
+    char name[30];
+    char driver[16];
+    char job[6];         /* lan, ap, idle, off */
+    bool ap_ok;
+    int  bands;          /* 1 = 2.4 GHz, 2 = 5 GHz (added) */
+    char band[3];        /* the AP's band: bg or a */
+    bool remember;
+    char iface[16];
+    char info[48];
+    int  clients;
+} LimbItem;
 
 typedef struct {
     volatile bool   running;
@@ -810,21 +825,20 @@ typedef struct {
     int             qr_mode;       /* 0 = HTTP Portal URL QR, 1 = WIFI Auto-Join QR */
     WifiSsidItem    wifi_list[6];
     int             wifi_count;
-    int             wifi_cursor;   /* 0 = Stage Radio Mode, 1 = Wi-Fi Tool Bar, 2.. = the Wi-Fi (EmulationStation's, shown only) */
+    int             wifi_cursor;   /* NETWORK rows: 0..limb_count-1 = the cards, limb_count = the tool */
     int             wifi_bar_mode; /* network tab tool: 0 = chain secret, 1 = find Stumps */
     char            wifi_status_msg[80];
-    /* Staged Network Settings Revision (Panel 4 & Panel 5) */
-    bool            net_staged_init;
-    bool            net_staged_dirty;
-    bool            net_staged_ap;
-    char            net_staged_ssid[32];
-    int             rev_cursor;    /* Panel 5 rows: 0=Mode, 1=Wi-Fi (shown), 2=ChainSecret/Role, 3=Apply/Revert, 4=ToolBar, 5=Logs */
+    LimbItem        limbs[6];
+    int             limb_count;
+    char            limb_pick_key[18];  /* the card whose job is being chosen (←/→) */
+    int             limb_pick;          /* that choice: 0 = not an AP, 1 = AP 2.4 GHz, 2 = AP 5 GHz; -1 none */
+    int             rev_cursor;    /* SETUP rows: 0=Wi-Fi cards, 1=ES's Wi-Fi, 2=Chain, 3=Jobs, 4=Tool, 5=Log */
     int             debug_bar_mode;/* 0 = SCAN & LINK LAN CHAIN, 1 = EDIT CHAIN SECRET, 2 = EXPORT DIAG->TF, 3 = HEAL HTTP */
     int             debug_scroll;
     char            debug_logs[MAX_DBG_LINES][64];
     int             debug_log_count;
     bool            confirm_open;
-    int             confirm_type;   /* 1 = Billboard Notices, 2 = Shared Files, 3 = Network Revision */
+    int             confirm_type;   /* 1 = notices, 2 = files, 3 = a Wi-Fi card's job */
     int             confirm_choice; /* 0 = NO / CANCEL, 1 = YES / ACCEPT */
     char            confirm_label[56];
     bool            osk_open;
@@ -992,84 +1006,114 @@ static void open_chain_secret_osk(void) {
     trigger_chime(740, 45);
 }
 
-static void revert_staged_network_revision(void) {
-    g_st.net_staged_ap = g_st.ap_active;
-    g_st.net_staged_ssid[0] = '\\0';
-    for (int i = 0; i < g_st.wifi_count; i++) {
-        if (g_st.wifi_list[i].active && g_st.wifi_list[i].ssid[0]) {
-            snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s", g_st.wifi_list[i].ssid);
-            break;
-        }
-    }
-    g_st.net_staged_dirty = false;
-    g_st.net_staged_init = true;
+/* ---- The Wi-Fi cards ("limbs") on the NETWORK tab ----
+ * Each card has a job: EmulationStation's network (shown, chosen there),
+ * the Stump's AP (any card that can), or nothing. ←/→ chooses, A asks and
+ * applies (LIMB_JOB to the feed), Y remembers it for the next plug-in. */
+static int limb_current(const LimbItem *l) {
+    if (strcmp(l->job, "ap") == 0) return strcmp(l->band, "a") == 0 ? 2 : 1;
+    return 0;
 }
 
-static void apply_staged_network_revision(void) {
-    uint64_t now = monotonic_ms();
-    if (now < g_st.radio_lock_until_ms) {
-        set_ui_busy("The radio is busy: a moment…", 1600);
-        trigger_chime(340, 45);
+static int limb_shown(int i) {
+    const LimbItem *l = &g_st.limbs[i];
+    if (g_st.limb_pick >= 0 && strcmp(g_st.limb_pick_key, l->key) == 0) return g_st.limb_pick;
+    return limb_current(l);
+}
+
+static const char *limb_label(const LimbItem *l, int choice) {
+    if (choice == 1) return "AP 2.4 GHz";
+    if (choice == 2) return "AP 5 GHz";
+    if (strcmp(l->job, "lan") == 0) return "Local LAN (ES)";
+    if (strcmp(l->job, "ap") == 0) return "Off · back to ES";
+    if (strcmp(l->job, "off") == 0) return "Unavailable";
+    return "Idle";
+}
+
+static void limb_cycle(int dir) {
+    if (g_st.wifi_cursor >= g_st.limb_count) return;
+    const LimbItem *l = &g_st.limbs[g_st.wifi_cursor];
+    int n = !l->ap_ok ? 1 : ((l->bands & 2) ? 3 : 2);
+    if (n == 1) {
+        set_ui_busy("This card can't run an AP", 1600);
+        trigger_chime(340, 40);
         return;
     }
-    g_st.radio_lock_until_ms = now + 5500ULL;
-    if (g_st.net_staged_ap) {
-        g_st.ap_active = true;
-        send_bridge_cmd("NET_APPLY|AP");
-        g_st.suppress_poll_frames = 300;
-        set_ui_busy("Turning the hotspot on…", 5200);
-        snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg),
-                 "HOTSPOT ON: %.40s", g_st.ap_ssid[0] ? g_st.ap_ssid : "STUMP");
-        trigger_chime(880, 85);
-    } else {
-        /* Hotspot off: the handheld stays on EmulationStation's Wi-Fi (chosen there). */
-        g_st.ap_active = false;
-        send_bridge_cmd("NET_APPLY|LAN");
-        g_st.suppress_poll_frames = 300;
-        set_ui_busy("Hotspot off: on EmulationStation's Wi-Fi", 5200);
-        snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "HOTSPOT OFF");
-        trigger_chime(784, 80);
-    }
-    g_st.net_staged_dirty = false;
-    g_st.osk_open = false;
-    update_qr_if_needed();
+    int c = (limb_shown(g_st.wifi_cursor) + n + dir) % n;
+    snprintf(g_st.limb_pick_key, sizeof(g_st.limb_pick_key), "%s", l->key);
+    g_st.limb_pick = c;
+    trigger_chime(580, 25);
 }
 
-static void open_network_revision_confirm(void) {
+static void limb_apply(void) {
+    const LimbItem *l = &g_st.limbs[g_st.wifi_cursor];
+    int c = limb_shown(g_st.wifi_cursor);
+    if (c == limb_current(l)) {
+        set_ui_busy("←→ chooses a job for this card", 1800);
+        trigger_chime(460, 30);
+        return;
+    }
+    snprintf(g_st.limb_pick_key, sizeof(g_st.limb_pick_key), "%s", l->key);
+    g_st.limb_pick = c;
     g_st.confirm_open = true;
     g_st.confirm_type = 3;
-    g_st.confirm_choice = 1; /* Default highlight on YES, APPLY so [A] accepts and [B] cancels */
-    if (g_st.net_staged_ap) {
-        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label),
-                 "HOTSPOT: %.40s", g_st.ap_ssid[0] ? g_st.ap_ssid : "STUMP");
-    } else {
-        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "Hotspot off (EmulationStation's Wi-Fi stays)");
-    }
+    g_st.confirm_choice = 1;
+    if (c > 0 && strcmp(l->job, "lan") == 0)
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "AP on %.20s: leaves %.20s", l->name, l->info);
+    else if (c > 0)
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "%s on %.30s", limb_label(l, c), l->name);
+    else
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "AP off on %.30s", l->name);
     trigger_chime(660, 45);
 }
 
-static void action_wifi_tab_confirm(void) {
-    if (g_st.wifi_cursor <= 0) {
-        /* Row 0: Stage selected radio mode and jump to Panel 5 (5:SETUP) for review before applying */
-        g_st.net_staged_dirty = true;
-        g_st.tab_idx = 4;
-        g_st.rev_cursor = 3; /* Highlight [APPLY REVISION] row in Panel 5 */
-        set_ui_busy("Staged: apply it in SETUP (A), or B to cancel", 2200);
-        trigger_chime(740, 55);
-    } else if (g_st.wifi_cursor == 1) {
-        /* Row 1: the tools (0 = chain secret, 1 = find Stumps on this network) */
-        if (g_st.wifi_bar_mode % 2 == 0) {
-            open_chain_secret_osk();
-        } else {
-            send_bridge_cmd("CHAIN_SCAN");
-            set_ui_busy("Looking for Stumps on this network…", 3000);
-            trigger_chime(880, 65);
-        }
-    } else {
-        /* Rows 2..: the network EmulationStation is on. It's chosen there, not here. */
-        set_ui_busy("Wi-Fi is set in EmulationStation: the Stump follows it", 2600);
-        trigger_chime(520, 30);
+static void limb_confirmed(void) {
+    char cmd[64];
+    if (g_st.limb_pick <= 0) snprintf(cmd, sizeof(cmd), "LIMB_JOB|%s|off", g_st.limb_pick_key);
+    else snprintf(cmd, sizeof(cmd), "LIMB_JOB|%s|ap|%s", g_st.limb_pick_key, g_st.limb_pick == 2 ? "a" : "bg");
+    send_bridge_cmd(cmd);
+    set_ui_busy(g_st.limb_pick > 0 ? "Starting the AP…" : "Stopping the AP…", 6000);
+    g_st.limb_pick = -1;
+    trigger_chime(880, 85);
+}
+
+static void limb_remember(void) {
+    LimbItem *l = &g_st.limbs[g_st.wifi_cursor];
+    if (!l->ap_ok) {
+        set_ui_busy("This card can't run an AP", 1600);
+        return;
     }
+    char cmd[48];
+    l->remember = !l->remember;
+    snprintf(cmd, sizeof(cmd), "LIMB_REMEMBER|%s|%d", l->key, l->remember ? 1 : 0);
+    send_bridge_cmd(cmd);
+    set_ui_busy(l->remember ? "Remembered: back as an AP when plugged in" : "Not remembered", 2200);
+    trigger_chime(l->remember ? 740 : 520, 40);
+}
+
+/* A (or START, or Enter) on the NETWORK tab. */
+static void network_tab_a(void) {
+    if (g_st.wifi_cursor < g_st.limb_count) {
+        limb_apply();
+    } else if (g_st.wifi_bar_mode % 2 == 0) {
+        open_chain_secret_osk();
+    } else {
+        send_bridge_cmd("CHAIN_SCAN");
+        set_ui_busy("Looking for Stumps on this network…", 3000);
+        trigger_chime(880, 65);
+    }
+}
+
+static void network_tab_cancel(void) {
+    g_st.limb_pick = -1;
+    set_ui_busy("Nothing changed", 1000);
+    trigger_chime(460, 35);
+}
+
+static void go_network_tab(void) {
+    g_st.tab_idx = 3;
+    g_st.wifi_cursor = 0;
+    trigger_chime(620, 35);
 }
 
 static void send_typed_chat(void) {
@@ -1219,6 +1263,7 @@ static void poll_live_bridge(void) {
     int b_count = 0;
     int f_count = 0;
     int w_count = 0;
+    int l_count = 0;
     int d_count = 0;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
@@ -1366,6 +1411,33 @@ static void poll_live_bridge(void) {
                     }
                 }
             }
+        } else if (strncmp(line, "LIMB|", 5) == 0 && l_count < 6) {
+            /* LIMB|key|name|driver|job|ap_ok|bands|band|remember|iface|info|clients */
+            char *fld[11];
+            int nf = 0;
+            char *q = line + 5;
+            q[strcspn(q, "\\r\\n")] = '\\0';
+            while (nf < 11) {
+                fld[nf++] = q;
+                char *bar = strchr(q, '|');
+                if (!bar) break;
+                *bar = '\\0';
+                q = bar + 1;
+            }
+            if (nf == 11) {
+                LimbItem *l = &g_st.limbs[l_count++];
+                snprintf(l->key, sizeof(l->key), "%.17s", fld[0]);
+                snprintf(l->name, sizeof(l->name), "%.29s", fld[1]);
+                snprintf(l->driver, sizeof(l->driver), "%.15s", fld[2]);
+                snprintf(l->job, sizeof(l->job), "%.5s", fld[3]);
+                l->ap_ok = atoi(fld[4]) != 0;
+                l->bands = atoi(fld[5]);
+                snprintf(l->band, sizeof(l->band), "%.2s", fld[6]);
+                l->remember = atoi(fld[7]) != 0;
+                snprintf(l->iface, sizeof(l->iface), "%.15s", fld[8]);
+                snprintf(l->info, sizeof(l->info), "%.47s", fld[9]);
+                l->clients = atoi(fld[10]);
+            }
         } else if (strncmp(line, "ROOM|", 5) == 0) {
             int r_idx = atoi(line + 5);
             char *p2 = strchr(line + 5, '|');
@@ -1445,13 +1517,14 @@ static void poll_live_bridge(void) {
     g_st.board_count = b_count;
     g_st.file_count = f_count;
     g_st.wifi_count = w_count;
+    g_st.limb_count = l_count;
     g_st.debug_log_count = d_count;
-    if (!g_st.net_staged_init || !g_st.net_staged_dirty) {
-        revert_staged_network_revision();
-    }
+    bool pick_here = false;                  /* a card being chosen for, unplugged: forget the choice */
+    for (int i = 0; i < l_count; i++) if (strcmp(g_st.limbs[i].key, g_st.limb_pick_key) == 0) pick_here = true;
+    if (!pick_here) g_st.limb_pick = -1;
     if (g_st.board_cursor > g_st.board_count) g_st.board_cursor = g_st.board_count;
     if (g_st.file_cursor > g_st.file_count) g_st.file_cursor = g_st.file_count;
-    if (g_st.wifi_cursor > 1 + g_st.wifi_count) g_st.wifi_cursor = 1 + g_st.wifi_count;
+    if (g_st.wifi_cursor > g_st.limb_count) g_st.wifi_cursor = g_st.limb_count;
 }
 
 /* v2.0: the cockpit no longer broadcasts or accepts chat on a LAN UDP port
@@ -1994,7 +2067,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.1.0-r36max");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.2.0-r36max");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -2011,8 +2084,8 @@ int main(int argc, char **argv) {
     snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "Wi-Fi: EmulationStation's");
 
     scan_transports(&g_st.net);
+    g_st.limb_pick = -1;
     poll_live_bridge();
-    revert_staged_network_revision();
     update_qr_if_needed();
 
 
@@ -2137,7 +2210,7 @@ int main(int argc, char **argv) {
             g_st.confirm_type = atoi(getenv("STUMP_COCKPIT_CONFIRM"));
             g_st.confirm_choice = 1;
             snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "%s", g_st.confirm_type == 3
-                     ? "Wi-Fi network: LaBuche_Cabin" : "2 notices: March\\u00e9 samedi, Potluck Sunday");
+                     ? "AP on Blueway High Power: leaves HomeNet" : "2 notices: March\\u00e9 samedi, Potluck Sunday");
         }
         if (getenv("STUMP_COCKPIT_OSK") && frames == 0) {     /* screenshots in tests: open it at start */
             g_st.osk_open = true; cmp_reset(); g_cmp.was_open = true;
@@ -2253,8 +2326,9 @@ int main(int argc, char **argv) {
                             if (g_st.confirm_choice == 1) {
                                 if (g_st.confirm_type == 1) action_board_delete_checked();
                                 else if (g_st.confirm_type == 2) action_file_delete_checked();
-                                else if (g_st.confirm_type == 3) apply_staged_network_revision();
+                                else if (g_st.confirm_type == 3) limb_confirmed();
                             } else {
+                                if (g_st.confirm_type == 3) g_st.limb_pick = -1;
                                 set_ui_busy("Cancelled: nothing changed", 1000);
                                 trigger_chime(480, 35);
                             }
@@ -2276,11 +2350,11 @@ int main(int argc, char **argv) {
                         } else if ((ev.code == KEY_ENTER || ev.code == KEY_KPENTER) && pressed) {
                             if (g_st.tab_idx == 1) action_board_add();
                             else if (g_st.tab_idx == 2) action_file_add();
-                            else if (g_st.tab_idx == 3) action_wifi_tab_confirm();
+                            else if (g_st.tab_idx == 3) network_tab_a();
                             else if (g_st.tab_idx == 4) {
                                 if (g_st.osk_open || g_st.input_len > 0) send_typed_chat();
                                 else if (g_st.rev_cursor == 2) open_chain_secret_osk();
-                                else if (g_st.rev_cursor == 3) open_network_revision_confirm();
+                                else if (g_st.rev_cursor <= 1 || g_st.rev_cursor == 3) go_network_tab();
                                 else execute_debug_tab_action();
                             }
                             else if (g_st.input_len > 0) send_typed_chat();
@@ -2288,7 +2362,7 @@ int main(int argc, char **argv) {
                             continue;
                         } else if (ev.code == KEY_ESC && pressed) {
                             if (g_st.osk_open) { g_st.osk_open = false; g_st.osk_target = 0; }
-                            else if (g_st.tab_idx == 4) revert_staged_network_revision();
+                            else if (g_st.tab_idx == 3) g_st.limb_pick = -1;
                             trigger_chime(480, 30);
                             continue;
                         } else if (ev.code == KEY_TAB && pressed) {
@@ -2333,10 +2407,10 @@ int main(int argc, char **argv) {
                         start_held = (ev.value != 0);
                         if (pressed && !select_held) {
                             if (g_st.tab_idx == 3) {
-                                action_wifi_tab_confirm();
+                                network_tab_a();
                             } else if (g_st.tab_idx == 4) {
                                 if (g_st.osk_open) send_typed_chat();
-                                else open_network_revision_confirm();
+                                else go_network_tab();
                             } else if (g_st.input_len > 0) {
                                 send_typed_chat();
                             } else {
@@ -2515,9 +2589,10 @@ int main(int argc, char **argv) {
                                 }
                                 else if (ev.code == 307) { input_backspace(); trigger_chime(420, 25); }
                             } else if (ev.code == 308) {
-                                open_chain_secret_osk();
+                                if (g_st.wifi_cursor < g_st.limb_count) limb_remember();
+                                else open_chain_secret_osk();
                             } else {
-                                int total_rows = 2 + g_st.wifi_count;
+                                int total_rows = g_st.limb_count + 1;
                                 if (g_st.wifi_cursor >= total_rows) g_st.wifi_cursor = total_rows - 1;
                                 if (ev.code == BTN_DPAD_UP || ev.code == 544) {
                                     g_st.wifi_cursor = (g_st.wifi_cursor + total_rows - 1) % total_rows;
@@ -2525,33 +2600,19 @@ int main(int argc, char **argv) {
                                 } else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) {
                                     g_st.wifi_cursor = (g_st.wifi_cursor + 1) % total_rows;
                                     trigger_chime(520, 20);
-                                } else if (ev.code == BTN_DPAD_LEFT || ev.code == 546) {
-                                    if (g_st.wifi_cursor == 0) {
-                                        /* Stage mode toggle only — never switches live radio until Panel 5 [A] Apply! */
-                                        g_st.net_staged_ap = !g_st.net_staged_ap;
-                                        g_st.net_staged_dirty = true;
-                                        trigger_chime(580, 25);
-                                    } else if (g_st.wifi_cursor == 1) {
-                                        g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 1) % 2;
-                                        trigger_chime(540, 25);
-                                    }
-                                } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
-                                    if (g_st.wifi_cursor == 0) {
-                                        /* Stage mode toggle only — never switches live radio until Panel 5 [A] Apply! */
-                                        g_st.net_staged_ap = !g_st.net_staged_ap;
-                                        g_st.net_staged_dirty = true;
-                                        trigger_chime(580, 25);
-                                    } else if (g_st.wifi_cursor == 1) {
+                                } else if (ev.code == BTN_DPAD_LEFT || ev.code == 546 ||
+                                           ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
+                                    int dir = (ev.code == BTN_DPAD_LEFT || ev.code == 546) ? -1 : 1;
+                                    if (g_st.wifi_cursor < g_st.limb_count) {
+                                        limb_cycle(dir);
+                                    } else {
                                         g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 1) % 2;
                                         trigger_chime(540, 25);
                                     }
                                 } else if (ev.code == R36_BTN_A_ACCEPT) {
-                                    action_wifi_tab_confirm();
+                                    network_tab_a();
                                 } else if (ev.code == R36_BTN_B_CANCEL) {
-                                    revert_staged_network_revision();
-                                    g_st.wifi_cursor = 0;
-                                    set_ui_busy("Staged Wi-Fi change cancelled", 1400);
-                                    trigger_chime(460, 35);
+                                    network_tab_cancel();
                                 } else if (ev.code == 307) {
                                     g_st.qr_mode = (g_st.qr_mode + 1) % 2;
                                     update_qr_if_needed();
@@ -2559,7 +2620,7 @@ int main(int argc, char **argv) {
                                 }
                             }
                         } else if (g_st.tab_idx == 4) {
-                            /* Panel 5 (5:SETUP): Network Revision + Stump Chain Secret/Role + Debug ([A]=Accept, [B]=Cancel) */
+                            /* Panel 5 (SETUP): the Wi-Fi cards (shown; jobs on NETWORK), chain, tools, log */
                             if (g_st.osk_open) {
                                 if (ev.code == BTN_DPAD_LEFT || ev.code == 546) { g_st.osk_col = (g_st.osk_col + 9) % 10; }
                                 else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) { g_st.osk_col = (g_st.osk_col + 1) % 10; }
@@ -2589,11 +2650,7 @@ int main(int argc, char **argv) {
                                 }
                                 trigger_chime(500, 20);
                             } else if (ev.code == BTN_DPAD_LEFT || ev.code == 546) {
-                                if (g_st.rev_cursor == 0) {
-                                    g_st.net_staged_ap = !g_st.net_staged_ap;
-                                    g_st.net_staged_dirty = true;
-                                    trigger_chime(580, 25);
-                                } else if (g_st.rev_cursor == 2) {
+                                if (g_st.rev_cursor == 2) {
                                     int next_role = (g_st.chain_role_idx + 2) % 3;
                                     commit_chain_settings(g_st.chain_secret, next_role);
                                 } else if (g_st.rev_cursor == 4) {
@@ -2601,11 +2658,7 @@ int main(int argc, char **argv) {
                                     trigger_chime(540, 25);
                                 }
                             } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
-                                if (g_st.rev_cursor == 0) {
-                                    g_st.net_staged_ap = !g_st.net_staged_ap;
-                                    g_st.net_staged_dirty = true;
-                                    trigger_chime(580, 25);
-                                } else if (g_st.rev_cursor == 2) {
+                                if (g_st.rev_cursor == 2) {
                                     int next_role = (g_st.chain_role_idx + 1) % 3;
                                     commit_chain_settings(g_st.chain_secret, next_role);
                                 } else if (g_st.rev_cursor == 4) {
@@ -2613,24 +2666,18 @@ int main(int argc, char **argv) {
                                     trigger_chime(540, 25);
                                 }
                             } else if (ev.code == R36_BTN_A_ACCEPT) {
-                                if (g_st.rev_cursor == 0) {
-                                    g_st.net_staged_ap = !g_st.net_staged_ap;
-                                    g_st.net_staged_dirty = true;
-                                    trigger_chime(600, 30);
+                                if (g_st.rev_cursor == 0 || g_st.rev_cursor == 3) {
+                                    go_network_tab();
                                 } else if (g_st.rev_cursor == 1) {
                                     set_ui_busy("Wi-Fi is set in EmulationStation: the Stump follows it", 2600);
                                     trigger_chime(520, 30);
                                 } else if (g_st.rev_cursor == 2) {
                                     open_chain_secret_osk();
-                                } else if (g_st.rev_cursor == 3) {
-                                    open_network_revision_confirm();
                                 } else {
                                     execute_debug_tab_action();
                                 }
                             } else if (ev.code == R36_BTN_B_CANCEL) {
-                                revert_staged_network_revision();
                                 g_st.rev_cursor = 0;
-                                set_ui_busy("Staged change reverted", 1500);
                                 trigger_chime(460, 35);
                             } else if (ev.code == 308) {
                                 open_chain_secret_osk();
@@ -2703,7 +2750,7 @@ int main(int argc, char **argv) {
                             if (ev.code == ABS_HAT0Y && ev.value < 0) g_st.osk_row = (g_st.osk_row + 3) % 4;
                             if (ev.code == ABS_HAT0Y && ev.value > 0) g_st.osk_row = (g_st.osk_row + 1) % 4;
                         } else {
-                            int total_rows = 2 + g_st.wifi_count;
+                            int total_rows = g_st.limb_count + 1;
                             if (ev.code == ABS_HAT0Y && ev.value < 0) {
                                 g_st.wifi_cursor = (g_st.wifi_cursor + total_rows - 1) % total_rows;
                                 trigger_chime(520, 20);
@@ -2711,11 +2758,9 @@ int main(int argc, char **argv) {
                                 g_st.wifi_cursor = (g_st.wifi_cursor + 1) % total_rows;
                                 trigger_chime(520, 20);
                             } else if (ev.code == ABS_HAT0X) {
-                                if (g_st.wifi_cursor == 0) {
-                                    g_st.net_staged_ap = !g_st.net_staged_ap;
-                                    g_st.net_staged_dirty = true;
-                                    trigger_chime(580, 25);
-                                } else if (g_st.wifi_cursor == 1) {
+                                if (g_st.wifi_cursor < g_st.limb_count) {
+                                    limb_cycle(ev.value > 0 ? 1 : -1);
+                                } else {
                                     g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 1) % 2;
                                     trigger_chime(540, 25);
                                 }
@@ -2736,11 +2781,7 @@ int main(int argc, char **argv) {
                             else g_st.rev_cursor = (g_st.rev_cursor + 1) % 6;
                             trigger_chime(500, 20);
                         } else if (ev.code == ABS_HAT0X) {
-                            if (g_st.rev_cursor == 0) {
-                                g_st.net_staged_ap = !g_st.net_staged_ap;
-                                g_st.net_staged_dirty = true;
-                                trigger_chime(580, 25);
-                            } else if (g_st.rev_cursor == 2) {
+                            if (g_st.rev_cursor == 2) {
                                 int next_role = (g_st.chain_role_idx + (ev.value > 0 ? 1 : 2)) % 3;
                                 commit_chain_settings(g_st.chain_secret, next_role);
                             } else if (g_st.rev_cursor == 4) {
@@ -2767,11 +2808,11 @@ int main(int argc, char **argv) {
             fill_rect(fb, 0, 0, PANEL_W, hl + 14, th->panel2);
             ctext(fb, F30B, 12, 4, "Stump", th->ember, 0);
             int tx = 12 + font_width(F30B, "Stump  ");
-            const char *tabs[5] = { "CHATS", "BOARD", "FILES", "NETWORK", g_st.net_staged_dirty ? "SETUP*" : "SETUP" };
+            const char *tabs[5] = { "CHATS", "BOARD", "FILES", "NETWORK", "SETUP" };
             for (int t = 0; t < 5; t++) {
                 int w = font_width(F24, tabs[t]) + 14;
                 bool act = (t == g_st.tab_idx);
-                bool dirty = (t == 4 && g_st.net_staged_dirty);
+                bool dirty = false;
                 if (act) fill_rrect(fb, tx, 6, w, hl + 2, 4, th->ember);
                 ctext(fb, F24, tx + 7, 7, tabs[t], act ? th->bg : (dirty ? th->ok : th->muted), 0);
                 tx += w + 3;
@@ -2938,42 +2979,67 @@ int main(int argc, char **argv) {
             else snprintf(sub, sizeof(sub), "files waiting in /roms/ports/stump_r36max/drop/");
             ctext(fb, F16, 18, 594, sub, th->muted, PANEL_W - 36);
         } else if (g_st.tab_idx == 3) {
-            /* Network: where this Stump is, what's staged, the networks, the QR code. */
-            char now[120], staged[160];
-            if (g_st.ap_active) snprintf(now, sizeof(now), "Hotspot %s · %s", g_st.ap_ssid, disp_ip);
+            /* Network: where this Stump is, its Wi-Fi cards and their jobs, the QR code. */
+            char now[120], sum[120];
+            int n_ap = 0, n_rem = 0;
+            for (int i = 0; i < g_st.limb_count; i++) {
+                if (strcmp(g_st.limbs[i].job, "ap") == 0) n_ap++;
+                if (g_st.limbs[i].remember) n_rem++;
+            }
+            if (g_st.ap_active) snprintf(now, sizeof(now), "AP %s · %s", g_st.ap_ssid, disp_ip);
             else snprintf(now, sizeof(now), "%.32s · %s", g_st.wifi_count > 0 ? g_st.wifi_list[0].ssid : "no Wi-Fi", disp_ip);
-            if (g_st.net_staged_dirty)
-                snprintf(staged, sizeof(staged), "staged: hotspot %s — apply it in SETUP", g_st.net_staged_ap ? "on" : "off");
-            else snprintf(staged, sizeof(staged), "nothing staged");
+            snprintf(sum, sizeof(sum), "%d Wi-Fi card%s · %d AP%s · Wi-Fi network chosen in EmulationStation",
+                     g_st.limb_count, g_st.limb_count == 1 ? "" : "s", n_ap, n_ap == 1 ? "" : "s");
             ctext(fb, F16, 14, 134, "THIS STUMP", th->ember, 0);
             ctext(fb, F24, 14, 154, now, th->text, PANEL_W - 28);
-            ctext(fb, F16, 14, 184, staged, g_st.net_staged_dirty ? th->ok : th->muted, PANEL_W - 28);
+            ctext(fb, F16, 14, 184, sum, th->muted, PANEL_W - 28);
 
-            ctext(fb, F16, 14, 212, "STAGE", th->ember, 0);
+            ctext(fb, F16, 14, 212, "WI-FI CARDS", th->ember, 0);
             static const char *tools[2] = { "Chain secret", "Find Stumps on this network" };
-            int lw = 440;
-            for (int row = 0; row < 2 + (g_st.wifi_count < 4 ? g_st.wifi_count : 4); row++) {
-                int y = 232 + row * 38;
+            /* One card per row (name / job / what it's doing), four at a time, scrolling. */
+            int lw = 440, rh = 72, vis = 4;
+            int first = g_st.wifi_cursor - (vis - 1);
+            if (first < 0) first = 0;
+            if (first > g_st.limb_count - vis) first = g_st.limb_count > vis ? g_st.limb_count - vis : 0;
+            int rows = g_st.limb_count - first < vis ? g_st.limb_count - first : vis;
+            if (g_st.limb_count == 0) ctext(fb, F20, 22, 237, "No Wi-Fi card found", th->muted, lw - 20);
+            if (first > 0) ctext(fb, F16, lw - 40, 212, "↑ more", th->muted, 0);
+            for (int k = 0; k < rows; k++) {
+                int row = first + k;
+                const LimbItem *l = &g_st.limbs[row];
+                int y = 232 + k * rh;
                 bool sel = (g_st.wifi_cursor == row);
+                if (sel) stroke_rrect(fb, 12, y, lw, rh - 4, 6, th->ember, th->panel);
+                int c = limb_shown(row);
+                bool pending = (c != limb_current(l));
+                char val[48], sub[120];
+                if (l->ap_ok && sel) snprintf(val, sizeof(val), "◀ %s ▶", limb_label(l, c));
+                else snprintf(val, sizeof(val), "%s", limb_label(l, c));
+                uint32_t vc = pending ? th->ember_bright : (strcmp(l->job, "ap") == 0 ? th->ok : th->text);
+                ctext(fb, F20, 22, y + 3, l->name, sel ? th->ember_bright : th->text, lw - 30);
+                ctext(fb, F20, 22, y + 25, val, vc, lw - 30);
+                if (pending) snprintf(sub, sizeof(sub), "A to apply · B to cancel");
+                else if (strcmp(l->job, "ap") == 0)
+                    snprintf(sub, sizeof(sub), "%d phone%s%s · %s", l->clients, l->clients == 1 ? "" : "s",
+                             l->remember ? " · remembered" : "", l->info);
+                else if (strcmp(l->job, "lan") == 0)
+                    snprintf(sub, sizeof(sub), "%s · %s%s", l->info, l->ap_ok ? "can run an AP" : "no AP mode",
+                             l->remember ? " · remembered" : "");
+                else snprintf(sub, sizeof(sub), "%s · %s%s", l->driver[0] ? l->driver : l->iface,
+                              l->ap_ok ? ((l->bands & 2) ? "AP 2.4/5 GHz" : "AP 2.4 GHz") : "no AP mode",
+                              l->remember ? " · remembered" : "");
+                ctext(fb, F16, 22, y + 48, sub, pending ? th->ember : th->muted, lw - 30);
+            }
+            if (first + rows < g_st.limb_count) ctext(fb, F16, lw - 40, 232 + rows * rh - 2, "↓ more", th->muted, 0);
+            {
+                int y = 232 + (rows > 0 ? rows : 1) * rh + 8;
+                bool sel = (g_st.wifi_cursor >= g_st.limb_count);
                 if (sel) stroke_rrect(fb, 12, y, lw, 34, 6, th->ember, th->panel);
-                char lab[64], val[64];
-                uint32_t vc = th->muted;
-                if (row == 0) {
-                    snprintf(lab, sizeof(lab), "Mode");
-                    snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ap ? "Hotspot on" : "Hotspot off");
-                    vc = g_st.net_staged_ap ? th->ok : th->text;
-                } else if (row == 1) {
-                    snprintf(lab, sizeof(lab), "Tool");
-                    snprintf(val, sizeof(val), "◀ %s ▶", tools[g_st.wifi_bar_mode % 2]);
-                } else {
-                    int w = row - 2;
-                    snprintf(lab, sizeof(lab), "%s%.24s", g_st.wifi_list[w].active ? "● " : "", g_st.wifi_list[w].ssid);
-                    snprintf(val, sizeof(val), "%s %d%%", g_st.wifi_list[w].sec, g_st.wifi_list[w].signal);
-                    if (g_st.wifi_list[w].active) vc = th->ok;
-                }
+                char val[64];
+                snprintf(val, sizeof(val), "◀ %s ▶", tools[g_st.wifi_bar_mode % 2]);
                 int vw = font_width(F20, val);
-                ctext(fb, F20, 22, y + 5, lab, sel ? th->ember_bright : th->text, lw - 40 - vw);
-                ctext(fb, F20, 12 + lw - 10 - vw, y + 5, val, vc, 0);
+                ctext(fb, F20, 22, y + 5, "Tool", sel ? th->ember_bright : th->text, lw - 40 - vw);
+                ctext(fb, F20, 12 + lw - 10 - vw, y + 5, val, th->muted, 0);
             }
 
             /* the QR code: the Stump's page, or (X) joining the hotspot */
@@ -2987,30 +3053,23 @@ int main(int argc, char **argv) {
                     if (g_st.qr_grid[rr][cc]) fill_rect(fb, qx + (cc + 2) * qs, qy + (rr + 2) * qs, qs, qs, 0xFF000000u);
             ctext(fb, F16, qx0 + (240 - font_width(F16, g_st.qr_url)) / 2, qy + qbox + 6, g_st.qr_url, th->muted, 240);
 
-            ctext(fb, F16, 14, 480, "WI-FI", th->ember, 0);
-            ctext(fb, F20, 14, 502, g_st.wifi_count > 0 ? "EmulationStation's network: the Stump follows it"
-                                                       : "No Wi-Fi: connect in EmulationStation",
-                  g_st.wifi_count > 0 ? th->text : th->muted, PANEL_W - 28);
-            ctext(fb, F16, 14, 540, "CHAIN", th->ember, 0);
-            ctext(fb, F20, 14, 562, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->text, PANEL_W - 28);
-            ctext(fb, F16, 14, 594, "secret, role and the Stump above: in /admin, as on every Stump", th->muted, PANEL_W - 28);
         } else {
             /* Setup: the staged change, apply or revert, the tools, the log. */
-            ctext(fb, F16, 14, 134, "STAGED CHANGES", th->ember, 0);
-            const char *st = g_st.net_staged_dirty ? "pending" : "synced";
-            ctext(fb, F16, PANEL_W - 14 - font_width(F16, st), 134, st, g_st.net_staged_dirty ? th->ok : th->muted, 0);
+            ctext(fb, F16, 14, 134, "NETWORK", th->ember, 0);
             static const char *dtools[4] = { "Scan LAN for Stumps", "Chain secret", "Diagnostics → TF card",
                                              "Restart the Stump" };
             for (int row = 0; row < 5; row++) {
                 int y = (row < 4) ? 156 + row * 38 : 362;
                 bool sel = (g_st.rev_cursor == row);
-                if (sel) stroke_rrect(fb, 12, y, PANEL_W - 24, 34, 6, row == 3 ? th->ok : th->ember, th->panel);
+                if (sel) stroke_rrect(fb, 12, y, PANEL_W - 24, 34, 6, th->ember, th->panel);
                 char lab[32], val[120];
                 uint32_t vc = th->muted;
                 if (row == 0) {
-                    snprintf(lab, sizeof(lab), "Mode");
-                    snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ap ? "Hotspot on (10.42.0.1)" : "Hotspot off");
-                    vc = th->text;
+                    int n_ap = 0;
+                    for (int i = 0; i < g_st.limb_count; i++) if (strcmp(g_st.limbs[i].job, "ap") == 0) n_ap++;
+                    snprintf(lab, sizeof(lab), "Wi-Fi cards");
+                    snprintf(val, sizeof(val), "%d · %d running an AP", g_st.limb_count, n_ap);
+                    vc = n_ap > 0 ? th->ok : th->text;
                 } else if (row == 1) {
                     snprintf(lab, sizeof(lab), "Wi-Fi");
                     snprintf(val, sizeof(val), "%.32s (set in EmulationStation)",
@@ -3022,16 +3081,16 @@ int main(int argc, char **argv) {
                     else snprintf(val, sizeof(val), "no secret · set it in /admin");
                     vc = g_st.chain_has_secret ? th->ok : th->muted;
                 } else if (row == 3) {
-                    snprintf(lab, sizeof(lab), "Apply");
-                    snprintf(val, sizeof(val), "A apply · B revert");
-                    vc = g_st.net_staged_dirty ? th->ok : th->muted;
+                    snprintf(lab, sizeof(lab), "Jobs");
+                    snprintf(val, sizeof(val), "chosen on NETWORK (A to go)");
+                    vc = th->muted;
                 } else {
                     snprintf(lab, sizeof(lab), "Tool");
                     snprintf(val, sizeof(val), "◀ %s ▶", dtools[g_st.debug_bar_mode % 4]);
                     vc = th->text;
                 }
                 int vw = font_width(F20, val);
-                ctext(fb, F20, 22, y + 5, lab, sel ? (row == 3 ? th->ok : th->ember_bright) : th->text, 200);
+                ctext(fb, F20, 22, y + 5, lab, sel ? th->ember_bright : th->text, 200);
                 ctext(fb, F20, PANEL_W - 22 - vw, y + 5, val, vc, PANEL_W - 250);
             }
             ctext(fb, F16, 14, 314, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->muted, PANEL_W - 28);
@@ -3060,7 +3119,7 @@ int main(int argc, char **argv) {
             bool apply = (g_st.confirm_type == 3);
             uint32_t tone = apply ? th->ok : th->warn;
             stroke_rrect(fb, 60, 200, PANEL_W - 120, 270, 10, tone, th->panel);
-            ctext(fb, F24, 84, 220, apply ? "Apply the staged network?" : "Erase what's checked?", tone, PANEL_W - 168);
+            ctext(fb, F24, 84, 220, apply ? "Change this card's job?" : "Erase what's checked?", tone, PANEL_W - 168);
             ctext(fb, F16, 84, 262, apply ? "This change:" : (g_st.confirm_type == 1 ? "Checked notices:" : "Checked files:"),
                   th->muted, 0);
             ctext(fb, F20, 84, 286, g_st.confirm_label, th->ember_bright, PANEL_W - 168);
@@ -3085,12 +3144,12 @@ int main(int argc, char **argv) {
             static const char *const l[6] = { "check", "clear", "TF backup", "delete", "move", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
         } else if (g_st.tab_idx == 3) {
-            static const char *const k[6] = { "A", "B", "Y", "X", "↑↓", "L/R" };
-            static const char *const l[6] = { "stage", "cancel", "secret", "QR", "move", "tab" };
+            static const char *const k[6] = { "A", "←→", "Y", "X", "↑↓", "L/R" };
+            static const char *const l[6] = { "apply", "job", "remember", "QR", "move", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
         } else if (g_st.tab_idx == 4) {
             static const char *const k[6] = { "A", "B", "X", "START", "↑↓", "L/R" };
-            static const char *const l[6] = { "do", "revert", "scan LAN", "apply", "move", "tab" };
+            static const char *const l[6] = { "do", "back", "scan LAN", "cards", "move", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
         } else {
             static const char *const k[6] = { "A", "Y", "X", "←→", "↑↓", "L/R" };
@@ -3211,13 +3270,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # limbs.py, next to this file (also under -I)
+import limbs  # noqa: E402
+
+
 def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.1.0-r36max"
+            return f.read().strip() or "2.2.0-r36max"
     except OSError:
-        return "2.1.0-r36max"
+        return "2.2.0-r36max"
 
 
 FEED_VERSION = _version()
@@ -3231,13 +3294,14 @@ LIVE_TXT = os.environ.get("STUMP_LIVE_FILE", "/dev/shm/stump_live.txt")
 CMD_TXT = os.environ.get("STUMP_CMD_FILE", "/dev/shm/stump_cmd.txt")
 IPC_PORT = int(os.environ.get("STUMP_IPC_PORT", "42421"))
 NICK = os.environ.get("STUMP_COCKPIT_NICK", "r36max")
-HOTSPOT_CON = "Stump-Hotspot"
+HOTSPOT_CON = limbs.OLD_HOTSPOT                  # v2.0's single hotspot (limbs.py moves it)
+LIMBS_FILE = os.environ.get("STUMP_LIMBS_FILE", os.path.join(APP_DIR, "limbs.json"))
 
 ROOMS = ("main", "lora-mesh", "wifi-mesh")      # the cockpit's three room tabs, in order
 
 POLL_S = 2.0          # the reference client's cadence (CLIENT_QUICKSTART "Polling cadence")
 INFO_S = 5.0
-NET_S = 12.0
+NET_S = 4.0           # the Wi-Fi cards: often enough to notice one plugged in
 
 
 # ── small helpers ──────────────────────────────────────────────────
@@ -3451,7 +3515,10 @@ class Feed:
         self.board = []
         self.files = []
         self.net = {"ap": False, "ap_if": "", "ap_mac": "", "ap_driver": "", "clients": 0,
-                    "ip": "", "ssids": []}
+                    "ip": "", "ssids": [], "ap_ssid": ""}
+        self.limbs = limbs.Limbs(nmcli=lambda *a, **k: self._nmcli(*a, **k), iw_phy=_iw_phy, iw_dev=_iw_stations,
+                                 state_file=LIMBS_FILE, config=read_config)
+        self.ap_keys = None                # the cards running an AP at the last look (None: not looked yet)
         self.busy_until, self.busy_msg = 0.0, "READY"
         self.full_names = {}               # shown (truncated) file name -> the real one
         self.full_ssids = {}               # shown SSID -> the real one
@@ -3545,36 +3612,43 @@ class Feed:
             ok, out = run(["sudo", "-n", "nmcli"] + list(args), timeout=timeout)
         return ok, out
 
-    def wifi_devices(self):
-        """[(device, state, connection)] of the Wi-Fi interfaces."""
-        ok, out = self._nmcli("-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device")
-        devs = []
-        for line in out.splitlines() if ok else []:
-            parts = _split_nm(line)
-            if len(parts) >= 4 and parts[1] == "wifi":
-                devs.append((parts[0], parts[2], parts[3]))
-        return devs
-
     def refresh_net(self):
-        devs = self.wifi_devices()
-        ap_dev = next((d for d, s, c in devs if c == HOTSPOT_CON and s.startswith("connected")), "")
-        self.net["ap"] = bool(ap_dev)
-        self.net["ap_if"] = ap_dev or (devs[-1][0] if devs else "wlan0")
-        self.net["ap_mac"] = _read("/sys/class/net/%s/address" % self.net["ap_if"])
-        drv = "/sys/class/net/%s/device/driver" % self.net["ap_if"]
-        self.net["ap_driver"] = os.path.basename(os.path.realpath(drv)) if os.path.exists(drv) else ""
-        self.net["clients"] = 0
-        if ap_dev and shutil.which("iw"):
-            ok, out = run(["iw", "dev", ap_dev, "station", "dump"], timeout=5)
-            self.net["clients"] = out.count("Station ") if ok else 0
+        cards = self.limbs.scan()
+        aps = [c for c in cards if c["job"] == "ap"]
+        first = aps[0] if aps else (cards[0] if cards else None)
+        self.net["ap"] = bool(aps)
+        self.net["ap_if"] = first["iface"] if first else "wlan0"
+        self.net["ap_mac"] = first["key"] if first else ""
+        self.net["ap_driver"] = first["driver"] if first else ""
+        self.net["ap_ssid"] = aps[0]["info"].split(" \\u00b7 ")[0] if aps else ""
+        self.net["clients"] = sum(c["clients"] for c in aps)
+        # Cards plugged in or pulled out: say so; a remembered AP is already
+        # back (NetworkManager), any other AP-capable card is offered a job.
+        new, gone = self.limbs.new_and_gone()
+        for c in new:
+            if c["job"] == "ap":
+                self.busy("%s is back as an AP" % c["name"], 5)
+            elif c["ap_ok"]:
+                self.busy("New Wi-Fi: %s, AP-capable: give it a job (NETWORK)" % c["name"], 8)
+            else:
+                self.busy("New Wi-Fi: %s (no AP mode)" % c["name"], 5)
+        for key in gone:
+            self.busy("A Wi-Fi card was unplugged", 4)
+            log("NET", "card %s unplugged" % key)
+        # The Stump's sign-in DNS answers with its hotspot address, chosen when
+        # it starts: one restart whenever the cards running an AP change.
+        keys = sorted(c["key"] for c in aps)
+        if self.ap_keys is not None and keys != self.ap_keys:
+            self.restart_stump("APs now: %s" % (", ".join(c["name"] for c in aps) or "none"))
+        self.ap_keys = keys
         # The Wi-Fi is EmulationStation's: the network(s) the handheld is on
-        # now, shown, never chosen here (the hotspot's own network left out).
+        # now, shown, never chosen here (the APs' own networks left out).
         ok, out = self._nmcli("-t", "-f", "IN-USE,SIGNAL,SECURITY,SSID", "device", "wifi", "list", "--rescan", "no")
-        hotspot = str(read_config().get("PC_HOTSPOT_NAME") or "") if ap_dev else ""
+        own = set(c["info"].split(" \\u00b7 ")[0] for c in aps)
         ssids, seen = [], set()
         for line in out.splitlines() if ok else []:
             p = _split_nm(line)
-            if len(p) >= 4 and p[0] == "*" and p[3] and p[3] not in seen and p[3] != hotspot:
+            if len(p) >= 4 and p[0] == "*" and p[3] and p[3] not in seen and p[3] not in own:
                 seen.add(p[3])
                 ssids.append({"active": True, "signal": int(p[1] or 0) if p[1].isdigit() else 0,
                               "sec": p[2] or "OPEN", "ssid": p[3]})
@@ -3601,38 +3675,34 @@ class Feed:
         self.next_info = time.time() + 6
 
     def hotspot(self, on):
-        cfg = read_config()
+        """The old one-button hotspot: on = an AP on a free AP-capable card,
+        else on the card EmulationStation is on; off = every AP off."""
+        self.limbs.scan()
         if not on:
-            ok, out = self._nmcli("connection", "down", HOTSPOT_CON)
-            self.busy("Hotspot off" if ok else "Hotspot: " + out, 3)
-            self.restart_stump("hotspot off")
+            aps = [c for c in self.limbs.cards if c["job"] == "ap"]
+            for c in aps:
+                self.limbs.set_off(c["key"])
+            self.busy("AP off" if aps else "No AP was on", 3)
             return
-        devs = self.wifi_devices()
-        if not devs:
-            self.busy("No Wi-Fi adapter found", 3)
+        c = self.limbs.ap_target()
+        if not c:
+            self.busy("No Wi-Fi card here can run an AP", 4)
             return
-        # The hotspot only on an adapter EmulationStation's Wi-Fi isn't using
-        # (two adapters: internal + RT3070), so the handheld stays on the
-        # network chosen there. With one adapter on a network, it waits.
-        free = [d for d, s, c in devs if not s.startswith("connected") or c == HOTSPOT_CON]
-        if not free:
-            self.busy("No hotspot: EmulationStation's Wi-Fi uses the adapter", 6)
-            log("NET", "no hotspot: every Wi-Fi adapter is on EmulationStation's network")
+        self.limb_job(c["key"], "ap", c.get("band") or "bg")
+
+    def limb_job(self, key, job, band="bg"):
+        c = self.limbs.find(key) or (self.limbs.scan() and self.limbs.find(key))
+        if not c:
+            self.busy("That Wi-Fi card is gone", 3)
             return
-        dev = free[-1]
-        ssid = cfg.get("PC_HOTSPOT_NAME") or "%s-Stump" % (cfg.get("NODE_NAME") or "R36MAX")
-        ssid = str(ssid)[:32]
-        self._nmcli("connection", "delete", HOTSPOT_CON)
-        # Open, like a CAM's walk-up Wi-Fi; NetworkManager's "shared" mode gives
-        # it 10.42.0.1 with DHCP (the Linux hotspot of docs/PC.md).
-        ok, out = self._nmcli("connection", "add", "type", "wifi", "ifname", dev, "con-name", HOTSPOT_CON,
-                              "autoconnect", "no", "ssid", ssid, "802-11-wireless.mode", "ap",
-                              "802-11-wireless.band", "bg", "ipv4.method", "shared", "ipv6.method", "ignore")
-        if ok:
-            ok, out = self._nmcli("connection", "up", HOTSPOT_CON, timeout=45)
-        self.busy(("HOTSPOT ON: %s" % ssid) if ok else ("HOTSPOT FAILED: %s" % out), 4)
-        if ok:
-            self.restart_stump("hotspot on")
+        if job == "ap":
+            if c["job"] == "lan":
+                log("NET", "AP on %s: the handheld leaves %s" % (c["name"], c["info"]))
+            ok, msg = self.limbs.set_ap(key, band)
+        else:
+            ok, msg = self.limbs.set_off(key)
+        self.busy(msg, 5)
+        self.next_net = 0                  # look again now (and restart the Stump if the APs changed)
 
     # -- the TF card --
     def tf_count(self):
@@ -3707,6 +3777,14 @@ class Feed:
                         shutil.copy2(src, os.path.join(TF_DIR, os.path.basename(name)))
                         n += 1
                 self.busy("%d file(s) copied to the TF card" % n, 2.5)
+            elif op == "LIMB_JOB" and len(parts) >= 3:
+                job = parts[2].strip().lower()
+                self.busy("AP on\\u2026" if job == "ap" else "AP off\\u2026", 10)
+                self.limb_job(parts[1].strip().lower(), job, parts[3].strip() if len(parts) > 3 else "bg")
+            elif op == "LIMB_REMEMBER" and len(parts) >= 3:
+                ok, msg = self.limbs.set_remember(parts[1].strip().lower(), parts[2].strip() == "1")
+                self.busy(msg, 3)
+                self.next_net = 0
             elif op in ("AP_ON", "AP_OFF", "AP_TOGGLE"):
                 on = (op == "AP_ON") or (op == "AP_TOGGLE" and not self.net["ap"])
                 self.busy("Hotspot %s\\u2026" % ("on" if on else "off"), 8)
@@ -3833,7 +3911,7 @@ class Feed:
             1 if port == 80 else 0, 1 if port == 8080 else 0, ip, self.tf_count()))
         busy = time.time() < self.busy_until
         out.append("BUSY|%d|%s" % (1 if busy else 0, clean(self.busy_msg if busy else "READY", 54)))
-        cfg_ssid = read_config().get("PC_HOTSPOT_NAME") or ""
+        cfg_ssid = self.net.get("ap_ssid") or read_config().get("PC_HOTSPOT_NAME") or ""
         out.append("AP|%d|%s|%s|%s|%s|%d" % (1 if self.net["ap"] else 0, clean(self.net["ap_if"] or "wlan0", 16),
                                              clean(self.net["ap_mac"], 20), clean(self.net["ap_driver"], 16),
                                              clean(cfg_ssid or "Stump hotspot", 23), self.net["clients"]))
@@ -3863,6 +3941,13 @@ class Feed:
             shown = clip(clean(screen_line(w["ssid"]), 31), 31)
             self.full_ssids[shown] = w["ssid"]
             out.append("SSID|%d|%d|%s|%s" % (1 if w["active"] else 0, w["signal"], clean(w["sec"], 8), shown))
+        # The Wi-Fi cards: LIMB|key|name|driver|job|ap_ok|bands|band|remember|iface|info|clients
+        for c in self.limbs.cards[:6]:
+            bands = (1 if 1 in c["bands"] else 0) | (2 if 2 in c["bands"] else 0)
+            out.append("LIMB|%s|%s|%s|%s|%d|%d|%s|%d|%s|%s|%d" % (
+                clean(c["key"], 17), clip(clean(screen_line(c["name"]), 28), 28), clean(c["driver"], 15), c["job"],
+                1 if c["ap_ok"] else 0, bands, "a" if c.get("band") == "a" else "bg", 1 if c["remember"] else 0,
+                clean(c["iface"], 15), clip(clean(screen_line(c["info"]), 44), 44), c["clients"]))
         for i, room in enumerate(ROOMS):
             out.append("ROOM|%d|%s|%d" % (i, room.upper(), self.users[room]))
             for m in self.msgs[room][-10:]:
@@ -3985,6 +4070,16 @@ def discover_stumps(timeout=1.5):
     return list(found.values())
 
 
+def _iw_phy(phy):
+    ok, out = run(["iw", "phy", phy, "info"], timeout=5)
+    return out if ok else ""
+
+
+def _iw_stations(iface):
+    ok, out = run(["iw", "dev", iface, "station", "dump"], timeout=5)
+    return out if ok else ""
+
+
 def _split_nm(line):
     """nmcli -t fields: ':' separated, '\\\\:' for a colon inside one."""
     out, cur, esc = [], "", False
@@ -4029,9 +4124,322 @@ if __name__ == "__main__":
             pass
 `;
 
+export const STUMP_R36MAX_LIMBS_PY = `"""limbs.py -- the handheld's Wi-Fi cards ("limbs") and their jobs.
+
+Every Wi-Fi card on the handheld (the Blueway on the hub, and any other one
+plugged in, in any order) is a limb with a job:
+
+  lan   EmulationStation's network is on it (chosen there, shown here)
+  ap    the Stump's open Wi-Fi with its sign-in page
+  idle  plugged in, unused
+  off   the system can't use it now (unavailable, unmanaged)
+
+A card is known by its hardware (permanent MAC), never by wlan0/wlan1,
+which change with the plug order. Whether it can run an AP, and on which
+bands, is read from the card itself (\`iw phy\`), so a future card qualifies
+without a change here.
+
+Each AP is one NetworkManager connection, Stump-AP-<mac>, bound to the
+card's MAC: open, "shared" (NetworkManager's DHCP), at 10.42.<slot>.1 on its
+own channel. "Remember" is that connection's autoconnect, with a priority
+above EmulationStation's networks, so NetworkManager itself brings the AP
+back when the card is plugged in again or at boot, cockpit open or not.
+Taking the AP off a card brings its connection down; NetworkManager then
+puts EmulationStation's network back on it by itself.
+
+Standard library only. nmcli and iw are passed in (the tests use fakes).
+"""
+
+import json
+import os
+import re
+
+AP_PREFIX = "Stump-AP-"
+OLD_HOTSPOT = "Stump-Hotspot"         # v2.0's single hotspot connection
+PRIORITY = 50                         # above a saved home network's default 0
+CHANNELS = {"bg": (1, 6, 11), "a": (36, 44, 149, 157)}
+
+# Friendly names by USB id; any other card is shown by its driver or id.
+KNOWN = {
+    "148f:3070": "Blueway High Power",
+    "148f:5572": "Ralink RT5572",
+    "0cf3:9271": "Atheros AR9271",
+}
+
+
+def split_nm(line):
+    """nmcli -t fields: ':' separated, '\\\\:' for a colon inside one."""
+    out, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\\\":
+            esc = True
+        elif ch == ":":
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return out
+
+
+def parse_iw_phy(text):
+    """(modes, bands) from \`iw phy <phy> info\` (or \`iw list\`): the
+    "Supported interface modes" ({"managed", "AP", ...}) and the band
+    numbers (1 = 2.4 GHz, 2 = 5 GHz, ...)."""
+    modes, inside = set(), False
+    for line in (text or "").splitlines():
+        if "Supported interface modes:" in line:
+            inside = True
+            continue
+        if inside:
+            m = re.match(r"^\\s+\\*\\s+(\\S+)\\s*$", line)
+            if not m:
+                inside = False
+                continue
+            modes.add(m.group(1))
+    bands = set(int(b) for b in re.findall(r"^\\s*Band (\\d+):", text or "", re.M))
+    return modes, bands
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def con_name(key):
+    return AP_PREFIX + key.replace(":", "").lower()
+
+
+def list_cards(iw, sys_net="/sys/class/net", sys_phy="/sys/class/ieee80211"):
+    """[{key, iface, phy, driver, usb, name, ap_ok, bands}] of the Wi-Fi
+    cards present now. iw(phy) returns \`iw phy <phy> info\`."""
+    cards = []
+    try:
+        ifaces = sorted(os.listdir(sys_net))
+    except OSError:
+        return cards
+    for iface in ifaces:
+        base = os.path.join(sys_net, iface)
+        if not os.path.exists(os.path.join(base, "phy80211")):
+            continue
+        phy = os.path.basename(os.path.realpath(os.path.join(base, "phy80211")))
+        key = (_read(os.path.join(sys_phy, phy, "macaddress")) or _read(os.path.join(base, "address"))).lower()
+        if not key:
+            continue
+        drv = os.path.join(base, "device", "driver")
+        driver = os.path.basename(os.path.realpath(drv)) if os.path.exists(drv) else ""
+        usb = ""
+        dev = os.path.realpath(os.path.join(base, "device"))
+        for d in (dev, os.path.dirname(dev)):              # the USB interface, then its device
+            vid, pid = _read(os.path.join(d, "idVendor")), _read(os.path.join(d, "idProduct"))
+            if vid and pid:
+                usb = "%s:%s" % (vid.lower(), pid.lower())
+                break
+        modes, bands = parse_iw_phy(iw(phy))
+        name = KNOWN.get(usb) or ("%s card" % driver if driver else ("Wi-Fi %s" % usb if usb else iface))
+        cards.append({"key": key, "iface": iface, "phy": phy, "driver": driver, "usb": usb, "name": name,
+                      "ap_ok": "AP" in modes, "bands": bands})
+    return cards
+
+
+class Limbs:
+    def __init__(self, nmcli, iw_phy=None, iw_dev=None, sys_net="/sys/class/net",
+                 sys_phy="/sys/class/ieee80211", state_file=None, config=None):
+        self.nmcli = nmcli                                   # nmcli(*args, timeout=) -> (ok, out)
+        self.iw_phy = iw_phy or (lambda phy: "")             # \`iw phy <phy> info\`
+        self.iw_dev = iw_dev or (lambda iface: "")           # \`iw dev <iface> station dump\`
+        self.sys_net, self.sys_phy = sys_net, sys_phy
+        self.state_file = state_file
+        self.config = config or (lambda: {})
+        self.state = self._load()
+        self.cards = []
+        self._seen = None                                    # keys at the last scan (None: none yet)
+
+    # -- the remembered preferences (remember on/off per card) --
+    def _load(self):
+        try:
+            with open(self.state_file, encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save(self):
+        if not self.state_file:
+            return
+        try:
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.state, f)
+            os.replace(tmp, self.state_file)
+        except OSError:
+            pass
+
+    def remember_pref(self, key):
+        return bool((self.state.get(key) or {}).get("remember"))
+
+    # -- what's there now --
+    def _ap_connections(self):
+        """{name: autoconnect} of the Stump's AP connections."""
+        ok, out = self.nmcli("-t", "-f", "NAME,AUTOCONNECT", "connection", "show")
+        cons = {}
+        for line in out.splitlines() if ok else []:
+            p = split_nm(line)
+            if len(p) >= 2 and (p[0].startswith(AP_PREFIX) or p[0] == OLD_HOTSPOT):
+                cons[p[0]] = p[1] == "yes"
+        return cons
+
+    def _ap_details(self, name):
+        """(ssid, address, channel, band) of an AP connection."""
+        ok, out = self.nmcli("-t", "-g", "802-11-wireless.ssid,ipv4.addresses,802-11-wireless.channel,"
+                             "802-11-wireless.band", "connection", "show", name)
+        p = split_nm(out.splitlines()[0]) if ok and out else []
+        p += [""] * (4 - len(p))
+        return p[0], p[1].split("/")[0], p[2], p[3] or "bg"
+
+    def _slot_of(self, name):
+        m = re.match(r"10\\.42\\.(\\d+)\\.1", self._ap_details(name)[1])
+        return int(m.group(1)) if m else None
+
+    def scan(self):
+        """The cards now, each with its job: [{..., job, conn, info, remember,
+        band, clients}]. Also keeps what new_and_gone() compares."""
+        cards = list_cards(self.iw_phy, self.sys_net, self.sys_phy)
+        ok, out = self.nmcli("-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device")
+        dev = {}
+        for line in out.splitlines() if ok else []:
+            p = split_nm(line)
+            if len(p) >= 4:
+                dev[p[0]] = (p[2], p[3])
+        cons = self._ap_connections()
+        for c in cards:
+            state, conn = dev.get(c["iface"], ("unavailable", ""))
+            c["conn"] = conn
+            c["remember"] = cons.get(con_name(c["key"]), self.remember_pref(c["key"])) is True
+            c["band"], c["clients"], c["info"] = "bg", 0, ""
+            if state.startswith("connected") and (conn.startswith(AP_PREFIX) or conn == OLD_HOTSPOT):
+                c["job"] = "ap"
+                ssid, ip, ch, band = self._ap_details(conn)
+                c["band"] = band
+                c["info"] = " · ".join(x for x in (ssid, ip, ("ch %s" % ch) if ch and ch != "0" else "") if x)
+                c["clients"] = self.iw_dev(c["iface"]).count("Station ")
+            elif state.startswith("connected"):
+                c["job"], c["info"] = "lan", conn
+            elif state in ("unavailable", "unmanaged"):
+                c["job"] = "off"
+            else:
+                c["job"] = "idle"
+        self.cards = cards
+        return cards
+
+    def new_and_gone(self):
+        """(cards that appeared, keys that left) since the last call; nothing
+        the first time (the cards there at start aren't news)."""
+        keys = set(c["key"] for c in self.cards)
+        if self._seen is None:
+            self._seen = keys
+            return [], []
+        new = [c for c in self.cards if c["key"] not in self._seen]
+        gone = sorted(self._seen - keys)
+        self._seen = keys
+        return new, gone
+
+    def find(self, key):
+        return next((c for c in self.cards if c["key"] == key), None)
+
+    # -- jobs --
+    def hotspot_name(self, slot):
+        cfg = self.config() or {}
+        base = str(cfg.get("PC_HOTSPOT_NAME") or "%s-Stump" % (cfg.get("NODE_NAME") or "R36MAX"))[:32]
+        return base if slot == 0 else "%s-%d" % (base[:29], slot + 1)
+
+    def free_slot(self, name):
+        """This card's slot if it had one, else the lowest one no other AP uses."""
+        used = {}
+        for other in self._ap_connections():
+            s = self._slot_of(other)
+            if s is not None:
+                used[other] = s
+        if name in used:
+            return used.pop(name)
+        taken = set(used.values())
+        slot = 0
+        while slot in taken:
+            slot += 1
+        return slot
+
+    def set_ap(self, key, band="bg"):
+        """The card runs an AP. (ok, message)."""
+        c = self.find(key)
+        if not c:
+            return False, "That card is gone"
+        if not c["ap_ok"]:
+            return False, "%s can't run an AP" % c["name"]
+        if band == "a" and 2 not in c["bands"]:
+            return False, "%s has no 5 GHz" % c["name"]
+        band = "a" if band == "a" else "bg"
+        # v2.0's single hotspot goes; every AP is now one per card.
+        self.nmcli("connection", "down", OLD_HOTSPOT)
+        self.nmcli("connection", "delete", OLD_HOTSPOT)
+        name = con_name(key)
+        slot = self.free_slot(name)
+        chans = CHANNELS[band]
+        ssid = self.hotspot_name(slot)
+        self.nmcli("connection", "delete", name)
+        ok, out = self.nmcli("connection", "add", "type", "wifi", "ifname", "*", "con-name", name,
+                             "ssid", ssid, "802-11-wireless.mode", "ap", "802-11-wireless.band", band,
+                             "802-11-wireless.channel", str(chans[slot % len(chans)]),
+                             "802-11-wireless.mac-address", key,
+                             "ipv4.method", "shared", "ipv4.addresses", "10.42.%d.1/24" % slot,
+                             "ipv6.method", "ignore",
+                             "connection.autoconnect", "yes" if self.remember_pref(key) else "no",
+                             "connection.autoconnect-priority", str(PRIORITY))
+        if ok:
+            ok, out = self.nmcli("connection", "up", name, "ifname", c["iface"], timeout=45)
+        if not ok:
+            return False, "AP failed: %s" % out
+        return True, "AP on %s: %s (10.42.%d.1)" % (c["name"], ssid, slot)
+
+    def set_off(self, key):
+        """The card stops being an AP; EmulationStation's network comes back
+        on it by itself (NetworkManager). (ok, message)."""
+        c = self.find(key)
+        name = con_name(key)
+        self.nmcli("connection", "modify", name, "connection.autoconnect", "no")
+        ok, out = self.nmcli("connection", "down", name)
+        if c and c.get("conn") == OLD_HOTSPOT:
+            ok, out = self.nmcli("connection", "down", OLD_HOTSPOT)
+        return True, "AP off on %s" % (c["name"] if c else "that card")
+
+    def set_remember(self, key, on):
+        """Remember on: the card goes back to being an AP by itself (replug,
+        boot). Kept per card, by its MAC."""
+        self.state.setdefault(key, {})["remember"] = bool(on)
+        self._save()
+        c = self.find(key)
+        if c and c["job"] == "ap" and c.get("conn") == con_name(key):
+            self.nmcli("connection", "modify", con_name(key), "connection.autoconnect", "yes" if on else "no")
+        return True, "%s: %s" % (c["name"] if c else "card", "remembered as an AP" if on else "not remembered")
+
+    def ap_target(self):
+        """The card the old one-button "hotspot on" uses: a free AP-capable
+        card first, else the one EmulationStation is on (taken over)."""
+        for job in ("idle", "lan"):
+            for c in self.cards:
+                if c["ap_ok"] and c["job"] == job:
+                    return c
+        return None
+`;
+
 export const STUMP_R36MAX_PORTS_SCRIPT = `#!/bin/bash
 # =============================================================================
-# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.1.0-r36max)
+# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.2.0-r36max)
 # EmulationStation Ports launcher: /roms/ports/LaBuche_Stump.sh
 #
 # The Stump itself is a stock Stump on a computer (SandBox_Stump_On,
@@ -4062,7 +4470,7 @@ APP_DIR="/roms/ports/stump_r36max"               # on the TF card: drop/, tf_bac
 STUMP_DIR="$USER_HOME/Stump"
 LOG="$APP_DIR/cockpit.log"
 mkdir -p "$APP_DIR/drop" "$APP_DIR/tf_backup" 2>/dev/null
-echo "=== R36MAX Stump cockpit v2.1.0-r36max, $(date) ===" > "$LOG"
+echo "=== R36MAX Stump cockpit v2.2.0-r36max, $(date) ===" > "$LOG"
 # For diagnosing a black screen: who we are, and whether we can open the display.
 { echo "user: $(id)"; ls -l /dev/dri/ /dev/fb0 /dev/tty1 2>&1; } >> "$LOG"
 
@@ -4130,7 +4538,7 @@ echo "=== cockpit closed $(date); the Stump keeps running ===" >> "$LOG"
 
 export const STUMP_R36MAX_INSTALL_SH = `#!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.1.0-r36max)
+# install.sh — makes the R36MAX a Stump like any other (v2.2.0-r36max)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -4266,12 +4674,13 @@ case "$PY_REAL" in
   *) warn "the venv's python is a link to $PY_REAL, not its own copy: not giving it ports <1024"; CAP=0 ;;
 esac
 if [ "$CAP" = 1 ] && [ -d /etc/NetworkManager ]; then
-  # The hotspot (NetworkManager "shared", 10.42.0.1) keeps its DHCP; DNS goes to
-  # the Stump's own captive DNS on :53, as on a CAM's walk-up Wi-Fi.
+  # Every AP (NetworkManager "shared": 10.42.0.1, 10.42.1.1... one per Wi-Fi
+  # card) keeps its DHCP; DNS goes to the Stump's own captive DNS on :53, as
+  # on a CAM's walk-up Wi-Fi. 0.0.0.0 is dnsmasq's "this AP's own address".
   sudo mkdir -p /etc/NetworkManager/dnsmasq-shared.d
-  printf '%s\\n' "# R36MAX Stump (R36MAX-Stump/handheld/install.sh): the hotspot's DNS is the Stump's own" \\
-                "port=0" "dhcp-option=option:dns-server,10.42.0.1" | sudo tee /etc/NetworkManager/dnsmasq-shared.d/stump.conf >/dev/null
-  ok "hotspot phones use the Stump's DNS (sign-in pop-up)"
+  printf '%s\\n' "# R36MAX Stump (R36MAX-Stump/handheld/install.sh): every AP's DNS is the Stump's own" \\
+                "port=0" "dhcp-option=option:dns-server,0.0.0.0" | sudo tee /etc/NetworkManager/dnsmasq-shared.d/stump.conf >/dev/null
+  ok "AP phones use the Stump's DNS (sign-in pop-up)"
 fi
 # The screen and gamepad for the user who runs the cockpit: its groups (they
 # apply from the next boot), and the devices opened up now for this boot.
@@ -4332,7 +4741,7 @@ fi
 # ── 6. The cockpit ──────────────────────────────────────────────────────────
 step "6/6 The cockpit (720x720 screen, gamepad, Ports launcher)"
 mkdir -p "$COCKPIT_DIR"
-cp -f "$HERE/cockpit_feed.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \\
+cp -f "$HERE/cockpit_feed.py" "$HERE/limbs.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \\
       "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$COCKPIT_DIR/"
 ok "FireFly's font (DejaVu Sans Mono) next to the engine"
 CFLAGS="-O2 -Wall -Wno-format-truncation"
@@ -4771,7 +5180,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'stump_r36max_c',
     filename: 'stump_r36max_engine.c',
-    title: 'Cockpit engine v2.1.0-r36max (720x720, gamepad, QR)',
+    title: 'Cockpit engine v2.2.0-r36max (720x720, gamepad, QR)',
     language: 'c',
     summary:
       "The handheld's screen and gamepad: five panels (chats, board, files, network, setup). Reads /dev/shm/stump_live.txt and sends command lines to cockpit_feed.py; never touches the Stump's files or the network. The v1.8.8 KMSDRM display fixes are kept.",
@@ -4787,9 +5196,18 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
     content: STUMP_R36MAX_BRIDGE_PY,
   },
   {
+    id: 'limbs_py',
+    filename: 'limbs.py',
+    title: "limbs.py: the handheld's Wi-Fi cards and their jobs",
+    language: 'python',
+    summary:
+      "Every Wi-Fi card (by its hardware, in any plug order) with a job: EmulationStation's network (shown), the Stump's AP (any card that supports AP mode, one NetworkManager connection each, 10.42.<slot>.1), or idle. Remember = NetworkManager brings the AP back on replug or at boot.",
+    content: STUMP_R36MAX_LIMBS_PY,
+  },
+  {
     id: 'labuche_stump_sh',
     filename: 'LaBuche_Stump.sh',
-    title: 'EmulationStation Ports launcher v2.1.0-r36max (/roms/ports/LaBuche_Stump.sh)',
+    title: 'EmulationStation Ports launcher v2.2.0-r36max (/roms/ports/LaBuche_Stump.sh)',
     language: 'bash',
     summary:
       'Opens the cockpit on the Stump that runs in the background from boot; SELECT+START returns to EmulationStation and the Stump keeps running. No firewall flush, no NetworkManager masking.',
