@@ -3,7 +3,7 @@
 # install.sh — makes the R36MAX a Stump like any other (v2.0.0-r36max)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
-#   git clone -b r36max-pc-stump https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
+#   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
 #   bash ~/R36MAX-Stump/handheld/install.sh
 # Run it again to update (it pulls both repos and re-runs the Stump's own update).
 #

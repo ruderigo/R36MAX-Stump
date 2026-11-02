@@ -64,7 +64,9 @@ From the Mac, with the handheld on your Wi-Fi and online:
 ssh -t ark@r36max.local 'if [ -d ~/R36MAX-Stump/.git ]; then git -C ~/R36MAX-Stump pull --ff-only; else git clone https://github.com/ruderigo/R36MAX-Stump.git ~/R36MAX-Stump; fi && bash ~/R36MAX-Stump/handheld/install.sh'
 ```
 
-(Before this branch is merged, add `-b r36max-pc-stump` after `git clone`.)
+The step-by-step guide (getting the handheld ready, the release-file
+install, update, troubleshooting, uninstall) is in the
+[repo's README](../README.md#install-guide).
 
 `install.sh` asks for the sudo password once. Then **SandBox_Stump_On's own
 Provisioner asks its usual questions**. Answer them as you did for macOS1:
