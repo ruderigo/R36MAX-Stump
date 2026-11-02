@@ -1,5 +1,8 @@
 # R36MAX Stump
 
+<img width="300" height="400" alt="r36MAX_Stump" src="https://github.com/user-attachments/assets/75b1b8cb-2e83-4600-9b95-d44c42bc2c31" />
+
+
 Turns an **R36MAX handheld** (RK3326, dArkOS) into a **Stump**: a node of
 the Stump/FireFly LoRa mesh, like LaBuche3 or macOS1. It has its own web
 pages, chat, notice board and file shelf, and its own place in the chain.
