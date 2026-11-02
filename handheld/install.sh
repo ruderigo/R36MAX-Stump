@@ -202,7 +202,9 @@ fi
 # ── 6. The cockpit ──────────────────────────────────────────────────────────
 step "6/6 The cockpit (720x720 screen, gamepad, Ports launcher)"
 mkdir -p "$COCKPIT_DIR"
-cp -f "$HERE/cockpit_feed.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" "$COCKPIT_DIR/"
+cp -f "$HERE/cockpit_feed.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \
+      "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$COCKPIT_DIR/"
+ok "FireFly's font (DejaVu Sans Mono) next to the engine"
 CFLAGS="-O2 -Wall -Wno-format-truncation"
 grep -qi "cortex-a35\|rk3326" /proc/device-tree/compatible /proc/cpuinfo 2>/dev/null && CFLAGS="$CFLAGS -mcpu=cortex-a35"
 gcc $CFLAGS "$COCKPIT_DIR/stump_r36max_engine.c" -o "$COCKPIT_DIR/stump_r36max_engine" -lasound -lpthread -ldl -lm \

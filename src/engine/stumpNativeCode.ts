@@ -110,12 +110,6 @@ static void fill_rect(uint32_t *fb, int x, int y, int w, int h, uint32_t color) 
     }
 }
 
-static void draw_border(uint32_t *fb, int x, int y, int w, int h, int thick, uint32_t color) {
-    fill_rect(fb, x, y, w, thick, color);
-    fill_rect(fb, x, y + h - thick, w, thick, color);
-    fill_rect(fb, x, y, thick, h, color);
-    fill_rect(fb, x + w - thick, y, thick, h, color);
-}
 
 /* True 5x7 Pixel-Matrix Bitmap Font (35-bit row-major integer per glyph) */
 #define G57(a,b,c,d,e,f,g) ( \\
@@ -204,7 +198,7 @@ static void draw_char_scaled(uint32_t *fb, int x, int y, char c, uint32_t fg, in
     }
 }
 
-static void draw_text_s(uint32_t *fb, int x, int y, const char *s, uint32_t color, int scale, int max_chars) {
+static void draw_text_5x7(uint32_t *fb, int x, int y, const char *s, uint32_t color, int scale, int max_chars) {
     int count = 0;
     int step = 6 * scale;
     bool shadow = (color != 0xFF000000u && color != 0xFF1F1C19u);
@@ -212,6 +206,172 @@ static void draw_text_s(uint32_t *fb, int x, int y, const char *s, uint32_t colo
         if (x + step > PANEL_W - 4) break;
         draw_char_scaled(fb, x, y, *s++, color, scale, shadow);
         x += step;
+        count++;
+    }
+}
+
+/* ---- FireFly's font: DejaVu Sans Mono, pre-rendered by gen_font.py ----
+ * cockpit_font.bin sits next to the engine (or STUMP_COCKPIT_FONT). Real
+ * lower and upper case, accents, and the symbols Stump sends (✓ ✗ → ⊖), all
+ * anti-aliased. Without the file, the old 5x7 capitals font is used. */
+typedef struct { uint32_t cp; int16_t xo, yo; uint16_t w, h; uint32_t off; } CkGlyph;
+typedef struct {
+    int px, adv64, ascent, descent, line, bold;
+    uint32_t n;
+    CkGlyph *g;
+    const uint8_t *data;
+    int16_t idx[256];            /* codepoint < 256 -> glyph index (-1: none) */
+} CkFont;
+enum { F10 = 0, F16, F20, F24, F30B, F_COUNT };
+static CkFont g_fonts[F_COUNT];
+static bool g_fonts_ok = false;
+
+static bool load_fonts(void) {
+    char path[512] = "";
+    const char *env = getenv("STUMP_COCKPIT_FONT");
+    if (env && env[0]) {
+        snprintf(path, sizeof(path), "%s", env);
+    } else {
+        ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 32);
+        if (n <= 0) return false;
+        path[n] = '\\0';
+        char *slash = strrchr(path, '/');
+        if (!slash) return false;
+        strcpy(slash + 1, "cockpit_font.bin");
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "[Stump-R36MAX] no %s: the 5x7 font\\n", path); return false; }
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *buf = (len > 16) ? malloc((size_t)len) : NULL;
+    if (!buf || fread(buf, 1, (size_t)len, f) != (size_t)len) { fclose(f); free(buf); return false; }
+    fclose(f);
+    if (memcmp(buf, "CKFONT1\\0", 8) != 0) { free(buf); return false; }
+    uint32_t nf;
+    memcpy(&nf, buf + 8, 4);
+    size_t pos = 12;
+    for (uint32_t i = 0; i < nf && i < F_COUNT; i++) {
+        if (pos + 20 > (size_t)len) { free(buf); return false; }
+        uint16_t px, adv64, line, bold; int16_t asc, desc; uint32_t ng, dlen;
+        memcpy(&px, buf + pos, 2); memcpy(&adv64, buf + pos + 2, 2);
+        memcpy(&asc, buf + pos + 4, 2); memcpy(&desc, buf + pos + 6, 2);
+        memcpy(&line, buf + pos + 8, 2); memcpy(&bold, buf + pos + 10, 2);
+        memcpy(&ng, buf + pos + 12, 4); memcpy(&dlen, buf + pos + 16, 4);
+        pos += 20;
+        if (pos + (size_t)ng * 16 + dlen > (size_t)len) { free(buf); return false; }
+        CkFont *ft = &g_fonts[i];
+        ft->px = px; ft->adv64 = adv64; ft->ascent = asc; ft->descent = desc;
+        ft->line = line; ft->bold = bold; ft->n = ng;
+        ft->g = calloc(ng, sizeof(CkGlyph));
+        if (!ft->g) { free(buf); return false; }
+        memset(ft->idx, 0xFF, sizeof(ft->idx));
+        for (uint32_t k = 0; k < ng; k++) {
+            const uint8_t *r = buf + pos + k * 16;
+            memcpy(&ft->g[k].cp, r, 4); memcpy(&ft->g[k].xo, r + 4, 2); memcpy(&ft->g[k].yo, r + 6, 2);
+            memcpy(&ft->g[k].w, r + 8, 2); memcpy(&ft->g[k].h, r + 10, 2); memcpy(&ft->g[k].off, r + 12, 4);
+            if (ft->g[k].cp < 256) ft->idx[ft->g[k].cp] = (int16_t)k;
+        }
+        pos += (size_t)ng * 16;
+        ft->data = buf + pos;            /* the buffer stays for the program's life */
+        pos += dlen;
+    }
+    g_fonts_ok = (nf >= F_COUNT);
+    fprintf(stderr, "[Stump-R36MAX] FireFly font loaded: %s\\n", path);
+    return g_fonts_ok;
+}
+
+/* The next codepoint of a UTF-8 string (advances *s); 0 at the end. A broken
+ * sequence (a field cut mid-character) gives U+FFFD and moves on. */
+static uint32_t utf8_next(const char **ps) {
+    const unsigned char *s = (const unsigned char *)*ps;
+    if (!*s) return 0;
+    uint32_t c = *s++;
+    int extra = 0;
+    if (c >= 0xF0) { c &= 0x07; extra = 3; }
+    else if (c >= 0xE0) { c &= 0x0F; extra = 2; }
+    else if (c >= 0xC0) { c &= 0x1F; extra = 1; }
+    else if (c >= 0x80) { *ps = (const char *)s; return 0xFFFD; }
+    for (int i = 0; i < extra; i++) {
+        if ((*s & 0xC0) != 0x80) { *ps = (const char *)s; return 0xFFFD; }
+        c = (c << 6) | (*s++ & 0x3F);
+    }
+    *ps = (const char *)s;
+    return c;
+}
+
+static const CkGlyph *font_glyph(const CkFont *f, uint32_t cp) {
+    if (cp < 256) {
+        int16_t k = f->idx[cp];
+        return (k >= 0) ? &f->g[k] : NULL;
+    }
+    for (uint32_t k = 0; k < f->n; k++) if (f->g[k].cp == cp) return &f->g[k];
+    return NULL;
+}
+
+static inline uint32_t blend_px(uint32_t bg, uint32_t fg, unsigned a) {
+    unsigned ia = 255 - a;
+    unsigned r = (((fg >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * ia) / 255;
+    unsigned g = (((fg >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * ia) / 255;
+    unsigned b = ((fg & 0xFF) * a + (bg & 0xFF) * ia) / 255;
+    return 0xFF000000u | (r << 16) | (g << 8) | b;
+}
+
+static void font_draw_glyph(uint32_t *fb, const CkFont *f, int x, int baseline, uint32_t cp, uint32_t color) {
+    const CkGlyph *g = font_glyph(f, cp);
+    if (!g) g = font_glyph(f, '?');
+    if (!g) return;
+    const uint8_t *src = f->data + g->off;
+    for (int r = 0; r < g->h; r++) {
+        int py = baseline + g->yo + r;
+        if (py < 0 || py >= PANEL_H) continue;
+        for (int c = 0; c < g->w; c++) {
+            int pxx = x + g->xo + c;
+            if (pxx < 0 || pxx >= PANEL_W) continue;
+            unsigned a = src[r * g->w + c];
+            if (!a) continue;
+            uint32_t *d = &fb[py * PANEL_W + pxx];
+            *d = (a == 255) ? color : blend_px(*d, color, a);
+        }
+    }
+}
+
+/* Text in font fid with its top at y_top; at most max_px wide (0: to the
+ * screen's edge). Returns the width drawn. */
+static int font_text(uint32_t *fb, int fid, int x, int y_top, const char *s, uint32_t color, int max_px) {
+    const CkFont *f = &g_fonts[fid];
+    int base = y_top + f->ascent;
+    int x0 = x, acc = 0, limit = max_px > 0 ? x + max_px : PANEL_W - 2;
+    uint32_t cp;
+    while ((cp = utf8_next(&s)) != 0) {
+        int nx = x0 + (acc + f->adv64) / 64;
+        if (nx > limit) break;
+        font_draw_glyph(fb, f, x0 + acc / 64, base, cp, color);
+        acc += f->adv64;
+    }
+    return acc / 64;
+}
+
+static int font_width(int fid, const char *s) {
+    if (!g_fonts_ok) return (int)strlen(s) * (fid == F30B ? 18 : fid == F10 ? 6 : 12);
+    int n = 0;
+    while (utf8_next(&s)) n++;
+    return n * g_fonts[fid].adv64 / 64;
+}
+
+/* The engine's text call: same cells as the 5x7 font (6 px per character
+ * per scale step: DejaVu Sans Mono at 10*scale px is 6.02*scale wide), the
+ * baseline where the 5x7 glyphs ended, max_chars counted in characters. */
+static void draw_text_s(uint32_t *fb, int x, int y, const char *s, uint32_t color, int scale, int max_chars) {
+    if (!g_fonts_ok) { draw_text_5x7(fb, x, y, s, color, scale, max_chars); return; }
+    int fid = scale >= 3 ? F30B : (scale == 1 ? F10 : F20);
+    const CkFont *f = &g_fonts[fid];
+    int base = y + 7 * scale, count = 0, acc = 0;
+    uint32_t cp;
+    while ((cp = utf8_next(&s)) != 0 && (max_chars <= 0 || count < max_chars)) {
+        if (x + (acc + f->adv64) / 64 > PANEL_W - 4) break;
+        font_draw_glyph(fb, f, x + acc / 64, base, cp, color);
+        acc += f->adv64;
         count++;
     }
 }
@@ -672,7 +832,7 @@ typedef struct {
     int             osk_row;
     int             osk_col;
     bool            shift_held;
-    char            input_buf[96];
+    char            input_buf[300];
     int             input_len;
     TransportStatus net;
     ChatLine        rooms[3][MAX_LOG_LINES];
@@ -711,16 +871,7 @@ static void handle_sig(int sig) {
 }
 
 static const char *ROOM_SLUGS[3] = { "main", "lora-mesh", "wifi-mesh" };
-static const char *ROOM_NAMES[3] = { "#MAIN", "#LORA-MESH", "#WIFI-MESH" };
 
-static const char *QUICK_CMDS[6] = {
-    "1. /WHOAMI + /NAMES",
-    "2. /AUTH CHALLENGE+SIGN",
-    "3. !FIND JARDINAGE",
-    "4. !ROLL 2D6 TAVERN",
-    "5. ANNOUNCE ON MESH",
-    "6. SEND HELLO TO ROOM"
-};
 
 /* 4x10 On-Screen Keyboard (OSK) Grid (Y to open/close, A to type, B to cancel/close) */
 static const char *OSK_LABELS[4][10] = {
@@ -746,11 +897,6 @@ static const char *BOARD_PRESET_BODIES[5] = {
     "RT3070 20dBm AP + Reticulum LoRa relay active."
 };
 
-static const char *FILE_ACTION_LABELS[3] = {
-    "EXPORT LIVE MESH LOG (.TXT)",
-    "SHARE FIELD GUIDE (.MD)",
-    "IMPORT FROM DROP FOLDER"
-};
 
 static void trigger_chime(int freq, int ms) {
     g_st.chime_freq = freq;
@@ -802,9 +948,10 @@ static void input_append_char(char c) {
 }
 
 static void input_backspace(void) {
-    if (g_st.input_len > 0) {
-        g_st.input_buf[--g_st.input_len] = '\\0';
-    }
+    /* One character, not one byte: an accented letter is 2-3 bytes in UTF-8. */
+    while (g_st.input_len > 0 && (g_st.input_buf[g_st.input_len - 1] & 0xC0) == 0x80) g_st.input_len--;
+    if (g_st.input_len > 0) g_st.input_len--;
+    g_st.input_buf[g_st.input_len] = '\\0';
 }
 
 static void broadcast_udp_beacon(const char *type, const char *msg);
@@ -833,7 +980,7 @@ static void commit_chain_settings(const char *new_secret, int role_idx) {
     char cmd[220];
     snprintf(cmd, sizeof(cmd), "CHAIN_SET|%s|%s|", g_st.chain_secret, rmode);
     send_bridge_cmd(cmd);
-    set_ui_busy("IN PROCESS: APPLYING CHAIN SECRET & LINKING LAN...", 2600);
+    set_ui_busy("Chain secret…", 2600);
     trigger_chime(840, 65);
 }
 
@@ -862,7 +1009,7 @@ static void revert_staged_network_revision(void) {
 static void apply_staged_network_revision(void) {
     uint64_t now = monotonic_ms();
     if (now < g_st.radio_lock_until_ms) {
-        set_ui_busy("IN PROCESS: RADIO BUSY, WAIT A MOMENT...", 1600);
+        set_ui_busy("The radio is busy: a moment…", 1600);
         trigger_chime(340, 45);
         return;
     }
@@ -871,7 +1018,7 @@ static void apply_staged_network_revision(void) {
         g_st.ap_active = true;
         send_bridge_cmd("NET_APPLY|AP");
         g_st.suppress_poll_frames = 300;
-        set_ui_busy("IN PROCESS: TURNING THE HOTSPOT ON...", 5200);
+        set_ui_busy("Turning the hotspot on…", 5200);
         snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg),
                  "HOTSPOT ON: %.40s", g_st.ap_ssid[0] ? g_st.ap_ssid : "STUMP");
         trigger_chime(880, 85);
@@ -917,7 +1064,7 @@ static void action_wifi_tab_confirm(void) {
         g_st.net_staged_dirty = true;
         g_st.tab_idx = 4;
         g_st.rev_cursor = 3; /* Highlight [APPLY REVISION] row in Panel 5 */
-        set_ui_busy("STAGED IN PANEL 5: PRESS [A] TO APPLY OR [B] TO CANCEL", 2200);
+        set_ui_busy("Staged: apply it in SETUP (A), or B to cancel", 2200);
         trigger_chime(740, 55);
     } else if (g_st.wifi_cursor == 1) {
         /* Row 1: Utility Toggle Bar (0=Set Chain Secret OSK, 1=Scan LAN Chain, 2=Rescan Wi-Fi, 3=Wi-Fi Pass OSK) */
@@ -926,11 +1073,11 @@ static void action_wifi_tab_confirm(void) {
             open_chain_secret_osk();
         } else if (m == 1) {
             send_bridge_cmd("CHAIN_SCAN");
-            set_ui_busy("IN PROCESS: SCANNING LAN FOR STUMP CHAIN PEERS...", 3000);
+            set_ui_busy("Looking for Stumps on this network…", 3000);
             trigger_chime(880, 65);
         } else if (m == 2) {
             send_bridge_cmd("WIFI_SCAN");
-            set_ui_busy("IN PROCESS: SCANNING 2.4GHZ WIFI...", 4000);
+            set_ui_busy("Scanning Wi-Fi…", 4000);
             snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "SCANNING 2.4GHZ WIFI NETWORKS...");
             trigger_chime(700, 50);
         } else {
@@ -971,21 +1118,21 @@ static void send_typed_chat(void) {
     if (g_st.tab_idx == 3) {
         snprintf(g_st.net_staged_pass, sizeof(g_st.net_staged_pass), "%.63s", g_st.input_buf);
         g_st.osk_open = false;
-        set_ui_busy("WIFI PASSWORD SAVED TO STAGED REVISION", 1500);
+        set_ui_busy("Wi-Fi password staged", 1500);
         trigger_chime(740, 45);
         return;
     }
     if (g_st.input_len <= 0) return;
     int r = g_st.room_idx;
     const char *rslug = ROOM_SLUGS[r];
-    char cmd[256];
+    char cmd[400];
     snprintf(cmd, sizeof(cmd), "RRC|%s|%s", rslug, g_st.input_buf);
     send_bridge_cmd(cmd);
     broadcast_udp_beacon("CHAT", g_st.input_buf);
     push_chat_local(r, "r36max", g_st.input_buf, false);
     g_st.input_len = 0;
     g_st.input_buf[0] = '\\0';
-    set_ui_busy("IN PROCESS: SENDING MESSAGE TO MESH...", 1000);
+    set_ui_busy("Sending…", 1000);
     trigger_chime(840, 55);
 }
 
@@ -1011,7 +1158,17 @@ static void execute_osk_key(void) {
     }
 }
 
+static bool g_caps_lock = false;      /* a USB keyboard's Caps Lock (toggled in the key loop) */
+
 static char translate_linux_key(uint16_t code, bool shift) {
+    /* Letters: upper case with Shift or Caps Lock (not both), as a computer types. */
+    static const char letters[] = "qwertyuiopasdfghjklzxcvbnm";
+    static const uint16_t lcodes[] = { KEY_Q, KEY_W, KEY_E, KEY_R, KEY_T, KEY_Y, KEY_U, KEY_I, KEY_O, KEY_P,
+                                       KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L,
+                                       KEY_Z, KEY_X, KEY_C, KEY_V, KEY_B, KEY_N, KEY_M };
+    for (int i = 0; i < 26; i++) {
+        if (code == lcodes[i]) return (shift != g_caps_lock) ? (char)(letters[i] - 32) : letters[i];
+    }
     switch (code) {
         case KEY_1: return shift ? '!' : '1';
         case KEY_2: return shift ? '@' : '2';
@@ -1057,8 +1214,15 @@ static char translate_linux_key(uint16_t code, bool shift) {
         case KEY_COMMA: return shift ? '<' : ',';
         case KEY_SEMICOLON: return shift ? ':' : ';';
         case KEY_APOSTROPHE: return shift ? (char)34 : (char)39;
-        case KEY_LEFTBRACE: return '[';
-        case KEY_RIGHTBRACE: return ']';
+        case KEY_LEFTBRACE: return shift ? '{' : '[';
+        case KEY_RIGHTBRACE: return shift ? '}' : ']';
+        case KEY_BACKSLASH: return shift ? '|' : (char)92;
+        case KEY_GRAVE: return shift ? '~' : '\`';
+        case KEY_KP0: return '0'; case KEY_KP1: return '1'; case KEY_KP2: return '2';
+        case KEY_KP3: return '3'; case KEY_KP4: return '4'; case KEY_KP5: return '5';
+        case KEY_KP6: return '6'; case KEY_KP7: return '7'; case KEY_KP8: return '8';
+        case KEY_KP9: return '9'; case KEY_KPDOT: return '.'; case KEY_KPMINUS: return '-';
+        case KEY_KPPLUS: return '+'; case KEY_KPASTERISK: return '*'; case KEY_KPSLASH: return '/';
         default: return 0;
     }
 }
@@ -1389,7 +1553,7 @@ static void execute_rrc_deck_action(void) {
     const char *rslug = ROOM_SLUGS[r];
     int c = g_st.cmd_cursor;
     char cmd[256];
-    set_ui_busy("IN PROCESS: DISPATCHING MESH COMMAND...", 1200);
+    set_ui_busy("Sending the command…", 1200);
 
     if (c == 0) {
         snprintf(cmd, sizeof(cmd), "RRC|%s|/whoami", rslug);
@@ -1435,7 +1599,7 @@ static void action_board_add(void) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "BOARD_ADD|%s|%s", BOARD_PRESET_TITLES[p], BOARD_PRESET_BODIES[p]);
     send_bridge_cmd(cmd);
-    set_ui_busy("IN PROCESS: POSTING NOTICE TO BILLBOARD...", 1600);
+    set_ui_busy("Posting the notice…", 1600);
     g_st.board_preset_idx = (g_st.board_preset_idx + 1) % 5;
     trigger_chime(880, 65);
 }
@@ -1443,7 +1607,7 @@ static void action_board_add(void) {
 static void action_board_backup_checked_tf(void) {
     int chk = count_checked_boards();
     if (chk <= 0) {
-        set_ui_busy("CHECK [X] A NOTICE FIRST (PRESS [A] ON ITEM)!", 2200);
+        set_ui_busy("Check a notice first (A on it)", 2200);
         trigger_chime(320, 70);
         return;
     }
@@ -1458,7 +1622,7 @@ static void action_board_backup_checked_tf(void) {
     char cmd[300];
     snprintf(cmd, sizeof(cmd), "BOARD_BACKUP_TF|%s", ids);
     send_bridge_cmd(cmd);
-    set_ui_busy("IN PROCESS: BACKING UP CHECKED NOTICES TO TF CARD...", 2600);
+    set_ui_busy("Backing up the checked notices to the TF card…", 2600);
     trigger_chime(860, 75);
 }
 
@@ -1475,7 +1639,7 @@ static void action_board_delete_checked(void) {
     char cmd[300];
     snprintf(cmd, sizeof(cmd), "BOARD_DEL_MULTI|%s", ids);
     send_bridge_cmd(cmd);
-    set_ui_busy("IN PROCESS: ERASING CHECKED NOTICES...", 2000);
+    set_ui_busy("Deleting the checked notices…", 2000);
     trigger_chime(440, 70);
 }
 
@@ -1484,7 +1648,7 @@ static void action_file_add(void) {
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "FILE_ADD|%d", m);
     send_bridge_cmd(cmd);
-    set_ui_busy("IN PROCESS: SHARING THE NEXT FILE FROM drop/...", 1800);
+    set_ui_busy("Sharing the next file from drop/…", 1800);
     g_st.file_action_idx = (g_st.file_action_idx + 1) % 3;
     trigger_chime(880, 65);
 }
@@ -1492,7 +1656,7 @@ static void action_file_add(void) {
 static void action_file_backup_checked_tf(void) {
     int chk = count_checked_files();
     if (chk <= 0) {
-        set_ui_busy("CHECK [X] A FILE FIRST (PRESS [A] ON ITEM)!", 2200);
+        set_ui_busy("Check a file first (A on it)", 2200);
         trigger_chime(320, 70);
         return;
     }
@@ -1507,7 +1671,7 @@ static void action_file_backup_checked_tf(void) {
     char cmd[360];
     snprintf(cmd, sizeof(cmd), "FILE_BACKUP_TF|%s", names);
     send_bridge_cmd(cmd);
-    set_ui_busy("IN PROCESS: BACKING UP CHECKED FILES TO TF CARD...", 2600);
+    set_ui_busy("Backing up the checked files to the TF card…", 2600);
     trigger_chime(860, 75);
 }
 
@@ -1524,7 +1688,7 @@ static void action_file_delete_checked(void) {
     char cmd[360];
     snprintf(cmd, sizeof(cmd), "FILE_DEL_MULTI|%s", names);
     send_bridge_cmd(cmd);
-    set_ui_busy("IN PROCESS: ERASING CHECKED FILES...", 2000);
+    set_ui_busy("Deleting the checked files…", 2000);
     trigger_chime(440, 70);
 }
 
@@ -1532,7 +1696,7 @@ static void open_delete_confirm(int type) {
     if (type == 1) {
         int chk = count_checked_boards();
         if (chk <= 0) {
-            set_ui_busy("CHECK [X] A NOTICE FIRST BEFORE DELETING!", 2200);
+            set_ui_busy("Check a notice first, then delete", 2200);
             trigger_chime(320, 70);
             return;
         }
@@ -1544,7 +1708,7 @@ static void open_delete_confirm(int type) {
     } else if (type == 2) {
         int chk = count_checked_files();
         if (chk <= 0) {
-            set_ui_busy("CHECK [X] A FILE FIRST BEFORE DELETING!", 2200);
+            set_ui_busy("Check a file first, then delete", 2200);
             trigger_chime(320, 70);
             return;
         }
@@ -1559,17 +1723,17 @@ static void open_delete_confirm(int type) {
 static void execute_debug_tab_action(void) {
     if (g_st.debug_bar_mode == 0) {
         send_bridge_cmd("CHAIN_SCAN");
-        set_ui_busy("IN PROCESS: SCANNING LAN FOR STUMP CHAIN PEERS...", 3000);
+        set_ui_busy("Looking for Stumps on this network…", 3000);
         trigger_chime(880, 75);
     } else if (g_st.debug_bar_mode == 1) {
         open_chain_secret_osk();
     } else if (g_st.debug_bar_mode == 2) {
         send_bridge_cmd("DEBUG_EXPORT_TF");
-        set_ui_busy("IN PROCESS: EXPORTING LOGS & DIAG TO TF CARD...", 3000);
+        set_ui_busy("Saving diagnostics to the TF card…", 3000);
         trigger_chime(880, 75);
     } else {
         send_bridge_cmd("DEBUG_HEAL_NET");
-        set_ui_busy("IN PROCESS: HEALING HTTP :80/:8080 & CHAIN...", 3000);
+        set_ui_busy("Restarting the Stump…", 3000);
         trigger_chime(784, 70);
     }
 }
@@ -1593,6 +1757,277 @@ static void update_qr_if_needed(void) {
 }
 
 
+/* ==== FireFly's keyboard: firefly/ui/widgets.py Compose, for the cockpit ====
+ * Full screen while open, and it takes every button first (as FireFly's
+ * pushed screen does): A key, B delete, X space, Y shift, L/R page, START
+ * send/OK, SELECT cancel, the D-pad to move; a USB keyboard types too. Real
+ * lower and upper case, symbols and accents: what you type is what is sent
+ * (a Wi-Fi password keeps its exact case). Done, it hands the text to
+ * send_typed_chat(), which knows the purpose (chat, Wi-Fi password, chain). */
+static const char *CMP_PAGES[3][4] = {
+    { "1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm,.?" },
+    { "!@#$%&*()-", "_=+/\\\\:;\\"<>", "[]{}~\`|^€£", "°±×÷…«»¿¡·" },
+    { "àâäçéèêëîï", "ôöùûüÿœæñß",
+      "ÀÂÇÉÈÊÎÔÙÛ", "✓✗→←↑↓♥☺★—" },
+};
+static const char *CMP_PAGE_NAMES[3] = { "ABC", "SYM", "ÀÉ" };
+static const char *CMP_SPECIALS[4] = { "⇧", "PAGE", "SPACE", "⌫" };
+static struct { int page, row, col; bool shift, was_open; } g_cmp;
+
+static int utf8_count(const char *s) { int n = 0; while (utf8_next(&s)) n++; return n; }
+
+static uint32_t utf8_at(const char *s, int i) {
+    uint32_t c = 0;
+    for (int k = 0; k <= i; k++) { c = utf8_next(&s); if (!c) return 0; }
+    return c;
+}
+
+static int utf8_put(char *o, uint32_t c) {
+    if (c < 0x80) { o[0] = (char)c; return 1; }
+    if (c < 0x800) { o[0] = (char)(0xC0 | (c >> 6)); o[1] = (char)(0x80 | (c & 0x3F)); return 2; }
+    if (c < 0x10000) { o[0] = (char)(0xE0 | (c >> 12)); o[1] = (char)(0x80 | ((c >> 6) & 0x3F));
+                       o[2] = (char)(0x80 | (c & 0x3F)); return 3; }
+    o[0] = (char)(0xF0 | (c >> 18)); o[1] = (char)(0x80 | ((c >> 12) & 0x3F));
+    o[2] = (char)(0x80 | ((c >> 6) & 0x3F)); o[3] = (char)(0x80 | (c & 0x3F)); return 4;
+}
+
+static uint32_t cp_upper(uint32_t c) {
+    if (c >= 'a' && c <= 'z') return c - 32;
+    if (c >= 0xE0 && c <= 0xFE && c != 0xF7) return c - 32;     /* à..þ -> À..Þ (not ÷) */
+    if (c == 0x153) return 0x152;                                 /* œ -> Œ */
+    if (c == 0xFF) return 0x178;                                  /* ÿ -> Ÿ */
+    return c;
+}
+
+static bool cmp_is_chat(void) { return g_st.tab_idx != 3 && g_st.tab_idx != 4 && g_st.osk_target != 1; }
+static const char *cmp_send_label(void) { return cmp_is_chat() ? "SEND" : "OK"; }
+static int cmp_max_bytes(void) {
+    if (g_st.osk_target == 1 || g_st.tab_idx == 4) return 50;    /* chain secret */
+    if (g_st.tab_idx == 3) return 63;                             /* WPA passphrase: 8..63 */
+    return 295;                                                   /* one LoRa packet's text */
+}
+static int cmp_row_len(int r) { return r < 4 ? utf8_count(CMP_PAGES[g_cmp.page][r]) : 5; }
+
+static void cmp_reset(void) {
+    g_cmp.page = 0; g_cmp.row = 1; g_cmp.col = 0; g_cmp.shift = false;
+}
+
+static void cmp_type_cp(uint32_t c) {
+    char b[5];
+    int n = utf8_put(b, c);
+    if (g_st.input_len + n > cmp_max_bytes() || g_st.input_len + n >= (int)sizeof(g_st.input_buf)) {
+        trigger_chime(300, 40);
+        return;
+    }
+    memcpy(g_st.input_buf + g_st.input_len, b, (size_t)n);
+    g_st.input_len += n;
+    g_st.input_buf[g_st.input_len] = '\\0';
+    trigger_chime(600, 15);
+}
+
+static void cmp_close(bool keep) {
+    g_st.osk_open = false;
+    g_st.osk_target = 0;
+    if (!keep) { g_st.input_len = 0; g_st.input_buf[0] = '\\0'; }
+}
+
+static void cmp_finish(void) {
+    if (g_st.input_len <= 0 && cmp_is_chat()) { cmp_close(false); return; }
+    send_typed_chat();                 /* chat line, Wi-Fi password or chain secret, by purpose */
+    cmp_close(false);
+}
+
+static void cmp_move(int dx, int dy) {
+    g_cmp.row = (g_cmp.row + dy + 5) % 5;
+    int n = cmp_row_len(g_cmp.row);
+    g_cmp.col = ((g_cmp.col + dx) % n + n) % n;
+    trigger_chime(520, 10);
+}
+
+static void cmp_page(int d) {
+    g_cmp.page = (g_cmp.page + d + 3) % 3;
+    g_cmp.col %= cmp_row_len(g_cmp.row);
+    trigger_chime(660, 20);
+}
+
+static void cmp_press(void) {
+    if (g_cmp.row < 4) {
+        uint32_t c = utf8_at(CMP_PAGES[g_cmp.page][g_cmp.row], g_cmp.col);
+        if (!c) return;
+        if (g_cmp.shift) c = cp_upper(c);
+        cmp_type_cp(c);
+        g_cmp.shift = false;
+    } else if (g_cmp.col == 0) {
+        g_cmp.shift = !g_cmp.shift; trigger_chime(740, 20);
+    } else if (g_cmp.col == 1) {
+        cmp_page(1);
+    } else if (g_cmp.col == 2) {
+        cmp_type_cp(' ');
+    } else if (g_cmp.col == 3) {
+        input_backspace(); trigger_chime(420, 15);
+    } else {
+        cmp_finish();
+    }
+}
+
+/* Every key while the keyboard is open (value 1 press, 2 repeat). */
+static void cmp_key(uint16_t code, int value, bool shift_held) {
+    bool press = (value == 1), rep = (value == 2);
+    if (!press && !rep) return;
+    if (code == BTN_DPAD_UP || code == 544 || code == KEY_UP) cmp_move(0, -1);
+    else if (code == BTN_DPAD_DOWN || code == 545 || code == KEY_DOWN) cmp_move(0, 1);
+    else if (code == BTN_DPAD_LEFT || code == 546 || code == KEY_LEFT) cmp_move(-1, 0);
+    else if (code == BTN_DPAD_RIGHT || code == 547 || code == KEY_RIGHT) cmp_move(1, 0);
+    else if (code == R36_BTN_B_CANCEL || code == KEY_BACKSPACE) { input_backspace(); trigger_chime(420, 15); }
+    else if (!press) return;                                     /* the rest: one press, one action */
+    else if (code == R36_BTN_A_ACCEPT) cmp_press();
+    else if (code == 307) cmp_type_cp(' ');                      /* X: space */
+    else if (code == 308) { g_cmp.shift = !g_cmp.shift; trigger_chime(740, 20); }   /* Y: shift */
+    else if (code == BTN_TL || code == 310) cmp_page(-1);
+    else if (code == BTN_TR || code == 311) cmp_page(1);
+    else if (code == BTN_START || code == 315 || code == 705 || code == 707 ||
+             code == KEY_ENTER || code == KEY_KPENTER) cmp_finish();
+    else if (code == BTN_SELECT || code == BTN_MODE || code == 314 || code == 704 || code == 706 ||
+             code == KEY_ESC) { cmp_close(false); trigger_chime(480, 30); }
+    else if (code < 256) {
+        char ch = translate_linux_key(code, shift_held);
+        if (ch) cmp_type_cp((unsigned char)ch);
+    }
+}
+
+/* Rounded boxes, as FireFly's draw.box (pygame border_radius). */
+static void fill_rrect(uint32_t *fb, int x, int y, int w, int h, int r, uint32_t color) {
+    if (r * 2 > h) r = h / 2;
+    if (r * 2 > w) r = w / 2;
+    for (int i = 0; i < h; i++) {
+        int inset = 0;
+        int dy = (i < r) ? (r - i) : (i >= h - r ? (i - (h - r) + 1) : 0);
+        if (dy > 0) {
+            int k = 0;
+            while (k < r && (r - k) * (r - k) + dy * dy > r * r) k++;
+            inset = k;
+        }
+        fill_rect(fb, x + inset, y + i, w - 2 * inset, 1, color);
+    }
+}
+
+static void stroke_rrect(uint32_t *fb, int x, int y, int w, int h, int r, uint32_t color, uint32_t inner) {
+    fill_rrect(fb, x, y, w, h, r, color);
+    fill_rrect(fb, x + 1, y + 1, w - 2, h - 2, r > 1 ? r - 1 : 0, inner);
+}
+
+static int ctext(uint32_t *fb, int fid, int x, int y, const char *s, uint32_t color, int max_px) {
+    if (g_fonts_ok) return font_text(fb, fid, x, y, s, color, max_px);
+    draw_text_s(fb, x, y + 4, s, color, fid == F30B ? 3 : 2, max_px > 0 ? max_px / (fid == F30B ? 18 : 12) : 0);
+    return font_width(fid, s);
+}
+
+static int cline(int fid) { return g_fonts_ok ? g_fonts[fid].line : (fid == F30B ? 24 : 18); }
+
+/* FireFly's hint bar: keycaps on the sidebar colour, labels muted. */
+static void draw_hint_bar(uint32_t *fb, const ThemeColors *th, const char *const *keys, const char *const *labels, int n) {
+    int line = cline(F16);
+    int y = PANEL_H - line - 10;
+    fill_rect(fb, 0, y - 6, PANEL_W, PANEL_H - y + 6, th->panel2);
+    int x = 10;
+    for (int i = 0; i < n; i++) {
+        int kw = font_width(F16, keys[i]) + 10;
+        if (x + kw > PANEL_W - 20) break;
+        fill_rrect(fb, x, y, kw, line - 2, 4, th->border);
+        ctext(fb, F16, x + 5, y - 1, keys[i], th->text, 0);
+        x += kw + 5;
+        x += ctext(fb, F16, x, y - 1, labels[i], th->muted, PANEL_W - x - 8) + 13;
+    }
+}
+
+static void compose_draw(uint32_t *fb, const ThemeColors *th) {
+    const int W = PANEL_W, H = PANEL_H;
+    fill_rect(fb, 0, 0, W, H, th->bg);
+    int line = cline(F24);
+    char title[96];
+    if (g_st.osk_target == 1 || g_st.tab_idx == 4) snprintf(title, sizeof(title), "Chain secret");
+    else if (g_st.tab_idx == 3) snprintf(title, sizeof(title), "Wi-Fi password%s%.40s",
+                                         g_st.net_staged_ssid[0] ? ": " : "", g_st.net_staged_ssid);
+    else {
+        const char *rooms[3] = { "#main", "#lora-mesh", "#wifi-mesh" };
+        snprintf(title, sizeof(title), "To %s", rooms[g_st.room_idx % 3]);
+    }
+    ctext(fb, F30B, 14, 8, title, th->ember, W - 28);
+
+    /* The text, wrapped, the end of it shown, a cursor after it. */
+    int ax = 10, ay = 14 + line, aw = W - 20, ah = H * 2 / 5 - line;
+    stroke_rrect(fb, ax, ay, aw, ah, 8, th->border, th->panel);
+    char buf[sizeof(g_st.input_buf) + 8];
+    snprintf(buf, sizeof(buf), "%s▏", g_st.input_buf);
+    int per = g_fonts_ok ? (aw - 20) * 64 / g_fonts[F24].adv64 : (aw - 20) / 12;
+    if (per < 4) per = 4;
+    const char *starts[64];
+    int nl = 0;
+    const char *p = buf;
+    while (*p && nl < 64) {
+        starts[nl++] = p;
+        const char *q = p, *brk = NULL, *after = NULL;
+        int n = 0;
+        while (*q && n < per) {
+            const char *prev = q;
+            uint32_t c = utf8_next(&q);
+            if (c == ' ') { brk = prev; after = q; }
+            n++;
+        }
+        if (!*q) break;
+        p = (brk && brk > starts[nl - 1]) ? after : q;
+    }
+    int maxl = (ah - 12) / line;
+    int first = nl > maxl ? nl - maxl : 0;
+    for (int i = first; i < nl; i++) {
+        char tmp[sizeof(buf)];
+        size_t len = (i + 1 < nl) ? (size_t)(starts[i + 1] - starts[i]) : strlen(starts[i]);
+        if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+        memcpy(tmp, starts[i], len);
+        tmp[len] = '\\0';
+        ctext(fb, F24, ax + 10, ay + 6 + (i - first) * line, tmp, th->text, aw - 20);
+    }
+
+    char pg[32];
+    snprintf(pg, sizeof(pg), "%s%s", CMP_PAGE_NAMES[g_cmp.page], g_cmp.shift ? "  ⇧" : "");
+    ctext(fb, F16, 14, ay + ah + 4, pg, th->muted, 0);
+    char meter[64];
+    if (cmp_is_chat())
+        snprintf(meter, sizeof(meter), "%d/295 B · 1 LoRa packet", g_st.input_len);
+    else
+        snprintf(meter, sizeof(meter), "%d/%d bytes", g_st.input_len, cmp_max_bytes());
+    ctext(fb, F16, ax + aw - 8 - font_width(F16, meter), ay + ah + 4, meter, th->muted, 0);
+
+    /* The keys. */
+    int kb_top = ay + ah + line + 8;
+    int kb_h = H - kb_top - line - 16;
+    int rh = kb_h / 5;
+    for (int r = 0; r < 5; r++) {
+        int n = cmp_row_len(r);
+        for (int c = 0; c < n; c++) {
+            char label[16];
+            if (r < 4) {
+                uint32_t cp = utf8_at(CMP_PAGES[g_cmp.page][r], c);
+                if (g_cmp.shift) cp = cp_upper(cp);
+                label[utf8_put(label, cp)] = '\\0';
+            } else {
+                snprintf(label, sizeof(label), "%s", c < 4 ? CMP_SPECIALS[c] : cmp_send_label());
+            }
+            int kx = 10 + c * (W - 20) / n + 2, kw = (W - 20) / n - 4;
+            int ky = kb_top + r * rh + 2, kh = rh - 4;
+            bool sel = (r == g_cmp.row && c == g_cmp.col);
+            if (sel) fill_rrect(fb, kx, ky, kw, kh, 6, th->ember);
+            else stroke_rrect(fb, kx, ky, kw, kh, 6, th->border, th->panel);
+            int fid = (utf8_count(label) == 1) ? F24 : F16;
+            int lw = font_width(fid, label);
+            ctext(fb, fid, kx + (kw - lw) / 2, ky + (kh - cline(fid)) / 2, label, sel ? th->bg : th->text, 0);
+        }
+    }
+    static const char *const hk[7] = { "A", "B", "X", "Y", "L/R", "START", "SEL" };
+    const char *hl[7] = { "key", "del", "space", "shift", "page", cmp_is_chat() ? "send" : "ok", "cancel" };
+    draw_hint_bar(fb, th, hk, hl, 7);
+}
+
 int main(int argc, char **argv) {
     umask(0);
     signal(SIGTERM, handle_sig);
@@ -1602,6 +2037,7 @@ int main(int argc, char **argv) {
     g_st.running = true;
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    load_fonts();
     snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.0.0-r36max");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
@@ -1737,6 +2173,23 @@ int main(int argc, char **argv) {
         if (fn_PumpEvents && tex) fn_PumpEvents();
 
         if (g_st.suppress_poll_frames > 0) g_st.suppress_poll_frames--;
+        if (g_st.osk_open && !g_cmp.was_open) cmp_reset();
+        g_cmp.was_open = g_st.osk_open;
+        if (getenv("STUMP_COCKPIT_TAB") && frames == 0) g_st.tab_idx = atoi(getenv("STUMP_COCKPIT_TAB")) % 5;
+        if (getenv("STUMP_COCKPIT_CONFIRM") && frames == 0) {          /* screenshots in tests */
+            g_st.confirm_open = true;
+            g_st.confirm_type = atoi(getenv("STUMP_COCKPIT_CONFIRM"));
+            g_st.confirm_choice = 1;
+            snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "%s", g_st.confirm_type == 3
+                     ? "Wi-Fi network: LaBuche_Cabin" : "2 notices: March\\u00e9 samedi, Potluck Sunday");
+        }
+        if (getenv("STUMP_COCKPIT_OSK") && frames == 0) {     /* screenshots in tests: open it at start */
+            g_st.osk_open = true; cmp_reset(); g_cmp.was_open = true;
+            g_cmp.page = atoi(getenv("STUMP_COCKPIT_OSK")) % 3;
+            g_cmp.shift = getenv("STUMP_COCKPIT_SHIFT") != NULL;
+            const char *t = getenv("STUMP_COCKPIT_TEXT");
+            if (t) { snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%s", t); g_st.input_len = (int)strlen(g_st.input_buf); }
+        }
 
         /* The room on screen: the feed joins it (the Stump keeps one current room per client). */
         if (g_st.room_idx != last_room_view || frames % 300 == 0) {
@@ -1781,6 +2234,10 @@ int main(int argc, char **argv) {
                         g_st.shift_held = (ev.value != 0);
                         continue;
                     }
+                    if (ev.code == KEY_CAPSLOCK) {
+                        if (ev.value == 1) g_caps_lock = !g_caps_lock;
+                        continue;
+                    }
 
                     /* Hardware Debounce for Handheld Action Buttons (220ms) and D-Pad Keys (130ms) */
                     if (pressed && ev.code >= 256) {
@@ -1794,10 +2251,27 @@ int main(int argc, char **argv) {
                                    ev.code == 307 || ev.code == 308 ||
                                    ev.code == BTN_TL || ev.code == BTN_TR ||
                                    ev.code == 310 || ev.code == 311) {
-                            if (now_ms - g_st.last_btn_ms < 220) continue;
+                            /* 220 ms against contact bounce; 90 while typing, so the keyboard keeps up */
+                            if (now_ms - g_st.last_btn_ms < (g_st.osk_open ? 90u : 220u)) continue;
                             g_st.last_btn_ms = now_ms;
                         }
                         g_st.last_ev_code = (int)ev.code;
+                    }
+
+                    /* A USB keyboard typing on the chat tab: FireFly's keyboard opens, so you see
+                     * what you type, big (OTG port, or a hub on it). */
+                    if (!g_st.osk_open && !g_st.confirm_open && g_st.tab_idx == 0 && ev.code < 256 && ev.value == 1 &&
+                        ev.code != KEY_ENTER && ev.code != KEY_KPENTER && ev.code != KEY_ESC && ev.code != KEY_TAB &&
+                        translate_linux_key(ev.code, g_st.shift_held) != 0) {
+                        g_st.osk_open = true;
+                        g_st.osk_target = 0;
+                        cmp_reset();
+                        g_cmp.was_open = true;
+                    }
+                    /* FireFly's keyboard, while open, takes every key first. */
+                    if (g_st.osk_open) {
+                        cmp_key(ev.code, ev.value, g_st.shift_held);
+                        continue;
                     }
 
                     /* If Confirmation Modal is open: [A] (305) = Accept, [B] (304) = Cancel */
@@ -1815,7 +2289,7 @@ int main(int argc, char **argv) {
                         } else if (ev.code == R36_BTN_B_CANCEL || ev.code == 307 || ev.code == 308 || ev.code == KEY_ESC) {
                             /* Physical B (304), X (307), Y (308), or ESC ALWAYS CANCELS safely! */
                             g_st.confirm_open = false;
-                            set_ui_busy("CANCELLED (NO CHANGES MADE)", 1000);
+                            set_ui_busy("Cancelled: nothing changed", 1000);
                             trigger_chime(480, 35);
                             continue;
                         } else if (ev.code == R36_BTN_A_ACCEPT || ev.code == KEY_ENTER || ev.code == KEY_KPENTER) {
@@ -1825,7 +2299,7 @@ int main(int argc, char **argv) {
                                 else if (g_st.confirm_type == 2) action_file_delete_checked();
                                 else if (g_st.confirm_type == 3) apply_staged_network_revision();
                             } else {
-                                set_ui_busy("CANCELLED (NO CHANGES MADE)", 1000);
+                                set_ui_busy("Cancelled: nothing changed", 1000);
                                 trigger_chime(480, 35);
                             }
                             g_st.confirm_open = false;
@@ -1962,7 +2436,7 @@ int main(int argc, char **argv) {
                                     if (g_st.input_len > 0) {
                                         g_st.input_len = 0;
                                         g_st.input_buf[0] = '\\0';
-                                        set_ui_busy("CANCELLED DRAFT MESSAGE", 900);
+                                        set_ui_busy("Draft cleared", 900);
                                     } else {
                                         g_st.cmd_cursor = 0;
                                     }
@@ -2013,7 +2487,7 @@ int main(int argc, char **argv) {
                                     g_st.board_cursor = 0;
                                 } else {
                                     for (int i = 0; i < g_st.board_count; i++) g_st.board[i].checked = false;
-                                    set_ui_busy("CLEARED CHECKED [X] SELECTION", 900);
+                                    set_ui_busy("Checks cleared", 900);
                                 }
                                 trigger_chime(460, 30);
                             } else if (ev.code == 308) {
@@ -2062,7 +2536,7 @@ int main(int argc, char **argv) {
                                     g_st.file_cursor = 0;
                                 } else {
                                     for (int i = 0; i < g_st.file_count; i++) g_st.files[i].checked = false;
-                                    set_ui_busy("CLEARED CHECKED [X] SELECTION", 900);
+                                    set_ui_busy("Checks cleared", 900);
                                 }
                                 trigger_chime(460, 30);
                             } else if (ev.code == 308) {
@@ -2128,7 +2602,7 @@ int main(int argc, char **argv) {
                                 } else if (ev.code == R36_BTN_B_CANCEL) {
                                     revert_staged_network_revision();
                                     g_st.wifi_cursor = 0;
-                                    set_ui_busy("CANCELLED STAGED WIFI CHANGES (LIVE UNCHANGED)", 1400);
+                                    set_ui_busy("Staged Wi-Fi change cancelled", 1400);
                                     trigger_chime(460, 35);
                                 } else if (ev.code == 307) {
                                     g_st.qr_mode = (g_st.qr_mode + 1) % 2;
@@ -2149,7 +2623,7 @@ int main(int argc, char **argv) {
                                     g_st.osk_target = 0;
                                     g_st.input_len = 0;
                                     g_st.input_buf[0] = '\\0';
-                                    set_ui_busy("CANCELLED CHAIN SECRET EDIT", 1000);
+                                    set_ui_busy("Chain secret: cancelled", 1000);
                                     trigger_chime(480, 35);
                                 } else if (ev.code == 307) { input_backspace(); trigger_chime(420, 25); }
                             } else if (ev.code == BTN_DPAD_UP || ev.code == 544) {
@@ -2223,7 +2697,7 @@ int main(int argc, char **argv) {
                             } else if (ev.code == R36_BTN_B_CANCEL) {
                                 revert_staged_network_revision();
                                 g_st.rev_cursor = 0;
-                                set_ui_busy("REVERTED STAGED NETWORK REVISION TO LIVE STATE", 1500);
+                                set_ui_busy("Staged change reverted", 1500);
                                 trigger_chime(460, 35);
                             } else if (ev.code == 308) {
                                 open_chain_secret_osk();
@@ -2239,6 +2713,11 @@ int main(int argc, char **argv) {
                     g_st.last_dpad_ms = now_ms;
                     g_st.last_ev_code = (int)ev.code;
 
+                    if (g_st.osk_open) {
+                        if (ev.code == ABS_HAT0X) cmp_move(ev.value < 0 ? -1 : 1, 0);
+                        if (ev.code == ABS_HAT0Y) cmp_move(0, ev.value < 0 ? -1 : 1);
+                        continue;
+                    }
                     if (g_st.confirm_open) {
                         if (ev.code == ABS_HAT0X && ev.value < 0) { g_st.confirm_choice = 0; trigger_chime(520, 20); }
                         if (ev.code == ABS_HAT0X && ev.value > 0) { g_st.confirm_choice = 1; trigger_chime(520, 20); }
@@ -2351,593 +2830,355 @@ int main(int argc, char **argv) {
         const ThemeColors *th = &g_themes[g_st.theme_idx];
         fill_rect(fb, 0, 0, PANEL_W, PANEL_H, th->bg);
 
-        /* ---- FireFly_RK3326_R36MAX_R36S Header Bar (firefly/ui/app.py + theme.py) ---- */
-        fill_rect(fb, 0, 0, PANEL_W, 82, th->panel2);
-        fill_rect(fb, 0, 80, PANEL_W, 2, th->border);
-        draw_text_s(fb, 14, 10, "FIREFLY * STUMP", th->ember, 3, 16);
-        draw_text_s(fb, 306, 14, g_st.ver_str, th->muted, 2, 14);
-
+        /* ---- FireFly's header (firefly/ui/app.py draw_header): the title, the tab
+         * pills in the same band (only the current one boxed), the link dot. ---- */
         const char *disp_ip = (g_st.bridge_lan_ip[0] && strcmp(g_st.bridge_lan_ip, "127.0.0.1") != 0)
                                ? g_st.bridge_lan_ip : g_st.net.primary_ip;
+        bool stump_up = (g_st.http80_ok || g_st.http8080_ok) && strncmp(g_st.node_lxmf, "WAITING", 7) != 0
+                        && strncmp(g_st.node_lxmf, "STUMP OFFLINE", 13) != 0;
+        {
+            int hl = cline(F24);
+            fill_rect(fb, 0, 0, PANEL_W, hl + 14, th->panel2);
+            ctext(fb, F30B, 12, 4, "Stump", th->ember, 0);
+            int tx = 12 + font_width(F30B, "Stump  ");
+            const char *tabs[5] = { "CHATS", "BOARD", "FILES", "NETWORK", g_st.net_staged_dirty ? "SETUP*" : "SETUP" };
+            for (int t = 0; t < 5; t++) {
+                int w = font_width(F24, tabs[t]) + 14;
+                bool act = (t == g_st.tab_idx);
+                bool dirty = (t == 4 && g_st.net_staged_dirty);
+                if (act) fill_rrect(fb, tx, 6, w, hl + 2, 4, th->ember);
+                ctext(fb, F24, tx + 7, 7, tabs[t], act ? th->bg : (dirty ? th->ok : th->muted), 0);
+                tx += w + 3;
+            }
+            const char *link = stump_up ? "● link" : "○ no link";
+            ctext(fb, F16, PANEL_W - 10 - font_width(F16, link), 12, link, stump_up ? th->ok : th->warn, 0);
 
-        /* Right-aligned FireFly link indicator ("* AP <ip>" or "* LAN <ip>") */
-        fill_rect(fb, 486, 8, 222, 26, th->panel);
-        draw_border(fb, 486, 8, 222, 26, 1, g_st.ap_active ? th->ok : th->ember);
-        char link_pill[40];
-        snprintf(link_pill, sizeof(link_pill), "* %s %s",
-                 g_st.ap_active ? "AP" : "LAN", disp_ip);
-        draw_text_s(fb, 496, 14, link_pill, g_st.ap_active ? th->ok : th->ember_bright, 2, 17);
-
-        char line2[160];
-        snprintf(line2, sizeof(line2), "STUMP WEB: HTTP://%s%s/  %s  STUMPS:%d",
-                 disp_ip, (!g_st.http80_ok && g_st.http8080_ok) ? ":8080" : "",
-                 (g_st.http80_ok || g_st.http8080_ok) ? "UP" : "WAITING", g_st.mesh_peers);
-        draw_text_s(fb, 14, 40, line2, th->text, 2, 56);
-
-        char line3[160];
-        if (g_st.ap_active) {
-            snprintf(line3, sizeof(line3), "HOTSPOT:%s (%s on %s) CLIENTS:%d  TF-BAK:%d",
-                     g_st.ap_ssid, g_st.bridge_lan_ip, g_st.ap_if, g_st.ap_clients, g_st.tf_backup_count);
-            draw_text_s(fb, 14, 60, line3, th->ok, 2, 56);
-        } else {
-            snprintf(line3, sizeof(line3), "RT3070 LAN:%s (%s)  RNODE:%s  TF-BAK:%d",
-                     g_st.net.wifi_if[0] ? g_st.net.wifi_if : "wlan0", disp_ip,
-                     g_st.net.lora_online ? g_st.net.lora_dev : g_st.rnode_status,
-                     g_st.tf_backup_count);
-            draw_text_s(fb, 14, 60, line3, th->ok, 2, 56);
+            /* Under it, quieter: where the Stump is, and its radio and Wi-Fi. */
+            char l1[200], l2[200];
+            snprintf(l1, sizeof(l1), "%s  http://%s%s/  ·  %d other Stump%s",
+                     g_st.ver_str, disp_ip, (!g_st.http80_ok && g_st.http8080_ok) ? ":8080" : "",
+                     g_st.mesh_peers, g_st.mesh_peers == 1 ? "" : "s");
+            ctext(fb, F20, 14, hl + 22, l1, stump_up ? th->text : th->muted, PANEL_W - 28);
+            if (g_st.ap_active)
+                snprintf(l2, sizeof(l2), "hotspot %s on %s  ·  %d connected  ·  TF backups %d",
+                         g_st.ap_ssid, g_st.ap_if, g_st.ap_clients, g_st.tf_backup_count);
+            else
+                snprintf(l2, sizeof(l2), "Wi-Fi %s %s  ·  LoRa %s  ·  TF backups %d",
+                         g_st.net.wifi_if[0] ? g_st.net.wifi_if : "wlan0", disp_ip,
+                         g_st.net.lora_online ? g_st.net.lora_dev : g_st.rnode_status, g_st.tf_backup_count);
+            ctext(fb, F16, 14, hl + 22 + cline(F20) + 4, l2, g_st.ap_active ? th->ok : th->muted, PANEL_W - 28);
+            fill_rect(fb, 0, 124, PANEL_W, 1, th->border);
         }
 
-        /* ---- 5 FireFly Navigation Tab Pills (L1 / R1) ---- */
-        const char *tabs[5] = { "1:CHATS", "2:BOARD", "3:FILES", "4:NETWORK", g_st.net_staged_dirty ? "5:SETUP*" : "5:SETUP" };
-        for (int t = 0; t < 5; t++) {
-            int tx = 10 + t * 141;
-            bool act = (t == g_st.tab_idx);
-            fill_rect(fb, tx, 88, 136, 34, act ? th->ember : th->panel2);
-            draw_border(fb, tx, 88, 136, 34, 2, act ? th->ember_bright : (t == 4 && g_st.net_staged_dirty ? th->ok : th->border));
-            draw_text_s(fb, tx + 10, 98, tabs[t], act ? th->bg : (t == 4 && g_st.net_staged_dirty ? th->ok : th->muted), 2, 10);
-        }
-
+        /* ---- The five panels, in FireFly's style (firefly/ui/screens.py): small
+         * ember headings, normal-case text, label ... value rows, rounded boxes,
+         * chat bubbles. Same cursors and actions as before; only the drawing. ---- */
+        const uint32_t ACTION_C = 0xFFC8B48Fu, DM_C = 0xFFC8A2C8u;   /* FireFly's ACTION, DM_BODY */
         if (g_st.tab_idx == 0) {
-            /* Panel 1: FireFly_RK3326_R36MAX_R36S Chat Screen (firefly/ui/screens.py) */
+            /* Rooms: FireFly's pills, the current one outlined. */
+            static const char *rooms[3] = { "#main", "#lora-mesh", "#wifi-mesh" };
+            int rx = 12;
             for (int r = 0; r < 3; r++) {
-                int rx = 12 + r * 234;
-                bool ract = (r == g_st.room_idx);
-                fill_rect(fb, rx, 130, 228, 30, ract ? th->panel : th->panel2);
-                draw_border(fb, rx, 130, 228, 30, 2, ract ? th->ember : th->border);
-                char rlabel[48];
-                snprintf(rlabel, sizeof(rlabel), "%s (%d)", ROOM_NAMES[r], g_st.room_users[r]);
-                draw_text_s(fb, rx + 12, 138, rlabel, ract ? th->ember_bright : th->muted, 2, 18);
+                char lbl[40];
+                snprintf(lbl, sizeof(lbl), "%s %d", rooms[r], g_st.room_users[r]);
+                int w = font_width(F20, lbl) + 20;
+                bool act = (r == g_st.room_idx);
+                if (act) stroke_rrect(fb, rx, 132, w, 30, 6, th->ember, th->panel);
+                ctext(fb, F20, rx + 10, 136, lbl, act ? th->ember_bright : th->muted, 0);
+                rx += w + 8;
             }
 
-            fill_rect(fb, 12, 166, PANEL_W - 24, 294, th->bg);
-            draw_border(fb, 12, 166, PANEL_W - 24, 294, 2, th->border);
-            int r = g_st.room_idx;
-            if (g_st.room_counts[r] == 0) {
-                draw_text_s(fb, 28, 192, "NO MESSAGES YET - L/R: ROOM, [Y]: OSK, [A]: SEND, [B]: CANCEL.", th->muted, 2, 54);
-            }
-            /* Render FireFly-style chat bubbles with Stump line coloring ([DM], * action, outgoing right-aligned) */
-            int start_m = (g_st.room_counts[r] > 7) ? (g_st.room_counts[r] - 7) : 0;
-            for (int idx_m = start_m; idx_m < g_st.room_counts[r]; idx_m++) {
-                int slot_vis = idx_m - start_m;
-                int by = 172 + slot_vis * 40;
-                const char *nk = g_st.rooms[r][idx_m].nick;
-                const char *bd = g_st.rooms[r][idx_m].body;
-                bool is_sys = g_st.rooms[r][idx_m].is_sys;
-                bool is_out = (!is_sys && (strcmp(nk, "r36max") == 0 || strcmp(nk, "you") == 0));
-                bool is_dm  = (strncmp(bd, "[DM]", 4) == 0);
-                bool is_act = (strncmp(bd, "* ", 2) == 0);
-
-                int bx = is_out ? 132 : 20;
-                int bw = PANEL_W - 152;
-                uint32_t b_bg = is_out ? th->panel : th->panel2;
-                uint32_t b_bd = is_out ? th->ember : (is_sys ? th->ok : th->border);
-                fill_rect(fb, bx, by, bw, 35, b_bg);
-                draw_border(fb, bx, by, bw, 35, 1, b_bd);
-
-                uint32_t fg = th->text;
-                if (is_dm) fg = 0xFFC8A2C8u;        /* FireFly DM_BODY purple */
-                else if (is_act) fg = 0xFFC8B48Fu;  /* FireFly ACTION tan */
-                else if (is_sys) fg = th->ember_bright;
-
-                char row_txt[128];
-                if (is_out) {
-                    snprintf(row_txt, sizeof(row_txt), "<%s> %-31.31s OK", nk, bd);
+            /* Messages: bubbles, newest at the bottom (FireFly's chat view). */
+            int r = g_st.room_idx, ybot = 466;
+            if (g_st.room_counts[r] == 0)
+                ctext(fb, F20, 20, 190, "No messages yet. Y to write.", th->muted, 0);
+            for (int i = g_st.room_counts[r] - 1; i >= 0; i--) {
+                const char *nk = g_st.rooms[r][i].nick, *bd = g_st.rooms[r][i].body;
+                bool sys = g_st.rooms[r][i].is_sys;
+                bool act = (!sys && strcmp(nk, "*") == 0);
+                bool dm = (strncmp(nk, "DM ", 3) == 0);
+                bool out = (!sys && !act && !dm && strncmp(nk, "r36max", 6) == 0);
+                char txt[160];
+                if (sys) snprintf(txt, sizeof(txt), "%s", bd);
+                else if (act) snprintf(txt, sizeof(txt), "* %s", bd);
+                else if (dm) snprintf(txt, sizeof(txt), "[DM] %s: %s", nk + 3, bd);
+                else if (out) snprintf(txt, sizeof(txt), "%s", bd);
+                else snprintf(txt, sizeof(txt), "<%s> %s", nk, bd);
+                /* up to 2 lines of 45 characters (F20 is 12 px a character) */
+                int per = 45, n = utf8_count(txt);
+                char l1[160], l2[160] = "";
+                if (n <= per) {
+                    snprintf(l1, sizeof(l1), "%s", txt);
                 } else {
-                    snprintf(row_txt, sizeof(row_txt), "<%s> %s", nk, bd);
-                }
-                draw_text_s(fb, bx + 10, by + 10, row_txt, fg, 2, 45);
-            }
-
-            /* FireFly Composer Bar with byte & LoRa packet counter ("%d/295 B * 1 LORA PKT") */
-            fill_rect(fb, 12, 466, PANEL_W - 24, 38, th->panel2);
-            draw_border(fb, 12, 466, PANEL_W - 24, 38, 2, (g_st.osk_open || g_st.input_len > 0) ? th->ember : th->border);
-            char comp_line[160];
-            if (g_st.input_len > 0) {
-                snprintf(comp_line, sizeof(comp_line), "> %-26.26s_  %d/295B 1PKT ([A]SEND [B]CLR)",
-                         g_st.input_buf, g_st.input_len);
-                draw_text_s(fb, 22, 478, comp_line, th->ok, 2, 55);
-            } else {
-                snprintf(comp_line, sizeof(comp_line), "> Type message...  0/295B * 1 LORA PKT  ([Y]:OSK [A]:SEND)");
-                draw_text_s(fb, 22, 478, comp_line, th->muted, 2, 55);
-            }
-
-            if (g_st.osk_open) {
-                fill_rect(fb, 12, 510, PANEL_W - 24, 154, th->panel2);
-                draw_border(fb, 12, 510, PANEL_W - 24, 154, 2, th->ember);
-                draw_text_s(fb, 24, 518, "VIRTUAL KEYBOARD (DPAD MOVE, [A]:TYPE, [B]:CANCEL/CLOSE, [X]:DEL):", th->ember_bright, 2, 56);
-                for (int kr = 0; kr < 4; kr++) {
-                    for (int kc = 0; kc < 10; kc++) {
-                        int kx = 22 + kc * 67;
-                        int ky = 540 + kr * 29;
-                        bool ksel = (kr == g_st.osk_row && kc == g_st.osk_col);
-                        fill_rect(fb, kx, ky, 62, 24, ksel ? th->ember : th->panel);
-                        draw_border(fb, kx, ky, 62, 24, 1, ksel ? th->ember_bright : th->border);
-                        const char *klbl = OSK_LABELS[kr][kc];
-                        int xoff = (strlen(klbl) == 1) ? 24 : 8;
-                        draw_text_s(fb, kx + xoff, ky + 5, klbl, ksel ? th->bg : th->text, 2, 4);
+                    const char *q = txt, *cut = NULL, *after = NULL;
+                    for (int k = 0; k < per && *q; k++) {
+                        const char *prev = q;
+                        if (utf8_next(&q) == ' ') { cut = prev; after = q; }
                     }
+                    if (!cut) { cut = q; after = q; }
+                    size_t len = (size_t)(cut - txt);
+                    memcpy(l1, txt, len); l1[len] = '\\0';
+                    snprintf(l2, sizeof(l2), "%s", after);
                 }
-            } else {
-                fill_rect(fb, 12, 510, PANEL_W - 24, 154, th->panel2);
-                draw_border(fb, 12, 510, PANEL_W - 24, 154, 2, th->border);
-                draw_text_s(fb, 24, 520, "QUICK MESH DECK (UP/DN SELECT, [A]: ACCEPT/SEND, [B]: CANCEL):", th->muted, 2, 56);
-                for (int c = 0; c < 6; c++) {
-                    int col = c % 2, row = c / 2;
-                    int cx = 24 + col * 340, cy = 548 + row * 36;
-                    bool sel = (c == g_st.cmd_cursor);
-                    fill_rect(fb, cx - 6, cy - 5, 326, 26, sel ? th->ember : th->panel);
-                    if (!sel) draw_border(fb, cx - 6, cy - 5, 326, 26, 1, th->border);
-                    draw_text_s(fb, cx + 4, cy + 1, QUICK_CMDS[c], sel ? th->bg : th->text, 2, 26);
+                int lines = l2[0] ? 2 : 1;
+                int w1 = font_width(F20, l1), w2 = font_width(F20, l2);
+                int bw = (w1 > w2 ? w1 : w2) + 20, bh = lines * 24 + 12;
+                if (bw > PANEL_W - 60) bw = PANEL_W - 60;
+                int by = ybot - bh;
+                if (by < 170) break;
+                int bx = out ? PANEL_W - 12 - bw : 12;
+                stroke_rrect(fb, bx, by, bw, bh, 8, out ? th->ember : th->border, th->panel);
+                uint32_t fg = sys ? th->muted : act ? ACTION_C : dm ? DM_C : th->text;
+                ctext(fb, F20, bx + 10, by + 4, l1, fg, bw - 16);
+                if (l2[0]) ctext(fb, F20, bx + 10, by + 28, l2, fg, bw - 16);
+                ybot = by - 6;
+            }
+
+            /* The draft (Y opens FireFly's keyboard) and its size. */
+            bool draft = g_st.input_len > 0;
+            stroke_rrect(fb, 12, 474, PANEL_W - 24, 40, 8, draft ? th->ember : th->border, th->panel2);
+            char meter[32];
+            snprintf(meter, sizeof(meter), "%d/295 B", g_st.input_len);
+            int mw = font_width(F16, meter);
+            ctext(fb, F20, 24, 482, draft ? g_st.input_buf : "Y to write a message", draft ? th->text : th->muted,
+                  PANEL_W - 60 - mw);
+            ctext(fb, F16, PANEL_W - 24 - mw, 486, meter, th->muted, 0);
+
+            /* Quick commands. */
+            static const char *quick[6] = { "/whoami + /names", "/auth", "!find jardinage",
+                                            "!roll 2d6", "announce", "say hello" };
+            ctext(fb, F16, 14, 524, "QUICK", th->ember, 0);
+            for (int c = 0; c < 6; c++) {
+                int cx = 12 + (c % 2) * 354, cy = 546 + (c / 2) * 42;
+                bool sel = (c == g_st.cmd_cursor);
+                if (sel) fill_rrect(fb, cx, cy, 342, 36, 6, th->ember);
+                else stroke_rrect(fb, cx, cy, 342, 36, 6, th->border, th->panel);
+                ctext(fb, F20, cx + 12, cy + 6, quick[c], sel ? th->bg : th->text, 320);
+            }
+        } else if (g_st.tab_idx == 1 || g_st.tab_idx == 2) {
+            /* Billboard / shared files: a list with check boxes, then one action row. */
+            bool board = (g_st.tab_idx == 1);
+            int count = board ? g_st.board_count : g_st.file_count;
+            int cursor = board ? g_st.board_cursor : g_st.file_cursor;
+            int checked = board ? count_checked_boards() : count_checked_files();
+            int shown = board ? 4 : 5;
+            char head[96];
+            if (board) snprintf(head, sizeof(head), "%d notice%s · %d checked", count, count == 1 ? "" : "s", checked);
+            else snprintf(head, sizeof(head), "%d file%s · %d checked · %d of %d MB", count, count == 1 ? "" : "s",
+                          checked, g_st.used_kb / 1024, g_st.ceil_kb / 1024);
+            ctext(fb, F16, 14, 134, board ? "BILLBOARD" : "SHARED FILES", th->ember, 0);
+            ctext(fb, F16, PANEL_W - 14 - font_width(F16, head), 134, head, th->muted, 0);
+            if (count == 0)
+                ctext(fb, F20, 20, 170, board ? "No notices yet." : "No files shared yet.", th->muted, 0);
+            int rh = board ? 76 : 62;
+            for (int i = 0; i < count && i < shown; i++) {
+                int y = 158 + i * rh;
+                bool sel = (i == cursor);
+                bool chk = board ? g_st.board[i].checked : g_st.files[i].checked;
+                if (sel) stroke_rrect(fb, 12, y, PANEL_W - 24, rh - 6, 8, th->ember, th->panel);
+                /* the check box */
+                if (chk) { fill_rrect(fb, 24, y + 10, 22, 22, 4, th->ok); ctext(fb, F20, 28, y + 9, "✓", th->bg, 0); }
+                else stroke_rrect(fb, 24, y + 10, 22, 22, 4, th->muted, sel ? th->panel : th->bg);
+                if (board) {
+                    int tw = ctext(fb, F24, 58, y + 6, g_st.board[i].title, sel ? th->ember_bright : th->text, 520);
+                    char sig[32];
+                    snprintf(sig, sizeof(sig), "  — %s", g_st.board[i].sig);
+                    ctext(fb, F16, 58 + tw, y + 12, sig, th->muted, PANEL_W - 90 - tw);
+                    ctext(fb, F16, 58, y + 40, g_st.board[i].body[0] ? g_st.board[i].body : "(no text)", th->muted,
+                          PANEL_W - 90);
+                } else {
+                    char meta[32];
+                    snprintf(meta, sizeof(meta), "%s · %d KB", g_st.files[i].cat, g_st.files[i].size_kb);
+                    int mw = font_width(F16, meta);
+                    ctext(fb, F24, 58, y + 9, g_st.files[i].name, sel ? th->ember_bright : th->text, PANEL_W - 110 - mw);
+                    ctext(fb, F16, PANEL_W - 28 - mw, y + 15, meta, th->muted, 0);
                 }
             }
-        } else if (g_st.tab_idx == 1) {
-            /* Panel 2: Bulletin Board — [A]=Check [X] / Accept, [B]=Cancel / Clear [X] */
-            fill_rect(fb, 12, 130, PANEL_W - 24, 534, th->panel);
-            draw_border(fb, 12, 130, PANEL_W - 24, 534, 2, th->border);
-            int chk_cnt = count_checked_boards();
-            char bhead[96];
-            snprintf(bhead, sizeof(bhead), "BULLETIN BOARD (%d POSTS | %d CHECKED [X]) - [A]=CHECK [B]=CLEAR",
-                     g_st.board_count, chk_cnt);
-            draw_text_s(fb, 24, 142, bhead, th->ember_bright, 2, 55);
-
-            if (g_st.board_count == 0) {
-                draw_text_s(fb, 28, 196, "NO NOTICES ON BOARD YET. SELECT ACTION BAR BELOW TO POST!", th->muted, 2, 52);
-            }
-            for (int b = 0; b < g_st.board_count && b < 4; b++) {
-                int by = 172 + b * 88;
-                bool sel = (b == g_st.board_cursor);
-                bool chk = g_st.board[b].checked;
-                fill_rect(fb, 24, by, PANEL_W - 48, 78, th->panel2);
-                draw_border(fb, 24, by, PANEL_W - 48, 78, sel ? 3 : 1, chk ? th->ok : (sel ? th->ember_bright : th->border));
-                char tline[96], bline[96];
-                snprintf(tline, sizeof(tline), "%s[%c] %s [%s]",
-                         sel ? ">" : " ", chk ? 'X' : ' ', g_st.board[b].title, g_st.board[b].sig);
-                snprintf(bline, sizeof(bline), "     %s (ID:%s)", g_st.board[b].body, g_st.board[b].id);
-                draw_text_s(fb, 32, by + 12, tline, chk ? th->ok : (sel ? th->ember_bright : th->text), 2, 52);
-                draw_text_s(fb, 32, by + 44, bline, th->muted, 2, 52);
-            }
-
-            /* Action Toggle Bar at Row == board_count */
-            bool bar_sel = (g_st.board_cursor >= g_st.board_count);
-            fill_rect(fb, 24, 534, PANEL_W - 48, 118, th->panel2);
-            draw_border(fb, 24, 534, PANEL_W - 48, 118, bar_sel ? 3 : 2, bar_sel ? th->ember_bright : th->ember);
-            draw_text_s(fb, 34, 544, "[A]: CHECK [X] / ACCEPT  |  [B]: CANCEL / CLEAR [X]  |  [Y]: TF  |  [X]: DEL", th->ok, 2, 54);
-
-            const char *bmodes[3] = {
-                "1: BACKUP CHECKED -> TF CARD",
-                "2: DELETE CHECKED (CONFIRM)",
-                "3: POST NEW NOTICE"
-            };
-            char mline[96];
-            snprintf(mline, sizeof(mline), "%sACTION (L/R, [A] ACCEPT): < %s >",
-                     bar_sel ? "> " : "  ", bmodes[g_st.board_bar_mode]);
-            draw_text_s(fb, 34, 576, mline, bar_sel ? th->ember_bright : th->text, 2, 53);
-
-            char subline[96];
-            if (g_st.board_bar_mode == 0) {
-                snprintf(subline, sizeof(subline), "SAVES %d CHECKED NOTICE(S) TO /roms/ports/stump_r36max/tf_backup/", chk_cnt);
-            } else if (g_st.board_bar_mode == 1) {
-                snprintf(subline, sizeof(subline), "OPENS CONFIRMATION POPUP ([A]=ACCEPT [B]=CANCEL) FOR %d NOTICE(S)", chk_cnt);
-            } else {
-                snprintf(subline, sizeof(subline), "NEXT NOTICE PRESET: %s", BOARD_PRESET_TITLES[g_st.board_preset_idx]);
-            }
-            draw_text_s(fb, 34, 608, subline, th->muted, 2, 53);
-        } else if (g_st.tab_idx == 2) {
-            /* Panel 3: Shared File Shelf (/sd/shared) — [A]=Check [X] / Accept, [B]=Cancel / Clear [X] */
-            fill_rect(fb, 12, 130, PANEL_W - 24, 534, th->panel);
-            draw_border(fb, 12, 130, PANEL_W - 24, 534, 2, th->border);
-            int chk_files = count_checked_files();
-            char fhead[96];
-            snprintf(fhead, sizeof(fhead), "SHARED FILE SHELF (%d FILES | %d CHECKED [X] | %d/%d KB)",
-                     g_st.file_count, chk_files, g_st.used_kb, g_st.ceil_kb);
-            draw_text_s(fb, 24, 142, fhead, th->ember_bright, 2, 55);
-
-            if (g_st.file_count == 0) {
-                draw_text_s(fb, 28, 196, "NO FILES IN /SD/SHARED YET. USE ACTION BAR BELOW TO SHARE!", th->muted, 2, 52);
-            }
-            for (int f = 0; f < g_st.file_count && f < 5; f++) {
-                int fy = 172 + f * 70;
-                bool sel = (f == g_st.file_cursor);
-                bool chk = g_st.files[f].checked;
-                fill_rect(fb, 24, fy, PANEL_W - 48, 60, th->panel2);
-                draw_border(fb, 24, fy, PANEL_W - 48, 60, sel ? 3 : 1, chk ? th->ok : (sel ? th->ember_bright : th->border));
-                char fline[96];
-                snprintf(fline, sizeof(fline), "%s[%c] %-26.26s [%s] %d KB",
-                         sel ? ">" : " ", chk ? 'X' : ' ', g_st.files[f].name, g_st.files[f].cat, g_st.files[f].size_kb);
-                draw_text_s(fb, 32, fy + 10, fline, chk ? th->ok : (sel ? th->ember_bright : th->text), 2, 52);
-                draw_text_s(fb, 32, fy + 36, "     [A] OR L/R: CHECK [X]   [B]: CLEAR [X]   [Y]: TF   [X]: DELETE", th->muted, 2, 52);
-            }
-
-            /* Action Toggle Bar at Row == file_count */
-            bool bar_sel = (g_st.file_cursor >= g_st.file_count);
-            fill_rect(fb, 24, 534, PANEL_W - 48, 118, th->panel2);
-            draw_border(fb, 24, 534, PANEL_W - 48, 118, bar_sel ? 3 : 2, bar_sel ? th->ember_bright : th->ember);
-            draw_text_s(fb, 34, 544, "[A]: CHECK [X] / ACCEPT  |  [B]: CANCEL / CLEAR [X]  |  [Y]: TF  |  [X]: DEL", th->ok, 2, 54);
-
-            const char *fmodes[3] = {
-                "1: BACKUP CHECKED -> TF CARD",
-                "2: DELETE CHECKED (CONFIRM)",
-                "3: SHARE NEW FIELD FILE"
-            };
-            char mline[96];
-            snprintf(mline, sizeof(mline), "%sACTION (L/R, [A] ACCEPT): < %s >",
-                     bar_sel ? "> " : "  ", fmodes[g_st.file_bar_mode]);
-            draw_text_s(fb, 34, 576, mline, bar_sel ? th->ember_bright : th->text, 2, 53);
-
-            char subline[96];
-            if (g_st.file_bar_mode == 0) {
-                snprintf(subline, sizeof(subline), "COPIES %d CHECKED FILE(S) TO /roms/ports/stump_r36max/tf_backup/", chk_files);
-            } else if (g_st.file_bar_mode == 1) {
-                snprintf(subline, sizeof(subline), "OPENS CONFIRMATION POPUP ([A]=ACCEPT [B]=CANCEL) FOR %d FILE(S)", chk_files);
-            } else {
-                snprintf(subline, sizeof(subline), "NEXT FILE GENERATOR: %s", FILE_ACTION_LABELS[g_st.file_action_idx]);
-            }
-            draw_text_s(fb, 34, 608, subline, th->muted, 2, 53);
+            /* the action row, under the list (the cursor's last stop) */
+            bool bar = (cursor >= count);
+            int mode = board ? g_st.board_bar_mode : g_st.file_bar_mode;
+            static const char *bacts[3] = { "Back up checked → TF card", "Delete checked", "Post a notice" };
+            static const char *facts[3] = { "Back up checked → TF card", "Delete checked", "Share the next file from drop/" };
+            ctext(fb, F16, 14, 520, "ACTION", th->ember, 0);
+            if (bar) stroke_rrect(fb, 12, 542, PANEL_W - 24, 42, 8, th->ember, th->panel);
+            else stroke_rrect(fb, 12, 542, PANEL_W - 24, 42, 8, th->border, th->bg);
+            char act[96];
+            snprintf(act, sizeof(act), "◀  %s  ▶", (board ? bacts : facts)[mode % 3]);
+            ctext(fb, F24, 24, 549, act, bar ? th->ember_bright : th->text, PANEL_W - 48);
+            char sub[160];
+            if (mode == 0) snprintf(sub, sizeof(sub), "%d checked → /roms/ports/stump_r36max/tf_backup/", checked);
+            else if (mode == 1) snprintf(sub, sizeof(sub), "asks first · %d checked", checked);
+            else if (board) snprintf(sub, sizeof(sub), "next: %s", BOARD_PRESET_TITLES[g_st.board_preset_idx]);
+            else snprintf(sub, sizeof(sub), "files waiting in /roms/ports/stump_r36max/drop/");
+            ctext(fb, F16, 18, 594, sub, th->muted, PANEL_W - 36);
         } else if (g_st.tab_idx == 3) {
-            /* Panel 4: Stage Wi-Fi / AP Settings -> Review & Apply in Panel 5 */
-            fill_rect(fb, 12, 130, PANEL_W - 24, 534, th->panel);
-            draw_border(fb, 12, 130, PANEL_W - 24, 534, 2, th->border);
+            /* Network: where this Stump is, what's staged, the networks, the QR code. */
+            char now[120], staged[160];
+            if (g_st.ap_active) snprintf(now, sizeof(now), "Hotspot %s · %s", g_st.ap_ssid, disp_ip);
+            else snprintf(now, sizeof(now), "Wi-Fi network · %s", disp_ip);
+            if (g_st.net_staged_dirty)
+                snprintf(staged, sizeof(staged), "staged: %s — apply it in SETUP",
+                         g_st.net_staged_ap ? "hotspot" : (g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "saved Wi-Fi"));
+            else snprintf(staged, sizeof(staged), "nothing staged");
+            ctext(fb, F16, 14, 134, "THIS STUMP", th->ember, 0);
+            ctext(fb, F24, 14, 154, now, th->text, PANEL_W - 28);
+            ctext(fb, F16, 14, 184, staged, g_st.net_staged_dirty ? th->ok : th->muted, PANEL_W - 28);
 
-            fill_rect(fb, 24, 140, PANEL_W - 48, 66, th->panel2);
-            draw_border(fb, 24, 140, PANEL_W - 48, 66, 2, th->border);
-            char t1[160], t2[160];
-            snprintf(t1, sizeof(t1), "LIVE NOW: %s (%s)  |  STAGED: %s%s",
-                     g_st.ap_active ? "HOTSPOT" : "LOCAL LAN WIFI",
-                     disp_ip,
-                     g_st.net_staged_ap ? "HOTSPOT" : (g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "LOCAL LAN DHCP"),
-                     g_st.net_staged_dirty ? " [*PENDING*]" : " [SYNCED]");
-            snprintf(t2, sizeof(t2), "CHAIN: %s (ID:%s PEERS:%d)  |  STAGE HERE -> APPLY IN PANEL 5",
-                     g_st.chain_has_secret ? g_st.chain_secret : "NO SECRET (SET IN PANEL 5)",
-                     g_st.chain_id,
-                     g_st.chain_peers);
-            draw_text_s(fb, 34, 150, t1, g_st.net_staged_dirty ? th->ok : th->text, 2, 54);
-            draw_text_s(fb, 34, 178, t2, g_st.chain_has_secret ? th->ok : th->ember_bright, 2, 54);
-
-            /* Left Box: Row 0 = Stage Mode, Row 1 = Wi-Fi Utility Toggle, Rows 2..N = Stage SSID */
-            fill_rect(fb, 24, 214, 426, 248, th->panel2);
-            draw_border(fb, 24, 214, 426, 248, 2, th->border);
-            draw_text_s(fb, 34, 222, "STAGE NETWORK ([A]=REVIEW IN TAB 5, [B]=CANCEL):", th->ember_bright, 2, 34);
-
-            /* Row 0: Stage Radio Mode (never switches live radio directly!) */
-            {
-                bool sel0 = (g_st.wifi_cursor == 0);
-                int ry0 = 246;
-                fill_rect(fb, 32, ry0, 410, 30, sel0 ? th->ember : th->panel);
-                draw_border(fb, 32, ry0, 410, 30, 1, sel0 ? th->ember_bright : th->border);
-                char r0txt[96];
-                snprintf(r0txt, sizeof(r0txt), "%sSTAGE: < %s >",
-                         sel0 ? ">" : " ",
-                         g_st.net_staged_ap ? "HOTSPOT ON" : "LOCAL LAN WIFI DHCP");
-                draw_text_s(fb, 38, ry0 + 8, r0txt, sel0 ? th->bg : (g_st.net_staged_ap ? th->ok : th->ember_bright), 2, 33);
-            }
-
-            /* Row 1: Chain & Wi-Fi Utility Bar (0=Set Chain Secret OSK, 1=Scan LAN Chain, 2=Rescan Wi-Fi, 3=Wi-Fi Pass OSK) */
-            {
-                bool sel1 = (g_st.wifi_cursor == 1);
-                int ry1 = 280;
-                fill_rect(fb, 32, ry1, 410, 28, sel1 ? th->ember : th->panel);
-                draw_border(fb, 32, ry1, 410, 28, 1, sel1 ? th->ember_bright : th->border);
-                const char *wtools[4] = {
-                    "SET CHAIN SECRET (OSK)",
-                    "SCAN LAN STUMP CHAIN",
-                    "RESCAN 2.4GHZ WIFI",
-                    "OPEN WIFI PASSWORD OSK"
-                };
-                char r1txt[96];
-                snprintf(r1txt, sizeof(r1txt), "%sTOOL (L/R, [A]): < %s >", sel1 ? ">" : " ", wtools[g_st.wifi_bar_mode % 4]);
-                draw_text_s(fb, 38, ry1 + 7, r1txt, sel1 ? th->bg : th->text, 2, 33);
-            }
-
-            /* Rows 2..N: Discovered Wi-Fi Networks (Press [A] to stage into Panel 5) */
-            for (int w = 0; w < g_st.wifi_count && w < 4; w++) {
-                bool selw = (g_st.wifi_cursor == (w + 2));
-                int ry = 314 + w * 34;
-                fill_rect(fb, 32, ry, 410, 30, selw ? th->ember : th->panel);
-                draw_border(fb, 32, ry, 410, 30, 1, selw ? th->ember_bright : th->border);
-                char wtxt[96];
-                snprintf(wtxt, sizeof(wtxt), "%s%s%-17.17s [%s %d%%]",
-                         selw ? ">" : " ",
-                         g_st.wifi_list[w].active ? "*" : " ",
-                         g_st.wifi_list[w].ssid,
-                         g_st.wifi_list[w].sec,
-                         g_st.wifi_list[w].signal);
-                draw_text_s(fb, 38, ry + 8, wtxt,
-                            selw ? th->bg : (g_st.wifi_list[w].active ? th->ok : th->text), 2, 33);
-            }
-
-            /* Right Box: Scannable ISO 18004 QR Code */
-            fill_rect(fb, 458, 214, 238, 248, th->panel2);
-            draw_border(fb, 458, 214, 238, 248, 2, th->border);
-            draw_text_s(fb, 468, 222, g_st.qr_mode == 1 ? "WIFI JOIN QR [X]" : "PORTAL :80 QR [X]", th->ok, 2, 18);
-            int qs = 7;
-            int qx = 458 + (238 - (25 * qs)) / 2;
-            int qy = 254;
-            fill_rect(fb, qx - 2 * qs, qy - 2 * qs, (25 + 4) * qs, (25 + 4) * qs, 0xFFFFFFFFu);
-            for (int r = 0; r < 25; r++) {
-                for (int c = 0; c < 25; c++) {
-                    if (g_st.qr_grid[r][c]) {
-                        fill_rect(fb, qx + c * qs, qy + r * qs, qs, qs, 0xFF000000u);
-                    }
-                }
-            }
-            draw_text_s(fb, 466, 440, g_st.qr_url, th->muted, 1, 36);
-
-            /* Chain Secret / Wi-Fi Password Composer Bar */
-            fill_rect(fb, 24, 468, PANEL_W - 48, 38, th->panel2);
-            draw_border(fb, 24, 468, PANEL_W - 48, 38, 2, (g_st.osk_open || g_st.input_len > 0) ? th->ember_bright : th->border);
-            char pw_line[160];
-            if (g_st.osk_open && g_st.osk_target == 1) {
-                snprintf(pw_line, sizeof(pw_line), "CHAIN SECRET > %s_  ([A] ON 'OK' TO SAVE & LINK, [B]: CANCEL)", g_st.input_buf);
-                draw_text_s(fb, 34, 480, pw_line, th->ok, 2, 54);
-            } else if (g_st.input_len > 0) {
-                snprintf(pw_line, sizeof(pw_line), "WIFI PASS > %s_  ([A]: STAGE SSID -> PANEL 5  [B]: CANCEL)", g_st.input_buf);
-                draw_text_s(fb, 34, 480, pw_line, th->ok, 2, 54);
-            } else {
-                snprintf(pw_line, sizeof(pw_line), "CHAIN SECRET: %s  ([Y]: EDIT SECRET / WIFI PASS  [A]: STAGE)",
-                         g_st.chain_has_secret ? g_st.chain_secret : "NONE (PRESS [Y] TO SET)");
-                draw_text_s(fb, 34, 480, pw_line, g_st.chain_has_secret ? th->ok : th->ember_bright, 2, 54);
-            }
-
-            if (g_st.osk_open) {
-                fill_rect(fb, 24, 512, PANEL_W - 48, 146, th->panel2);
-                draw_border(fb, 24, 512, PANEL_W - 48, 146, 2, th->ember);
-                draw_text_s(fb, 34, 518,
-                            g_st.osk_target == 1
-                                ? "STUMP CHAIN SECRET KEYBOARD ([A]:TYPE, 'OK':SAVE & LINK, [B]:CANCEL):"
-                                : "WIFI PASSWORD KEYBOARD ([A]:TYPE, 'OK':SAVE, [B]:CANCEL, [X]:DEL):",
-                            th->ember_bright, 2, 54);
-                for (int kr = 0; kr < 4; kr++) {
-                    for (int kc = 0; kc < 10; kc++) {
-                        int kx = 30 + kc * 66;
-                        int ky = 538 + kr * 28;
-                        bool ksel = (kr == g_st.osk_row && kc == g_st.osk_col);
-                        fill_rect(fb, kx, ky, 61, 23, ksel ? th->ember : th->panel);
-                        draw_border(fb, kx, ky, 61, 23, 1, ksel ? th->ember_bright : th->border);
-                        const char *klbl = OSK_LABELS[kr][kc];
-                        int xoff = (strlen(klbl) == 1) ? 24 : 8;
-                        draw_text_s(fb, kx + xoff, ky + 5, klbl, ksel ? th->bg : th->text, 2, 4);
-                    }
-                }
-            } else {
-                fill_rect(fb, 24, 514, PANEL_W - 48, 142, th->panel2);
-                draw_border(fb, 24, 514, PANEL_W - 48, 142, 2, th->border);
-                draw_text_s(fb, 36, 526, "STUMP CHAIN (:4242) + SAFE 2-STEP NETWORK REVISION:", th->ember_bright, 2, 52);
-                draw_text_s(fb, 36, 554, "1. PRESS [Y] (OR TOOL ROW [A]) TO SET SHARED STUMP CHAIN SECRET.", th->ok, 2, 53);
-                draw_text_s(fb, 36, 582, "2. PICK WIFI/AP ABOVE & PRESS [A] TO REVIEW & APPLY IN PANEL 5.", th->text, 2, 53);
-                draw_text_s(fb, 36, 610, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->ember_bright, 2, 53);
-            }
-        } else {
-            /* Panel 5 (5:REV/DBG): Network + Stump Chain Revision + Debug Tools + Live Logs */
-            fill_rect(fb, 12, 130, PANEL_W - 24, 534, th->panel);
-            draw_border(fb, 12, 130, PANEL_W - 24, 534, 2, th->border);
-
-            /* Top Box: Network & Stump Chain Settings Revision (LIVE vs STAGED) */
-            fill_rect(fb, 24, 136, PANEL_W - 48, 224, th->panel2);
-            draw_border(fb, 24, 136, PANEL_W - 48, 224, 2, g_st.net_staged_dirty ? th->ok : th->ember);
-            char rev_hdr[128];
-            snprintf(rev_hdr, sizeof(rev_hdr), "NETWORK & STUMP CHAIN REVISION (%s)  |  %s",
-                     g_st.net_staged_dirty ? "*PENDING*" : "SYNCED",
-                     g_st.ver_str);
-            draw_text_s(fb, 34, 143, rev_hdr, g_st.net_staged_dirty ? th->ok : th->ember_bright, 2, 54);
-
-            char live_sum[140];
-            snprintf(live_sum, sizeof(live_sum), "LIVE: %s (%s) | CHAIN:%s PEERS:%d (%s)",
-                     g_st.ap_active ? "STUMP AP" : "LAN WIFI",
-                     disp_ip,
-                     g_st.chain_has_secret ? g_st.chain_id : "NO-SECRET",
-                     g_st.chain_peers,
-                     g_st.chain_peer_ip[0] && strcmp(g_st.chain_peer_ip, "-") != 0 ? g_st.chain_peer_ip : "SCANNING");
-            draw_text_s(fb, 34, 165, live_sum, g_st.chain_peers > 0 ? th->ok : th->text, 2, 54);
-
-            /* Row 0: Staged Radio Mode */
-            {
-                bool r0 = (g_st.rev_cursor == 0);
-                fill_rect(fb, 32, 188, PANEL_W - 64, 28, r0 ? th->ember : th->panel);
-                draw_border(fb, 32, 188, PANEL_W - 64, 28, 1, r0 ? th->ember_bright : th->border);
-                char r0line[120];
-                snprintf(r0line, sizeof(r0line), "%s1. STAGED MODE (L/R): < %s >",
-                         r0 ? "> " : "  ",
-                         g_st.net_staged_ap ? "HOTSPOT (OPEN, 10.42.0.1)" : "LOCAL LAN WIFI CLIENT (DHCP)");
-                draw_text_s(fb, 38, 195, r0line, r0 ? th->bg : (g_st.net_staged_ap ? th->ok : th->ember_bright), 2, 52);
-            }
-
-            /* Row 1: Staged Target SSID / AP Channel */
-            {
-                bool r1 = (g_st.rev_cursor == 1);
-                fill_rect(fb, 32, 220, PANEL_W - 64, 28, r1 ? th->ember : th->panel);
-                draw_border(fb, 32, 220, PANEL_W - 64, 28, 1, r1 ? th->ember_bright : th->border);
-                char r1line[120];
-                if (g_st.net_staged_ap) {
-                    snprintf(r1line, sizeof(r1line), "%s2. HOTSPOT: SSID=PC_HOTSPOT_NAME (config.py), OPEN, 10.42.0.1",
-                             r1 ? "> " : "  ");
+            ctext(fb, F16, 14, 212, "STAGE", th->ember, 0);
+            static const char *tools[4] = { "Chain secret", "Scan LAN for Stumps", "Rescan Wi-Fi", "Type Wi-Fi password" };
+            int lw = 440;
+            for (int row = 0; row < 2 + (g_st.wifi_count < 4 ? g_st.wifi_count : 4); row++) {
+                int y = 232 + row * 38;
+                bool sel = (g_st.wifi_cursor == row);
+                if (sel) stroke_rrect(fb, 12, y, lw, 34, 6, th->ember, th->panel);
+                char lab[64], val[64];
+                uint32_t vc = th->muted;
+                if (row == 0) {
+                    snprintf(lab, sizeof(lab), "Mode");
+                    snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ap ? "Hotspot" : "Wi-Fi network");
+                    vc = g_st.net_staged_ap ? th->ok : th->text;
+                } else if (row == 1) {
+                    snprintf(lab, sizeof(lab), "Tool");
+                    snprintf(val, sizeof(val), "◀ %s ▶", tools[g_st.wifi_bar_mode % 4]);
                 } else {
-                    snprintf(r1line, sizeof(r1line), "%s2. TARGET LAN SSID (L/R OR [A] PICK): < %s >",
-                             r1 ? "> " : "  ",
-                             g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "SAVED SYSTEM WIFI DHCP");
+                    int w = row - 2;
+                    snprintf(lab, sizeof(lab), "%s%.24s", g_st.wifi_list[w].active ? "● " : "", g_st.wifi_list[w].ssid);
+                    snprintf(val, sizeof(val), "%s %d%%", g_st.wifi_list[w].sec, g_st.wifi_list[w].signal);
+                    if (g_st.wifi_list[w].active) vc = th->ok;
                 }
-                draw_text_s(fb, 38, 227, r1line, r1 ? th->bg : th->text, 2, 52);
+                int vw = font_width(F20, val);
+                ctext(fb, F20, 22, y + 5, lab, sel ? th->ember_bright : th->text, lw - 40 - vw);
+                ctext(fb, F20, 12 + lw - 10 - vw, y + 5, val, vc, 0);
             }
 
-            /* Row 2: Stump Chain Secret & Role (SandBox_Stump_On provisioner.py parity) */
-            {
-                bool r2 = (g_st.rev_cursor == 2);
-                fill_rect(fb, 32, 252, PANEL_W - 64, 30, r2 ? th->ember : th->panel);
-                draw_border(fb, 32, 252, PANEL_W - 64, 30, 1, r2 ? th->ember_bright : (g_st.chain_has_secret ? th->ok : th->warn));
-                const char *roles[3] = { "AUTO(HUB+UPLINK)", "ROOT(:4242)", "MEMBER" };
-                const char *shown_sec = g_st.chain_secret[0] ? g_st.chain_secret : "NONE [PRESS A/Y TO SET]";
-                char r2line[140];
-                snprintf(r2line, sizeof(r2line), "%s3. CHAIN SECRET ([A]/[Y]=EDIT, L/R=ROLE): <%s> [%s]",
-                         r2 ? "> " : "  ",
-                         shown_sec,
-                         roles[g_st.chain_role_idx % 3]);
-                draw_text_s(fb, 38, 260, r2line, r2 ? th->bg : (g_st.chain_has_secret ? th->ok : th->warn), 2, 52);
-            }
+            /* the QR code: the Stump's page, or (X) joining the hotspot */
+            int qx0 = 466;
+            ctext(fb, F16, qx0, 212, g_st.qr_mode == 1 ? "JOIN THE HOTSPOT" : "OPEN THE STUMP", th->ember, 0);
+            int qs = 7, qn = 25 + 4, qbox = qn * qs;
+            int qx = qx0 + (240 - qbox) / 2, qy = 234;
+            fill_rect(fb, qx, qy, qbox, qbox, 0xFFFFFFFFu);
+            for (int rr = 0; rr < 25; rr++)
+                for (int cc = 0; cc < 25; cc++)
+                    if (g_st.qr_grid[rr][cc]) fill_rect(fb, qx + (cc + 2) * qs, qy + (rr + 2) * qs, qs, qs, 0xFF000000u);
+            ctext(fb, F16, qx0 + (240 - font_width(F16, g_st.qr_url)) / 2, qy + qbox + 6, g_st.qr_url, th->muted, 240);
 
-            /* Row 3: [A] ACCEPT & APPLY REVISION  |  [B] CANCEL & REVERT STAGED */
-            {
-                bool r3 = (g_st.rev_cursor == 3);
-                fill_rect(fb, 32, 286, PANEL_W - 64, 32, r3 ? th->ok : th->panel);
-                draw_border(fb, 32, 286, PANEL_W - 64, 32, 2, r3 ? th->text : (g_st.net_staged_dirty ? th->ok : th->border));
-                char r3line[120];
-                snprintf(r3line, sizeof(r3line), "%s4. [A] ACCEPT & APPLY REVISION + CHAIN  |  [B] CANCEL / REVERT",
-                         r3 ? "> " : "  ");
-                draw_text_s(fb, 38, 295, r3line, r3 ? th->bg : th->ok, 2, 52);
-            }
-
-            draw_text_s(fb, 34, 326, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->muted, 2, 54);
-
-            /* Row 4: Debug & Chain Action Toggle Bar */
-            {
-                bool r4 = (g_st.rev_cursor == 4);
-                fill_rect(fb, 24, 366, PANEL_W - 48, 54, r4 ? th->ember : th->panel2);
-                draw_border(fb, 24, 366, PANEL_W - 48, 54, 2, r4 ? th->ember_bright : th->border);
-                const char *dtools[4] = {
-                    "SCAN & LINK LAN CHAIN (:4244/:4242)",
-                    "EDIT CHAIN SECRET (ON-SCREEN KEYBOARD)",
-                    "EXPORT DIAG + LOGS -> TF CARD",
-                    "HEAL VISITOR HTTP :80/:8080"
-                };
-                char dtline[128];
-                snprintf(dtline, sizeof(dtline), "%s5. TOOL (L/R, [A] RUN): < %s >",
-                         r4 ? "> " : "  ", dtools[g_st.debug_bar_mode % 4]);
-                draw_text_s(fb, 34, 373, dtline, r4 ? th->bg : th->ember_bright, 2, 52);
-                char dt2[128];
-                snprintf(dt2, sizeof(dtline), "   CHAIN ID:%s  PEERS:%d  ([Y]=SET CHAIN SECRET  [X]=SCAN LAN CHAIN)",
-                         g_st.chain_id, g_st.chain_peers);
-                draw_text_s(fb, 34, 396, dt2, r4 ? th->bg : th->ok, 2, 52);
-            }
-
-            /* Row 5: Either Chain Secret OSK Overlay OR Live System & Chain Log Viewport */
-            if (g_st.osk_open) {
-                fill_rect(fb, 24, 426, PANEL_W - 48, 228, th->panel2);
-                draw_border(fb, 24, 426, PANEL_W - 48, 228, 2, th->ember_bright);
-                char sec_line[160];
-                snprintf(sec_line, sizeof(sec_line), "CHAIN SECRET > %s_  ([A] ON 'OK' TO SAVE, [B]=CANCEL, [X]=BACKSPACE)", g_st.input_buf);
-                draw_text_s(fb, 34, 436, sec_line, th->ok, 2, 54);
-                draw_text_s(fb, 34, 460, "SHARED PASSPHRASE FOR ALL STUMPS ON YOUR LAN (HMAC + AES-128-CBC):", th->muted, 2, 54);
-                for (int kr = 0; kr < 4; kr++) {
-                    for (int kc = 0; kc < 10; kc++) {
-                        int kx = 30 + kc * 66;
-                        int ky = 486 + kr * 38;
-                        bool ksel = (kr == g_st.osk_row && kc == g_st.osk_col);
-                        fill_rect(fb, kx, ky, 61, 32, ksel ? th->ember : th->panel);
-                        draw_border(fb, kx, ky, 61, 32, 1, ksel ? th->ember_bright : th->border);
-                        const char *klbl = OSK_LABELS[kr][kc];
-                        int xoff = (strlen(klbl) == 1) ? 24 : 8;
-                        draw_text_s(fb, kx + xoff, ky + 9, klbl, ksel ? th->bg : th->text, 2, 4);
-                    }
-                }
-            } else {
-                bool r5 = (g_st.rev_cursor == 5);
-                fill_rect(fb, 24, 426, PANEL_W - 48, 228, th->panel2);
-                draw_border(fb, 24, 426, PANEL_W - 48, 228, 2, r5 ? th->ember_bright : th->border);
-                char lhead[96];
-                snprintf(lhead, sizeof(lhead), "%s6. LIVE SYSTEM, RADIO & CHAIN LOGS (%d ENTRIES - UP/DN SCROLL):",
-                         r5 ? "> " : "  ", g_st.debug_log_count);
-                draw_text_s(fb, 34, 434, lhead, r5 ? th->ember_bright : th->muted, 2, 54);
-
-                if (g_st.debug_log_count == 0) {
-                    draw_text_s(fb, 34, 468, "NO LOGS YET - PRESS [X] TO SCAN LAN STUMP CHAIN OR [Y] FOR SECRET.", th->muted, 2, 52);
-                }
-                int start_idx = g_st.debug_scroll;
-                if (start_idx > g_st.debug_log_count - 1) start_idx = 0;
-                for (int i = 0; i < 6 && (start_idx + i) < g_st.debug_log_count; i++) {
-                    int ly = 462 + i * 28;
-                    draw_text_s(fb, 34, ly, g_st.debug_logs[start_idx + i], th->text, 2, 54);
-                }
-            }
-        }
-
-        /* ---- Prominent "IN PROCESS..." State Banner Overlay ---- */
-        if (is_ui_busy()) {
-            const char *bmsg = g_st.busy_msg[0] ? g_st.busy_msg : "IN PROCESS: PLEASE WAIT...";
-            fill_rect(fb, 36, 126, PANEL_W - 72, 44, th->bg);
-            fill_rect(fb, 40, 130, PANEL_W - 80, 36, th->ember);
-            draw_border(fb, 40, 130, PANEL_W - 80, 36, 3, th->ember_bright);
-            draw_text_s(fb, 54, 140, bmsg, th->bg, 2, 50);
-        }
-
-        /* ---- Confirmation Modal Overlay ([A] = ACCEPT, [B] = CANCEL) ---- */
-        if (g_st.confirm_open) {
-            fill_rect(fb, 56, 206, PANEL_W - 112, 258, th->bg);
-            fill_rect(fb, 62, 212, PANEL_W - 124, 246, th->panel);
-            draw_border(fb, 62, 212, PANEL_W - 124, 246, 4, g_st.confirm_type == 3 ? th->ok : th->warn);
-
-            if (g_st.confirm_type == 3) {
-                draw_text_s(fb, 92, 234, "APPLY STAGED NETWORK REVISION?", th->ok, 3, 32);
-                draw_text_s(fb, 88, 282, "PROPOSED NETWORK CONFIGURATION TO APPLY:", th->muted, 2, 44);
-            } else {
-                draw_text_s(fb, 110, 234, "ARE YOU SURE YOU WANT TO ERASE?", th->warn, 3, 32);
-                draw_text_s(fb, 88, 282,
-                            g_st.confirm_type == 1 ? "CHECKED BILLBOARD NOTICES TO ERASE:" : "CHECKED SHARED FILES TO ERASE:",
-                            th->muted, 2, 44);
-            }
-            draw_text_s(fb, 88, 314, g_st.confirm_label, th->ember_bright, 2, 44);
-
-            /* Choice 0: NO / CANCEL */
-            bool c0 = (g_st.confirm_choice == 0);
-            fill_rect(fb, 90, 362, 250, 54, c0 ? th->ember : th->panel2);
-            draw_border(fb, 90, 362, 250, 54, 3, c0 ? th->text : th->border);
-            draw_text_s(fb, 108, 382, c0 ? "> [B] NO, CANCEL <" : "  [B] NO, CANCEL  ", c0 ? th->bg : th->text, 2, 18);
-
-            /* Choice 1: YES / ACCEPT */
-            bool c1 = (g_st.confirm_choice == 1);
-            uint32_t c1_col = (g_st.confirm_type == 3) ? th->ok : th->warn;
-            fill_rect(fb, 380, 362, 250, 54, c1 ? c1_col : th->panel2);
-            draw_border(fb, 380, 362, 250, 54, 3, c1 ? th->text : th->border);
-            draw_text_s(fb, 396, 382,
-                        g_st.confirm_type == 3 ? (c1 ? "> [A] YES, APPLY <" : "  [A] YES, APPLY  ")
-                                               : (c1 ? "> [A] YES, ERASE <" : "  [A] YES, ERASE  "),
-                        c1 ? th->bg : c1_col, 2, 18);
-
-            draw_text_s(fb, 92, 430, "LEFT/RIGHT: SELECT   [A]: ACCEPT CHOICE   [B]: CANCEL IMMEDIATELY", th->muted, 2, 50);
-        }
-
-        /* ---- FireFly_RK3326_R36MAX_R36S Bottom Hints Bar (firefly/ui/widgets.py) ---- */
-        fill_rect(fb, 0, PANEL_H - 42, PANEL_W, 42, th->panel2);
-        fill_rect(fb, 0, PANEL_H - 42, PANEL_W, 2, th->border);
-        if (g_st.confirm_open) {
-            draw_text_s(fb, 16, PANEL_H - 28, "CONFIRM: [A]=ACCEPT HIGHLIGHTED   [B]=CANCEL IMMEDIATELY   L/R:NO/YES", th->ember_bright, 2, 58);
+            ctext(fb, F16, 14, 480, "WI-FI PASSWORD", th->ember, 0);
+            char pw[160];
+            int plen = utf8_count(g_st.net_staged_pass);
+            if (plen > 0) {
+                char dots[100] = "";
+                for (int k = 0; k < plen && k < 30; k++) strcat(dots, "•");
+                snprintf(pw, sizeof(pw), "%s  (%d characters)", dots, plen);
+            } else snprintf(pw, sizeof(pw), "none — Y to type it (case kept)");
+            ctext(fb, F20, 14, 502, pw, plen > 0 ? th->text : th->muted, PANEL_W - 28);
+            ctext(fb, F16, 14, 540, "CHAIN", th->ember, 0);
+            ctext(fb, F20, 14, 562, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->text, PANEL_W - 28);
+            ctext(fb, F16, 14, 594, "secret, role and the Stump above: in /admin, as on every Stump", th->muted, PANEL_W - 28);
         } else {
-            const char *hk[5] = { "A", "B", "Y", "X", "L/R" };
-            const char *hv0[5] = { "Send/Act", "Cancel", "Keyboard", "/Auth", "Room/Tab" };
-            const char *hv1[5] = { "Check[X]", "Clear",  "TF-Save",  "Delete", "Toggle" };
-            const char *hv3[5] = { "Stage->5", "Cancel", "PassOSK",  "QRMode", "Toggle" };
-            const char *hv4[5] = { "Apply/Act","Revert", "ChainSec", "ScanLAN","Cycle" };
-            const char **hv = (g_st.tab_idx == 1 || g_st.tab_idx == 2) ? hv1
-                            : (g_st.tab_idx == 3) ? hv3
-                            : (g_st.tab_idx == 4) ? hv4 : hv0;
-            int hx = 14;
-            for (int hi = 0; hi < 5; hi++) {
-                int kw = (int)strlen(hk[hi]) * 12 + 12;
-                fill_rect(fb, hx, PANEL_H - 34, kw, 24, th->panel);
-                draw_border(fb, hx, PANEL_H - 34, kw, 24, 1, th->border);
-                draw_text_s(fb, hx + 6, PANEL_H - 28, hk[hi], th->text, 2, 4);
-                hx += kw + 6;
-                draw_text_s(fb, hx, PANEL_H - 28, hv[hi], th->muted, 2, 10);
-                hx += (int)strlen(hv[hi]) * 12 + 14;
+            /* Setup: the staged change, apply or revert, the tools, the log. */
+            ctext(fb, F16, 14, 134, "STAGED CHANGES", th->ember, 0);
+            const char *st = g_st.net_staged_dirty ? "pending" : "synced";
+            ctext(fb, F16, PANEL_W - 14 - font_width(F16, st), 134, st, g_st.net_staged_dirty ? th->ok : th->muted, 0);
+            static const char *dtools[4] = { "Scan LAN for Stumps", "Chain secret", "Diagnostics → TF card",
+                                             "Restart the Stump" };
+            for (int row = 0; row < 5; row++) {
+                int y = (row < 4) ? 156 + row * 38 : 362;
+                bool sel = (g_st.rev_cursor == row);
+                if (sel) stroke_rrect(fb, 12, y, PANEL_W - 24, 34, 6, row == 3 ? th->ok : th->ember, th->panel);
+                char lab[32], val[120];
+                uint32_t vc = th->muted;
+                if (row == 0) {
+                    snprintf(lab, sizeof(lab), "Mode");
+                    snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ap ? "Hotspot (10.42.0.1)" : "Wi-Fi network");
+                    vc = th->text;
+                } else if (row == 1) {
+                    snprintf(lab, sizeof(lab), "Network");
+                    if (g_st.net_staged_ap) snprintf(val, sizeof(val), "name from config.py (PC_HOTSPOT_NAME)");
+                    else snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "saved Wi-Fi");
+                    vc = th->text;
+                } else if (row == 2) {
+                    snprintf(lab, sizeof(lab), "Chain");
+                    if (g_st.chain_has_secret) snprintf(val, sizeof(val), "secret set · id %s", g_st.chain_id);
+                    else snprintf(val, sizeof(val), "no secret · set it in /admin");
+                    vc = g_st.chain_has_secret ? th->ok : th->muted;
+                } else if (row == 3) {
+                    snprintf(lab, sizeof(lab), "Apply");
+                    snprintf(val, sizeof(val), "A apply · B revert");
+                    vc = g_st.net_staged_dirty ? th->ok : th->muted;
+                } else {
+                    snprintf(lab, sizeof(lab), "Tool");
+                    snprintf(val, sizeof(val), "◀ %s ▶", dtools[g_st.debug_bar_mode % 4]);
+                    vc = th->text;
+                }
+                int vw = font_width(F20, val);
+                ctext(fb, F20, 22, y + 5, lab, sel ? (row == 3 ? th->ok : th->ember_bright) : th->text, 200);
+                ctext(fb, F20, PANEL_W - 22 - vw, y + 5, val, vc, PANEL_W - 250);
+            }
+            ctext(fb, F16, 14, 314, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->muted, PANEL_W - 28);
+            ctext(fb, F16, 14, 340, "TOOLS", th->ember, 0);
+
+            bool lsel = (g_st.rev_cursor == 5);
+            char lh[48];
+            snprintf(lh, sizeof(lh), "LOG%s", lsel ? "  ↑↓ scroll" : "");
+            ctext(fb, F16, 14, 410, lh, lsel ? th->ember_bright : th->ember, 0);
+            if (g_st.debug_log_count == 0) ctext(fb, F16, 14, 434, "nothing yet", th->muted, 0);
+            int start = g_st.debug_scroll;
+            if (start > g_st.debug_log_count - 1) start = 0;
+            for (int i = 0; i < 10 && start + i < g_st.debug_log_count; i++)
+                ctext(fb, F16, 14, 434 + i * 23, g_st.debug_logs[start + i], th->text, PANEL_W - 28);
+        }
+
+        /* Busy: FireFly's toast, over the top of the panel. */
+        if (is_ui_busy()) {
+            const char *bmsg = g_st.busy_msg[0] ? g_st.busy_msg : "Working…";
+            fill_rrect(fb, 40, 128, PANEL_W - 80, 38, 8, th->ember);
+            ctext(fb, F20, 56, 135, bmsg, th->bg, PANEL_W - 112);
+        }
+
+        /* Confirm: a panel in the middle, No / Yes. */
+        if (g_st.confirm_open) {
+            bool apply = (g_st.confirm_type == 3);
+            uint32_t tone = apply ? th->ok : th->warn;
+            stroke_rrect(fb, 60, 200, PANEL_W - 120, 270, 10, tone, th->panel);
+            ctext(fb, F24, 84, 220, apply ? "Apply the staged network?" : "Erase what's checked?", tone, PANEL_W - 168);
+            ctext(fb, F16, 84, 262, apply ? "This change:" : (g_st.confirm_type == 1 ? "Checked notices:" : "Checked files:"),
+                  th->muted, 0);
+            ctext(fb, F20, 84, 286, g_st.confirm_label, th->ember_bright, PANEL_W - 168);
+            for (int c = 0; c < 2; c++) {
+                bool sel = (g_st.confirm_choice == c);
+                int bx = 84 + c * 284;
+                const char *lbl = c == 0 ? "No, cancel" : (apply ? "Yes, apply" : "Yes, erase");
+                uint32_t fillc = c == 0 ? th->ember : tone;
+                if (sel) fill_rrect(fb, bx, 380, 268, 54, 8, fillc);
+                else stroke_rrect(fb, bx, 380, 268, 54, 8, th->border, th->panel2);
+                ctext(fb, F24, bx + (268 - font_width(F24, lbl)) / 2, 392, lbl, sel ? th->bg : th->text, 0);
             }
         }
+
+        /* ---- FireFly's hint bar (firefly/ui/app.py draw_hints) ---- */
+        if (g_st.confirm_open) {
+            static const char *const ck[3] = { "←→", "A", "B" };
+            static const char *const cl[3] = { "choose", "accept", "cancel" };
+            draw_hint_bar(fb, th, ck, cl, 3);
+        } else if (g_st.tab_idx == 1 || g_st.tab_idx == 2) {
+            static const char *const k[6] = { "A", "B", "Y", "X", "↑↓", "L/R" };
+            static const char *const l[6] = { "check", "clear", "TF backup", "delete", "move", "tab" };
+            draw_hint_bar(fb, th, k, l, 6);
+        } else if (g_st.tab_idx == 3) {
+            static const char *const k[6] = { "A", "B", "Y", "X", "↑↓", "L/R" };
+            static const char *const l[6] = { "stage", "cancel", "password", "QR", "move", "tab" };
+            draw_hint_bar(fb, th, k, l, 6);
+        } else if (g_st.tab_idx == 4) {
+            static const char *const k[6] = { "A", "B", "X", "START", "↑↓", "L/R" };
+            static const char *const l[6] = { "do", "revert", "scan LAN", "apply", "move", "tab" };
+            draw_hint_bar(fb, th, k, l, 6);
+        } else {
+            static const char *const k[6] = { "A", "Y", "X", "←→", "↑↓", "L/R" };
+            static const char *const l[6] = { "do", "keyboard", "/auth", "room", "deck", "tab" };
+            draw_hint_bar(fb, th, k, l, 6);
+        }
+
+        if (g_st.osk_open) compose_draw(fb, th);
 
         /* Always publish RGBA buffer to /dev/shm/stump_fb.rgba for FireFly pygame.display.flip() presenter */
         if (shm_rgba) {
@@ -3088,30 +3329,71 @@ def clean(s, n=60):
     return s.strip()[:n]
 
 
-def ascii_line(s):
-    """The cockpit's font is ASCII: the Stump's room-activity symbols
-    (CLIENT_QUICKSTART "Room activity and DMs are symbols") said in words,
-    accents folded, anything else dropped."""
+_FONT_CHARS = []
+
+
+def font_chars():
+    """The characters the cockpit's font can draw: read from cockpit_font.bin
+    (gen_font.py) next to this file. None without it: the engine then uses
+    its 5x7 capitals font, which is ASCII only."""
+    if not _FONT_CHARS:
+        import struct
+        chars = None
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cockpit_font.bin"), "rb") as f:
+                buf = f.read()
+            if buf[:8] == b"CKFONT1\\0":
+                ng = struct.unpack_from("<I", buf, 12 + 12)[0]      # the first font's glyph count
+                chars = set(chr(struct.unpack_from("<I", buf, 32 + 16 * k)[0]) for k in range(ng))
+        except (OSError, struct.error):
+            chars = None
+        _FONT_CHARS.append(chars)
+    return _FONT_CHARS[0]
+
+
+def screen_line(s):
+    """Text as the cockpit can draw it. With FireFly's font: as sent, symbols
+    and accents included (✓ ~rod, café, → ...), as FireFly shows it; a
+    character the font lacks is folded (é -> e) or dropped. Without it: ASCII,
+    the symbols said in words."""
     import unicodedata
     s = str(s or "")
-    if s.startswith("✓ "):                       # ✓ rod
-        s = "+ %s joined" % s[2:]
-    elif s.startswith("✗ "):                     # ✗ rod
-        s = "- %s left" % s[2:]
-    elif s.startswith("✎ #"):                    # ✎ #main text
-        room, _, text = s[2:].partition(" ")
-        s = "%s topic: %s" % (room, text)
-    elif s.startswith("✎ "):                     # ✎ rod → bob
-        s = "%s is now %s" % tuple((s[2:].split(" → ", 1) + [""])[:2])
-    elif s.startswith("⊖ "):                     # ⊖ ghost
-        s = "no one here is called " + s[2:]
-    for k, v in (("→", "->"), ("—", "-"), ("–", "-"), ("…", "..."), ("·", "."),
-                 ("⊘", "(refused)"), ("⧗", "(slow down)"), ("♪", "voice"),
-                 ("«", '"'), ("»", '"'), ("’", "'"), ("“", '"'), ("”", '"')):
-        s = s.replace(k, v)
-    s = s.replace("~", "")                            # "on the mesh" mark: the font has no ~
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(c for c in s if 32 <= ord(c) < 127)
+    chars = font_chars()
+    if chars is None:
+        if s.startswith("\\u2713 "):                       # ✓ rod
+            s = "+ %s joined" % s[2:]
+        elif s.startswith("\\u2717 "):                     # ✗ rod
+            s = "- %s left" % s[2:]
+        elif s.startswith("\\u270e #"):                    # ✎ #main text
+            room, _, text = s[2:].partition(" ")
+            s = "%s topic: %s" % (room, text)
+        elif s.startswith("\\u270e "):                     # ✎ rod → bob
+            s = "%s is now %s" % tuple((s[2:].split(" \\u2192 ", 1) + [""])[:2])
+        elif s.startswith("\\u2296 "):                     # ⊖ ghost
+            s = "no one here is called " + s[2:]
+        for k, v in (("\\u2192", "->"), ("\\u2014", "-"), ("\\u2013", "-"), ("\\u2026", "..."), ("\\u00b7", "."),
+                     ("\\u2298", "(refused)"), ("\\u29d7", "(slow down)"), ("\\u266a", "voice"),
+                     ("\\u00ab", '"'), ("\\u00bb", '"'), ("\\u2019", "'"), ("\\u201c", '"'), ("\\u201d", '"')):
+            s = s.replace(k, v)
+        s = s.replace("~", "")
+        s = unicodedata.normalize("NFKD", s)
+        return "".join(c for c in s if 32 <= ord(c) < 127)
+    out = []
+    for c in s.replace("\\u29d7", "(slow down)"):
+        if c in chars:
+            out.append(c)
+        elif ord(c) >= 32:
+            out.append("".join(d for d in unicodedata.normalize("NFKD", c) if d in chars))
+    return "".join(out)
+
+
+def clip(s, nbytes):
+    """At most nbytes of UTF-8, cut between characters: the engine keeps
+    each field in a fixed number of bytes."""
+    b = s.encode("utf-8")
+    if len(b) <= nbytes:
+        return s
+    return b[:nbytes].decode("utf-8", "ignore")
 
 
 def run(cmd, timeout=20):
@@ -3241,13 +3523,14 @@ class Feed:
                     "ip": "", "ssids": []}
         self.busy_until, self.busy_msg = 0.0, "READY"
         self.full_names = {}               # shown (truncated) file name -> the real one
+        self.full_ssids = {}               # shown SSID -> the real one
         self.next_info = self.next_net = 0.0
         self.nick_set = False
         self.ipc = None
 
     # -- status line on the cockpit --
     def busy(self, msg, secs=2.5):
-        self.busy_msg, self.busy_until = clean(msg, 54), time.time() + secs
+        self.busy_msg, self.busy_until = clip(clean(screen_line(msg), 54), 62), time.time() + secs
         log("UI", msg)
 
     # -- reading the Stump --
@@ -3387,12 +3670,12 @@ class Feed:
         cfg = read_config()
         if not on:
             ok, out = self._nmcli("connection", "down", HOTSPOT_CON)
-            self.busy("HOTSPOT OFF" if ok else "HOTSPOT: " + out, 3)
+            self.busy("Hotspot off" if ok else "Hotspot: " + out, 3)
             self.restart_stump("hotspot off")
             return
         devs = self.wifi_devices()
         if not devs:
-            self.busy("NO WI-FI ADAPTER FOUND", 3)
+            self.busy("No Wi-Fi adapter found", 3)
             return
         # Two Wi-Fi adapters (internal + RT3070): the hotspot on the one not in
         # use, so the handheld stays on its network (PC.md: two networks).
@@ -3415,6 +3698,7 @@ class Feed:
             self.restart_stump("hotspot on")
 
     def join_wifi(self, ssid, password):
+        ssid = self.full_ssids.get(ssid, ssid)
         if not ssid:
             return
         self._nmcli("connection", "down", HOTSPOT_CON)
@@ -3455,7 +3739,7 @@ class Feed:
                 room = parts[1].strip().lower() or self.want_room
                 text = "|".join(parts[2:]).strip()
                 if not text or st.port is None:
-                    self.busy("THE STUMP ISN'T ANSWERING YET", 2.5)
+                    self.busy("The Stump isn't answering yet", 2.5)
                     return
                 if room != st.room:
                     st.send("/join " + room)
@@ -3466,7 +3750,7 @@ class Feed:
             elif op == "BOARD_ADD" and len(parts) >= 2:
                 s, t = st.post("/post", json.dumps({"title": parts[1], "body": "|".join(parts[2:])}),
                                "application/json")
-                self.busy("NOTICE POSTED" if s == 201 else "NOTICE: " + _msg(t, s), 2.5)
+                self.busy("Notice posted" if s == 201 else "Notice: " + _msg(t, s), 2.5)
                 self.next_info = 0
             elif op in ("BOARD_DEL", "BOARD_DEL_MULTI") and len(parts) >= 2:
                 ids = [i.strip() for i in parts[1].split(",") if i.strip()]
@@ -3485,7 +3769,7 @@ class Feed:
                 text += "".join("[%s] %s (%s)\\n%s\\n\\n" % (p.get("id"), p.get("title"), p.get("sig"), p.get("body", ""))
                                 for p in rows)
                 p = self._tf_write("billboard_%s.txt" % time.strftime("%Y%m%d_%H%M%S"), text)
-                self.busy("SAVED %d NOTICE(S) TO TF CARD" % len(rows), 2.5)
+                self.busy("%d notice(s) saved to the TF card" % len(rows), 2.5)
                 log("TF", p)
             elif op == "FILE_BACKUP_TF" and len(parts) >= 2:
                 names = [self.full_names.get(n.strip(), n.strip()) for n in parts[1].split(",") if n.strip()]
@@ -3496,31 +3780,31 @@ class Feed:
                     if os.path.isfile(src):          # a read-only copy: the Stump's shelf is untouched
                         shutil.copy2(src, os.path.join(TF_DIR, os.path.basename(name)))
                         n += 1
-                self.busy("COPIED %d FILE(S) TO TF CARD" % n, 2.5)
+                self.busy("%d file(s) copied to the TF card" % n, 2.5)
             elif op in ("AP_ON", "AP_OFF", "AP_TOGGLE"):
                 on = (op == "AP_ON") or (op == "AP_TOGGLE" and not self.net["ap"])
-                self.busy("HOTSPOT %s..." % ("ON" if on else "OFF"), 8)
+                self.busy("Hotspot %s\\u2026" % ("on" if on else "off"), 8)
                 self.hotspot(on)
                 self.next_net = 0
             elif op == "NET_APPLY" and len(parts) >= 2:
                 if parts[1].strip().upper() == "AP":
-                    self.busy("HOTSPOT ON...", 8)
+                    self.busy("Hotspot on\\u2026", 8)
                     self.hotspot(True)
                 else:
                     ssid = parts[2].strip() if len(parts) > 2 else ""
                     if ssid:
-                        self.busy("JOINING %s..." % ssid, 15)
+                        self.busy("Joining %s\\u2026" % ssid, 15)
                         self.join_wifi(ssid, parts[3] if len(parts) > 3 else "")
                     else:
-                        self.busy("HOTSPOT OFF...", 8)
+                        self.busy("Hotspot off\\u2026", 8)
                         self.hotspot(False)
                 self.next_net = 0
             elif op == "WIFI_SCAN":
-                self.busy("SCANNING WI-FI...", 6)
+                self.busy("Scanning Wi-Fi\\u2026", 6)
                 self._nmcli("device", "wifi", "rescan", timeout=15)
                 self.next_net = time.time() + 4
             elif op == "WIFI_JOIN" and len(parts) >= 2:
-                self.busy("JOINING %s..." % parts[1], 15)
+                self.busy("Joining %s\\u2026" % parts[1], 15)
                 self.join_wifi(parts[1].strip(), parts[2] if len(parts) > 2 else "")
                 self.next_net = 0
             elif op == "CHAIN_SCAN":
@@ -3528,18 +3812,18 @@ class Feed:
                 for s in found:
                     log("CHAIN", "%s at %s (%s)" % (s.get("name"), s.get("here") or ",".join(s.get("http") or []),
                                                     s.get("release")))
-                self.busy("%d STUMP(S) ON THIS NETWORK" % len(found), 3)
+                self.busy("%d Stump(s) on this network" % len(found), 3)
                 self.next_info = 0
             elif op == "CHAIN_SET":
                 # The chain is the Stump's own setting, as on every Stump: /admin
                 # (Stump chain) or the setup wizard -- never edited from here.
-                self.busy("SET THE CHAIN IN /admin OR: provisioner.py --pc --reconfigure", 5)
+                self.busy("The chain is set in /admin (or provisioner.py --pc --reconfigure)", 5)
             elif op == "ANNOUNCE":
-                self.busy("THE STUMP ANNOUNCES ITSELF (RADIO UP, NEW STUMPS HEARD)", 3)
+                self.busy("The Stump announces itself on its own (radio up, new Stumps)", 3)
             elif op == "DEBUG_EXPORT_TF":
                 self.export_diagnostics()
             elif op == "DEBUG_HEAL_NET":
-                self.busy("RESTARTING THE STUMP...", 6)
+                self.busy("Restarting the Stump\\u2026", 6)
                 self.restart_stump("from the cockpit")
             elif op == "DEBUG_CLEAR_LOGS":
                 _LOG.clear()
@@ -3556,7 +3840,7 @@ class Feed:
         if not items:
             return
         if not pw:
-            self.busy("SET AN ADMIN PASSWORD (/admin) TO DELETE FROM HERE", 4)
+            self.busy("Set an admin password (/admin) to delete from here", 4)
             return
         body = "&".join("%s=%s" % (field, urllib.parse.quote(i, safe="")) for i in items)
         body += "&admin_pass=" + urllib.parse.quote(pw, safe="")
@@ -3574,7 +3858,7 @@ class Feed:
         except OSError:
             waiting = []
         if not waiting:
-            self.busy("PUT FILES IN %s FIRST" % DROP_DIR, 4)
+            self.busy("Put files in %s first" % DROP_DIR, 4)
             return
         name = waiting[0][1]
         src = os.path.join(DROP_DIR, name)
@@ -3585,9 +3869,9 @@ class Feed:
         if s == 200:
             os.makedirs(os.path.join(DROP_DIR, "_shared"), exist_ok=True)
             shutil.move(src, os.path.join(DROP_DIR, "_shared", name))
-            self.busy("SHARED %s" % name, 3)
+            self.busy("Shared %s" % name, 3)
         else:
-            self.busy("SHARE: %s" % _msg(t, s), 4)
+            self.busy("Share: %s" % _msg(t, s), 4)
         self.next_info = 0
 
     def export_diagnostics(self):
@@ -3606,7 +3890,7 @@ class Feed:
             out.append("stump.log: %s" % e)
         out.append("cockpit feed log:\\n" + "\\n".join(_LOG))
         p = self._tf_write("diagnostics_%s.txt" % time.strftime("%Y%m%d_%H%M%S"), "\\n\\n".join(out) + "\\n")
-        self.busy("DIAGNOSTICS SAVED TO TF CARD", 3)
+        self.busy("Diagnostics saved to the TF card", 3)
         log("TF", p)
 
     # -- the live file the cockpit reads --
@@ -3641,11 +3925,11 @@ class Feed:
             below = ch.get("below") or []
             role = ch.get("role") or "member"
             if role == "root":
-                status = "FIRST STUMP · %d BELOW" % len(below)
+                status = "First Stump \\u00b7 %d below" % len(below)
             elif up.get("parent_heard_s") is not None:
-                status = "LINKED TO %s (%ds AGO)" % (up.get("parent"), up.get("parent_heard_s"))
+                status = "Linked to %s (heard %ds ago)" % (up.get("parent"), up.get("parent_heard_s"))
             else:
-                status = "LOOKING FOR %s" % (up.get("parent") or "THE STUMP ABOVE")
+                status = "Looking for %s\\u2026" % (up.get("parent") or "the Stump above")
             peer_ip = up.get("parent") or ch.get("lan_ip") or ip
             out.append("CHAIN|1|%d|%d|%s|%s|%d|%s|%s" % (1 if role == "root" else 2, 1 if ch.get("secret") else 0,
                                                          "(set in /admin)" if ch.get("secret") else "",
@@ -3653,9 +3937,14 @@ class Feed:
                                                          len(below) + (1 if up.get("parent_heard_s") is not None else 0),
                                                          clean(peer_ip, 24), clean(status, 56)))
         else:
-            out.append("CHAIN|0|0|0||none|0|%s|NOT IN A CHAIN (SET IT IN /admin)" % ip)
+            out.append("CHAIN|0|0|0||none|0|%s|Not in a chain (set it in /admin)" % ip)
+        # The cockpit sends back the SSID it shows: keep the real one behind it
+        # (a name cut short, or with a character the font lacks, would not join).
+        self.full_ssids = {}
         for w in self.net["ssids"]:
-            out.append("SSID|%d|%d|%s|%s" % (1 if w["active"] else 0, w["signal"], clean(w["sec"], 8), clean(w["ssid"], 28)))
+            shown = clip(clean(screen_line(w["ssid"]), 31), 31)
+            self.full_ssids[shown] = w["ssid"]
+            out.append("SSID|%d|%d|%s|%s" % (1 if w["active"] else 0, w["signal"], clean(w["sec"], 8), shown))
         for i, room in enumerate(ROOMS):
             out.append("ROOM|%d|%s|%d" % (i, room.upper(), self.users[room]))
             for m in self.msgs[room][-10:]:
@@ -3663,18 +3952,22 @@ class Feed:
                 nick = "*" if sys_ else (m.get("nick") or "?")
                 if m.get("kind") == "dm":
                     nick = "DM " + nick
-                out.append("MSG|%d|%d|%s|%s" % (i, 1 if sys_ else 0, clean(ascii_line(nick), 16),
-                                                clean(ascii_line(m.get("body")), 44)))
+                body = m.get("body")
+                if m.get("kind") == "action":            # /me: "* rod waves", as FireFly shows it
+                    nick, body = "*", "%s %s" % (m.get("nick") or "?", body or "")
+                out.append("MSG|%d|%d|%s|%s" % (i, 1 if sys_ else 0, clip(clean(screen_line(nick), 16), 17),
+                                                clip(clean(screen_line(body), 44), 45)))
         for p in self.board[:8]:
-            out.append("BOARD|%s|%s|%s|%s" % (clean(p.get("id") or "", 24), clean(p.get("sig"), 14),
-                                              clean(p.get("title"), 44), clean(p.get("body"), 48)))
+            out.append("BOARD|%s|%s|%s|%s" % (clean(p.get("id") or "", 24), clip(clean(screen_line(p.get("sig")), 14), 15),
+                                              clip(clean(screen_line(p.get("title")), 44), 45),
+                                              clip(clean(screen_line(p.get("body")), 48), 49)))
         self.full_names = {}
         used = 0
         files = sorted(self.files, key=lambda f: -(f.get("mtime") or 0))
         for f in files:
             used += int(f.get("size") or 0)
         for f in files[:8]:
-            shown = clean(f.get("name"), 35).replace(",", "_")
+            shown = clip(clean(screen_line(f.get("name")), 35), 35).replace(",", "_")
             self.full_names[shown] = f.get("name")
             cat = {"document": "DOC", "image": "IMG", "music": "AUDIO", "video": "VIDEO"}.get(f.get("cat"), "FILE")
             out.append("FILE|%s|%d|%s" % (shown, max(1, int(f.get("size") or 0) // 1024), cat))
@@ -4121,7 +4414,9 @@ fi
 # ── 6. The cockpit ──────────────────────────────────────────────────────────
 step "6/6 The cockpit (720x720 screen, gamepad, Ports launcher)"
 mkdir -p "$COCKPIT_DIR"
-cp -f "$HERE/cockpit_feed.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" "$COCKPIT_DIR/"
+cp -f "$HERE/cockpit_feed.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \\
+      "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$COCKPIT_DIR/"
+ok "FireFly's font (DejaVu Sans Mono) next to the engine"
 CFLAGS="-O2 -Wall -Wno-format-truncation"
 grep -qi "cortex-a35\\|rk3326" /proc/device-tree/compatible /proc/cpuinfo 2>/dev/null && CFLAGS="$CFLAGS -mcpu=cortex-a35"
 gcc $CFLAGS "$COCKPIT_DIR/stump_r36max_engine.c" -o "$COCKPIT_DIR/stump_r36max_engine" -lasound -lpthread -ldl -lm \\

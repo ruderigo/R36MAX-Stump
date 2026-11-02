@@ -80,30 +80,71 @@ def clean(s, n=60):
     return s.strip()[:n]
 
 
-def ascii_line(s):
-    """The cockpit's font is ASCII: the Stump's room-activity symbols
-    (CLIENT_QUICKSTART "Room activity and DMs are symbols") said in words,
-    accents folded, anything else dropped."""
+_FONT_CHARS = []
+
+
+def font_chars():
+    """The characters the cockpit's font can draw: read from cockpit_font.bin
+    (gen_font.py) next to this file. None without it: the engine then uses
+    its 5x7 capitals font, which is ASCII only."""
+    if not _FONT_CHARS:
+        import struct
+        chars = None
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "cockpit_font.bin"), "rb") as f:
+                buf = f.read()
+            if buf[:8] == b"CKFONT1\0":
+                ng = struct.unpack_from("<I", buf, 12 + 12)[0]      # the first font's glyph count
+                chars = set(chr(struct.unpack_from("<I", buf, 32 + 16 * k)[0]) for k in range(ng))
+        except (OSError, struct.error):
+            chars = None
+        _FONT_CHARS.append(chars)
+    return _FONT_CHARS[0]
+
+
+def screen_line(s):
+    """Text as the cockpit can draw it. With FireFly's font: as sent, symbols
+    and accents included (✓ ~rod, café, → ...), as FireFly shows it; a
+    character the font lacks is folded (é -> e) or dropped. Without it: ASCII,
+    the symbols said in words."""
     import unicodedata
     s = str(s or "")
-    if s.startswith("✓ "):                       # ✓ rod
-        s = "+ %s joined" % s[2:]
-    elif s.startswith("✗ "):                     # ✗ rod
-        s = "- %s left" % s[2:]
-    elif s.startswith("✎ #"):                    # ✎ #main text
-        room, _, text = s[2:].partition(" ")
-        s = "%s topic: %s" % (room, text)
-    elif s.startswith("✎ "):                     # ✎ rod → bob
-        s = "%s is now %s" % tuple((s[2:].split(" → ", 1) + [""])[:2])
-    elif s.startswith("⊖ "):                     # ⊖ ghost
-        s = "no one here is called " + s[2:]
-    for k, v in (("→", "->"), ("—", "-"), ("–", "-"), ("…", "..."), ("·", "."),
-                 ("⊘", "(refused)"), ("⧗", "(slow down)"), ("♪", "voice"),
-                 ("«", '"'), ("»", '"'), ("’", "'"), ("“", '"'), ("”", '"')):
-        s = s.replace(k, v)
-    s = s.replace("~", "")                            # "on the mesh" mark: the font has no ~
-    s = unicodedata.normalize("NFKD", s)
-    return "".join(c for c in s if 32 <= ord(c) < 127)
+    chars = font_chars()
+    if chars is None:
+        if s.startswith("\u2713 "):                       # ✓ rod
+            s = "+ %s joined" % s[2:]
+        elif s.startswith("\u2717 "):                     # ✗ rod
+            s = "- %s left" % s[2:]
+        elif s.startswith("\u270e #"):                    # ✎ #main text
+            room, _, text = s[2:].partition(" ")
+            s = "%s topic: %s" % (room, text)
+        elif s.startswith("\u270e "):                     # ✎ rod → bob
+            s = "%s is now %s" % tuple((s[2:].split(" \u2192 ", 1) + [""])[:2])
+        elif s.startswith("\u2296 "):                     # ⊖ ghost
+            s = "no one here is called " + s[2:]
+        for k, v in (("\u2192", "->"), ("\u2014", "-"), ("\u2013", "-"), ("\u2026", "..."), ("\u00b7", "."),
+                     ("\u2298", "(refused)"), ("\u29d7", "(slow down)"), ("\u266a", "voice"),
+                     ("\u00ab", '"'), ("\u00bb", '"'), ("\u2019", "'"), ("\u201c", '"'), ("\u201d", '"')):
+            s = s.replace(k, v)
+        s = s.replace("~", "")
+        s = unicodedata.normalize("NFKD", s)
+        return "".join(c for c in s if 32 <= ord(c) < 127)
+    out = []
+    for c in s.replace("\u29d7", "(slow down)"):
+        if c in chars:
+            out.append(c)
+        elif ord(c) >= 32:
+            out.append("".join(d for d in unicodedata.normalize("NFKD", c) if d in chars))
+    return "".join(out)
+
+
+def clip(s, nbytes):
+    """At most nbytes of UTF-8, cut between characters: the engine keeps
+    each field in a fixed number of bytes."""
+    b = s.encode("utf-8")
+    if len(b) <= nbytes:
+        return s
+    return b[:nbytes].decode("utf-8", "ignore")
 
 
 def run(cmd, timeout=20):
@@ -233,13 +274,14 @@ class Feed:
                     "ip": "", "ssids": []}
         self.busy_until, self.busy_msg = 0.0, "READY"
         self.full_names = {}               # shown (truncated) file name -> the real one
+        self.full_ssids = {}               # shown SSID -> the real one
         self.next_info = self.next_net = 0.0
         self.nick_set = False
         self.ipc = None
 
     # -- status line on the cockpit --
     def busy(self, msg, secs=2.5):
-        self.busy_msg, self.busy_until = clean(msg, 54), time.time() + secs
+        self.busy_msg, self.busy_until = clip(clean(screen_line(msg), 54), 62), time.time() + secs
         log("UI", msg)
 
     # -- reading the Stump --
@@ -379,12 +421,12 @@ class Feed:
         cfg = read_config()
         if not on:
             ok, out = self._nmcli("connection", "down", HOTSPOT_CON)
-            self.busy("HOTSPOT OFF" if ok else "HOTSPOT: " + out, 3)
+            self.busy("Hotspot off" if ok else "Hotspot: " + out, 3)
             self.restart_stump("hotspot off")
             return
         devs = self.wifi_devices()
         if not devs:
-            self.busy("NO WI-FI ADAPTER FOUND", 3)
+            self.busy("No Wi-Fi adapter found", 3)
             return
         # Two Wi-Fi adapters (internal + RT3070): the hotspot on the one not in
         # use, so the handheld stays on its network (PC.md: two networks).
@@ -407,6 +449,7 @@ class Feed:
             self.restart_stump("hotspot on")
 
     def join_wifi(self, ssid, password):
+        ssid = self.full_ssids.get(ssid, ssid)
         if not ssid:
             return
         self._nmcli("connection", "down", HOTSPOT_CON)
@@ -447,7 +490,7 @@ class Feed:
                 room = parts[1].strip().lower() or self.want_room
                 text = "|".join(parts[2:]).strip()
                 if not text or st.port is None:
-                    self.busy("THE STUMP ISN'T ANSWERING YET", 2.5)
+                    self.busy("The Stump isn't answering yet", 2.5)
                     return
                 if room != st.room:
                     st.send("/join " + room)
@@ -458,7 +501,7 @@ class Feed:
             elif op == "BOARD_ADD" and len(parts) >= 2:
                 s, t = st.post("/post", json.dumps({"title": parts[1], "body": "|".join(parts[2:])}),
                                "application/json")
-                self.busy("NOTICE POSTED" if s == 201 else "NOTICE: " + _msg(t, s), 2.5)
+                self.busy("Notice posted" if s == 201 else "Notice: " + _msg(t, s), 2.5)
                 self.next_info = 0
             elif op in ("BOARD_DEL", "BOARD_DEL_MULTI") and len(parts) >= 2:
                 ids = [i.strip() for i in parts[1].split(",") if i.strip()]
@@ -477,7 +520,7 @@ class Feed:
                 text += "".join("[%s] %s (%s)\n%s\n\n" % (p.get("id"), p.get("title"), p.get("sig"), p.get("body", ""))
                                 for p in rows)
                 p = self._tf_write("billboard_%s.txt" % time.strftime("%Y%m%d_%H%M%S"), text)
-                self.busy("SAVED %d NOTICE(S) TO TF CARD" % len(rows), 2.5)
+                self.busy("%d notice(s) saved to the TF card" % len(rows), 2.5)
                 log("TF", p)
             elif op == "FILE_BACKUP_TF" and len(parts) >= 2:
                 names = [self.full_names.get(n.strip(), n.strip()) for n in parts[1].split(",") if n.strip()]
@@ -488,31 +531,31 @@ class Feed:
                     if os.path.isfile(src):          # a read-only copy: the Stump's shelf is untouched
                         shutil.copy2(src, os.path.join(TF_DIR, os.path.basename(name)))
                         n += 1
-                self.busy("COPIED %d FILE(S) TO TF CARD" % n, 2.5)
+                self.busy("%d file(s) copied to the TF card" % n, 2.5)
             elif op in ("AP_ON", "AP_OFF", "AP_TOGGLE"):
                 on = (op == "AP_ON") or (op == "AP_TOGGLE" and not self.net["ap"])
-                self.busy("HOTSPOT %s..." % ("ON" if on else "OFF"), 8)
+                self.busy("Hotspot %s\u2026" % ("on" if on else "off"), 8)
                 self.hotspot(on)
                 self.next_net = 0
             elif op == "NET_APPLY" and len(parts) >= 2:
                 if parts[1].strip().upper() == "AP":
-                    self.busy("HOTSPOT ON...", 8)
+                    self.busy("Hotspot on\u2026", 8)
                     self.hotspot(True)
                 else:
                     ssid = parts[2].strip() if len(parts) > 2 else ""
                     if ssid:
-                        self.busy("JOINING %s..." % ssid, 15)
+                        self.busy("Joining %s\u2026" % ssid, 15)
                         self.join_wifi(ssid, parts[3] if len(parts) > 3 else "")
                     else:
-                        self.busy("HOTSPOT OFF...", 8)
+                        self.busy("Hotspot off\u2026", 8)
                         self.hotspot(False)
                 self.next_net = 0
             elif op == "WIFI_SCAN":
-                self.busy("SCANNING WI-FI...", 6)
+                self.busy("Scanning Wi-Fi\u2026", 6)
                 self._nmcli("device", "wifi", "rescan", timeout=15)
                 self.next_net = time.time() + 4
             elif op == "WIFI_JOIN" and len(parts) >= 2:
-                self.busy("JOINING %s..." % parts[1], 15)
+                self.busy("Joining %s\u2026" % parts[1], 15)
                 self.join_wifi(parts[1].strip(), parts[2] if len(parts) > 2 else "")
                 self.next_net = 0
             elif op == "CHAIN_SCAN":
@@ -520,18 +563,18 @@ class Feed:
                 for s in found:
                     log("CHAIN", "%s at %s (%s)" % (s.get("name"), s.get("here") or ",".join(s.get("http") or []),
                                                     s.get("release")))
-                self.busy("%d STUMP(S) ON THIS NETWORK" % len(found), 3)
+                self.busy("%d Stump(s) on this network" % len(found), 3)
                 self.next_info = 0
             elif op == "CHAIN_SET":
                 # The chain is the Stump's own setting, as on every Stump: /admin
                 # (Stump chain) or the setup wizard -- never edited from here.
-                self.busy("SET THE CHAIN IN /admin OR: provisioner.py --pc --reconfigure", 5)
+                self.busy("The chain is set in /admin (or provisioner.py --pc --reconfigure)", 5)
             elif op == "ANNOUNCE":
-                self.busy("THE STUMP ANNOUNCES ITSELF (RADIO UP, NEW STUMPS HEARD)", 3)
+                self.busy("The Stump announces itself on its own (radio up, new Stumps)", 3)
             elif op == "DEBUG_EXPORT_TF":
                 self.export_diagnostics()
             elif op == "DEBUG_HEAL_NET":
-                self.busy("RESTARTING THE STUMP...", 6)
+                self.busy("Restarting the Stump\u2026", 6)
                 self.restart_stump("from the cockpit")
             elif op == "DEBUG_CLEAR_LOGS":
                 _LOG.clear()
@@ -548,7 +591,7 @@ class Feed:
         if not items:
             return
         if not pw:
-            self.busy("SET AN ADMIN PASSWORD (/admin) TO DELETE FROM HERE", 4)
+            self.busy("Set an admin password (/admin) to delete from here", 4)
             return
         body = "&".join("%s=%s" % (field, urllib.parse.quote(i, safe="")) for i in items)
         body += "&admin_pass=" + urllib.parse.quote(pw, safe="")
@@ -566,7 +609,7 @@ class Feed:
         except OSError:
             waiting = []
         if not waiting:
-            self.busy("PUT FILES IN %s FIRST" % DROP_DIR, 4)
+            self.busy("Put files in %s first" % DROP_DIR, 4)
             return
         name = waiting[0][1]
         src = os.path.join(DROP_DIR, name)
@@ -577,9 +620,9 @@ class Feed:
         if s == 200:
             os.makedirs(os.path.join(DROP_DIR, "_shared"), exist_ok=True)
             shutil.move(src, os.path.join(DROP_DIR, "_shared", name))
-            self.busy("SHARED %s" % name, 3)
+            self.busy("Shared %s" % name, 3)
         else:
-            self.busy("SHARE: %s" % _msg(t, s), 4)
+            self.busy("Share: %s" % _msg(t, s), 4)
         self.next_info = 0
 
     def export_diagnostics(self):
@@ -598,7 +641,7 @@ class Feed:
             out.append("stump.log: %s" % e)
         out.append("cockpit feed log:\n" + "\n".join(_LOG))
         p = self._tf_write("diagnostics_%s.txt" % time.strftime("%Y%m%d_%H%M%S"), "\n\n".join(out) + "\n")
-        self.busy("DIAGNOSTICS SAVED TO TF CARD", 3)
+        self.busy("Diagnostics saved to the TF card", 3)
         log("TF", p)
 
     # -- the live file the cockpit reads --
@@ -633,11 +676,11 @@ class Feed:
             below = ch.get("below") or []
             role = ch.get("role") or "member"
             if role == "root":
-                status = "FIRST STUMP · %d BELOW" % len(below)
+                status = "First Stump \u00b7 %d below" % len(below)
             elif up.get("parent_heard_s") is not None:
-                status = "LINKED TO %s (%ds AGO)" % (up.get("parent"), up.get("parent_heard_s"))
+                status = "Linked to %s (heard %ds ago)" % (up.get("parent"), up.get("parent_heard_s"))
             else:
-                status = "LOOKING FOR %s" % (up.get("parent") or "THE STUMP ABOVE")
+                status = "Looking for %s\u2026" % (up.get("parent") or "the Stump above")
             peer_ip = up.get("parent") or ch.get("lan_ip") or ip
             out.append("CHAIN|1|%d|%d|%s|%s|%d|%s|%s" % (1 if role == "root" else 2, 1 if ch.get("secret") else 0,
                                                          "(set in /admin)" if ch.get("secret") else "",
@@ -645,9 +688,14 @@ class Feed:
                                                          len(below) + (1 if up.get("parent_heard_s") is not None else 0),
                                                          clean(peer_ip, 24), clean(status, 56)))
         else:
-            out.append("CHAIN|0|0|0||none|0|%s|NOT IN A CHAIN (SET IT IN /admin)" % ip)
+            out.append("CHAIN|0|0|0||none|0|%s|Not in a chain (set it in /admin)" % ip)
+        # The cockpit sends back the SSID it shows: keep the real one behind it
+        # (a name cut short, or with a character the font lacks, would not join).
+        self.full_ssids = {}
         for w in self.net["ssids"]:
-            out.append("SSID|%d|%d|%s|%s" % (1 if w["active"] else 0, w["signal"], clean(w["sec"], 8), clean(w["ssid"], 28)))
+            shown = clip(clean(screen_line(w["ssid"]), 31), 31)
+            self.full_ssids[shown] = w["ssid"]
+            out.append("SSID|%d|%d|%s|%s" % (1 if w["active"] else 0, w["signal"], clean(w["sec"], 8), shown))
         for i, room in enumerate(ROOMS):
             out.append("ROOM|%d|%s|%d" % (i, room.upper(), self.users[room]))
             for m in self.msgs[room][-10:]:
@@ -655,18 +703,22 @@ class Feed:
                 nick = "*" if sys_ else (m.get("nick") or "?")
                 if m.get("kind") == "dm":
                     nick = "DM " + nick
-                out.append("MSG|%d|%d|%s|%s" % (i, 1 if sys_ else 0, clean(ascii_line(nick), 16),
-                                                clean(ascii_line(m.get("body")), 44)))
+                body = m.get("body")
+                if m.get("kind") == "action":            # /me: "* rod waves", as FireFly shows it
+                    nick, body = "*", "%s %s" % (m.get("nick") or "?", body or "")
+                out.append("MSG|%d|%d|%s|%s" % (i, 1 if sys_ else 0, clip(clean(screen_line(nick), 16), 17),
+                                                clip(clean(screen_line(body), 44), 45)))
         for p in self.board[:8]:
-            out.append("BOARD|%s|%s|%s|%s" % (clean(p.get("id") or "", 24), clean(p.get("sig"), 14),
-                                              clean(p.get("title"), 44), clean(p.get("body"), 48)))
+            out.append("BOARD|%s|%s|%s|%s" % (clean(p.get("id") or "", 24), clip(clean(screen_line(p.get("sig")), 14), 15),
+                                              clip(clean(screen_line(p.get("title")), 44), 45),
+                                              clip(clean(screen_line(p.get("body")), 48), 49)))
         self.full_names = {}
         used = 0
         files = sorted(self.files, key=lambda f: -(f.get("mtime") or 0))
         for f in files:
             used += int(f.get("size") or 0)
         for f in files[:8]:
-            shown = clean(f.get("name"), 35).replace(",", "_")
+            shown = clip(clean(screen_line(f.get("name")), 35), 35).replace(",", "_")
             self.full_names[shown] = f.get("name")
             cat = {"document": "DOC", "image": "IMG", "music": "AUDIO", "video": "VIDEO"}.get(f.get("cat"), "FILE")
             out.append("FILE|%s|%d|%s" % (shown, max(1, int(f.get("size") or 0) // 1024), cat))

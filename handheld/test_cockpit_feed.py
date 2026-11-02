@@ -12,17 +12,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cockpit_feed as F  # noqa: E402
 
 
-class AsciiLine(unittest.TestCase):
-    def test_room_activity_symbols_in_words(self):
-        self.assertEqual(F.ascii_line("✓ rod"), "+ rod joined")
-        self.assertEqual(F.ascii_line("✗ ~rod"), "- rod left")
-        self.assertEqual(F.ascii_line("✎ rod → bob"), "rod is now bob")
-        self.assertEqual(F.ascii_line("✎ #main market at 10"), "#main topic: market at 10")
-        self.assertEqual(F.ascii_line("⊖ ghost"), "no one here is called ghost")
-        self.assertEqual(F.ascii_line("⧗ — slow"), "(slow down) - slow")
+class ScreenLine(unittest.TestCase):
+    def test_with_the_font_text_stays_as_sent(self):
+        self.assertIsNotNone(F.font_chars())                 # cockpit_font.bin is next to the feed
+        self.assertEqual(F.screen_line("\u2713 ~rod"), "\u2713 ~rod")
+        self.assertEqual(F.screen_line("\u270e rod \u2192 bob"), "\u270e rod \u2192 bob")
+        self.assertEqual(F.screen_line("caf\u00e9 \u00e0 Montr\u00e9al"), "caf\u00e9 \u00e0 Montr\u00e9al")
+        self.assertEqual(F.screen_line("LaBuche_Cabin"), "LaBuche_Cabin")      # case kept
 
-    def test_accents_folded_and_rest_dropped(self):
-        self.assertEqual(F.ascii_line("café à Montréal \U0001F332"), "cafe a Montreal ")
+    def test_what_the_font_lacks_is_folded_or_dropped(self):
+        self.assertEqual(F.screen_line("\u29d7 \u2014 slow"), "(slow down) \u2014 slow")
+        self.assertEqual(F.screen_line("tree \U0001F332 \u0103"), "tree  a")
+
+    def test_without_the_font_ascii_and_words(self):
+        old = list(F._FONT_CHARS)
+        F._FONT_CHARS[:] = [None]
+        try:
+            self.assertEqual(F.screen_line("\u2713 rod"), "+ rod joined")
+            self.assertEqual(F.screen_line("\u2717 ~rod"), "- rod left")
+            self.assertEqual(F.screen_line("caf\u00e9"), "cafe")
+        finally:
+            F._FONT_CHARS[:] = old
+
+    def test_clip_cuts_between_characters(self):
+        self.assertEqual(F.clip("\u00e9t\u00e9", 4), "\u00e9t")
+        self.assertEqual(F.clip("abc", 45), "abc")
 
 
 class Fields(unittest.TestCase):
@@ -70,12 +84,20 @@ class Live(unittest.TestCase):
         self.assertEqual(len(chain), 9)
         self.assertEqual(chain[1:4], ["1", "2", "1"])
         self.assertNotIn("secret", chain[4])                       # the secret itself is never shown
-        self.assertIn("MSG|2|1|*|+ rod joined", lines)
+        self.assertIn("MSG|2|1|*|\u2713 rod", lines)
         self.assertIn("MSG|2|0|rod@LaBuche3|hi / there", lines)
         self.assertEqual(get("FILE")[0], "FILE|a_ b.txt|2|DOC")
         self.assertEqual(feed.full_names["a_ b.txt"], "a, b.txt")  # deletes reach the real name
+        chars = F.font_chars()
         for l in lines:
-            self.assertTrue(all(32 <= ord(c) < 127 for c in l), l)
+            self.assertTrue(all(c in chars or c == "|" for c in l), l)   # only what the font can draw
+
+    def test_ssids_shown_map_back_to_the_real_name(self):
+        feed = F.Feed()
+        feed.net["ssids"] = [{"active": False, "signal": 70, "sec": "WPA2", "ssid": "Caf\u00e9 \U0001F332 Guest|5G"}]
+        line = [l for l in feed.live_lines() if l.startswith("SSID|")][0]
+        shown = line.split("|", 4)[4]
+        self.assertEqual(feed.full_ssids[shown], "Caf\u00e9 \U0001F332 Guest|5G")
 
 
 if __name__ == "__main__":

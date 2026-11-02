@@ -28,6 +28,8 @@ which sit **outside** the Stump and talk to it the way any app does:
 | `cockpit_feed.py` | The cockpit's client of the Stump (`/rrc/poll`, `/rrc/send`, `/post`, `/upload`, `/chain.json`…) and of NetworkManager for the hotspot |
 | `stump_r36max_engine.c` | The cockpit (v1.8.8's, minus everything that went around the Stump) |
 | `stump_pygame_display.py` | The KMSDRM presenter from v1.8.8, unchanged |
+| `cockpit_font.bin`, `gen_font.py`, `FONT_LICENSE` | FireFly's font (DejaVu Sans Mono), pre-rendered for the engine |
+| `tests/test_keyboard.c` | The keyboard driven with the R36MAX's real button codes |
 | `sync_app.py` | Regenerates `src/engine/stumpNativeCode.ts` so the web app shows these exact files |
 | `test_cockpit_feed.py` | Tests for the feed |
 
@@ -81,6 +83,37 @@ that's been saved.
 - Logs: `~/Stump/stump.log` (the Stump), `/roms/ports/stump_r36max/cockpit.log` (the cockpit).
 - Stop and start the Stump: `~/Stump/stop-stump.sh` / `~/Stump/start-stump.sh`, or
   `systemctl --user stop|start stump`.
+
+## The look and the keyboard (FireFly's)
+
+The cockpit follows Team FireFly's RK3326 app: its amber palette, its font
+(DejaVu Sans Mono, at FireFly's sizes for a 720 px screen), its header with
+tab pills and a link dot, its keycap hint bar, its chat bubbles, and its
+keyboard, key for key:
+
+| Button | On the keyboard |
+|---|---|
+| D-pad | move |
+| A | type the key |
+| B | delete one character |
+| X | space |
+| Y (or ⇧ on screen) | shift: the next letter in upper case |
+| L / R | page: `abc`, symbols, accents (à é ç ñ ß ✓ → …) |
+| START | send (chat) or OK (Wi-Fi password, chain secret) |
+| SELECT | cancel |
+
+Upper and lower case are real, so a Wi-Fi password is typed, and sent,
+exactly. The password field stops at 63 bytes (the WPA limit).
+
+**A USB keyboard** works too, on the OTG port or on a hub plugged into it:
+Shift, Caps Lock and the usual symbols (`{ } | \ ~` included). On the chat tab
+just start typing: the keyboard view opens with what you type. Enter sends,
+Esc cancels, Backspace deletes.
+
+The font is pre-rendered (`gen_font.py` makes `cockpit_font.bin` from
+`fonts-dejavu-core`; DejaVu's licence is in `FONT_LICENSE`), so the handheld
+needs no font library. Without the file the cockpit falls back to its old
+capitals-only font.
 
 ## Two things a laptop doesn't need
 
