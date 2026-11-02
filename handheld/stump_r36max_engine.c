@@ -1015,7 +1015,7 @@ static void apply_staged_network_revision(void) {
         trigger_chime(880, 85);
     } else {
         g_st.ap_active = false;
-        char cmd[256];
+        char cmd[384];
         const char *pw = (g_st.osk_target == 0 && g_st.input_len > 0) ? g_st.input_buf : g_st.net_staged_pass;
         snprintf(cmd, sizeof(cmd), "NET_APPLY|LAN|%s|%s", g_st.net_staged_ssid, pw);
         send_bridge_cmd(cmd);

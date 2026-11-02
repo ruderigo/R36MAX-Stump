@@ -1,0 +1,89 @@
+# The R36MAX handheld: tests on every push and pull request; on a tag
+# v<VERSION> (handheld/VERSION), the tests, then the GitHub release.
+#
+#   git tag v2.0.0-r36max && git push origin v2.0.0-r36max
+name: handheld
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: handheld-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  test:
+    name: Handheld tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q libasound2-dev shellcheck fonts-dejavu-core
+      - name: run_tests.sh
+        run: bash handheld/tests/run_tests.sh
+
+  stump:
+    name: The feed against a real Stump
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ruderigo/SandBox_Stump_On
+          path: SandBox_Stump_On
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The Stump's packages
+        run: python -m pip install cryptography pyserial
+      - name: test_with_stump.py
+        run: |
+          echo "SandBox_Stump_On $(git -C SandBox_Stump_On log -1 --format='%h %s')"
+          python handheld/tests/test_with_stump.py SandBox_Stump_On
+
+  app:
+    name: Web app
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --legacy-peer-deps --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run build
+      - name: Engine tests
+        run: npx --yes tsx --test src/engine/*.test.ts
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, stump, app]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package
+        run: bash handheld/package.sh --no-tests
+      - name: The package installs from itself
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q libasound2-dev
+          mkdir -p /tmp/x && tar xzf dist/R36MAX-Stump-handheld-*.tar.gz -C /tmp/x
+          cd /tmp/x/R36MAX-Stump-*/handheld
+          bash -n install.sh && bash -n LaBuche_Stump.sh
+          gcc -O2 stump_r36max_engine.c -o stump_r36max_engine -lasound -lpthread -ldl -lm
+          timeout 30 ./stump_r36max_engine --smoke 2>&1 | tail -1 | grep -q "frames cleanly"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/R36MAX-Stump-handheld-*.tar.gz dist/SHA256SUMS \
+            --title "R36MAX Stump $GITHUB_REF_NAME" --notes-file dist/RELEASE_NOTES.md --verify-tag

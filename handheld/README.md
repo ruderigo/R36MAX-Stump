@@ -29,9 +29,32 @@ which sit **outside** the Stump and talk to it the way any app does:
 | `stump_r36max_engine.c` | The cockpit (v1.8.8's, minus everything that went around the Stump) |
 | `stump_pygame_display.py` | The KMSDRM presenter from v1.8.8, unchanged |
 | `cockpit_font.bin`, `gen_font.py`, `FONT_LICENSE` | FireFly's font (DejaVu Sans Mono), pre-rendered for the engine |
+| `VERSION`, `CHANGELOG.md` | The one version number, and what changed in each |
+| `tests/run_tests.sh` | All the tests that need no handheld (run on every push by `.github/workflows/handheld.yml`) |
+| `tests/test_with_stump.py` | Every cockpit command, against a real stock Stump |
 | `tests/test_keyboard.c` | The keyboard driven with the R36MAX's real button codes |
+| `test_cockpit_feed.py` | Unit tests for the feed |
+| `package.sh` | The release tarball, its checksums and notes |
 | `sync_app.py` | Regenerates `src/engine/stumpNativeCode.ts` so the web app shows these exact files |
-| `test_cockpit_feed.py` | Tests for the feed |
+
+## Tests and releases
+
+```sh
+bash handheld/tests/run_tests.sh                       # versions, scripts, feed, font, engine, keyboard, app copy
+bash handheld/tests/run_tests.sh ../SandBox_Stump_On   # ... plus the feed against a real Stump
+```
+
+GitHub runs them on every push and pull request, with the web app's checks.
+To release, set `handheld/VERSION`, add its `## v…` section to
+`CHANGELOG.md` (the tests fail until every file agrees), merge, then:
+
+```sh
+git tag v2.0.0-r36max && git push origin v2.0.0-r36max
+```
+
+The tag runs every test, then publishes a GitHub release with
+`R36MAX-Stump-handheld-<version>.tar.gz` and `SHA256SUMS`. On the handheld:
+`tar xzf` it and run `bash R36MAX-Stump-<version>/handheld/install.sh`.
 
 ## Install (or update)
 
