@@ -47,7 +47,7 @@ else
   cp -rp "$HERE/." "$STAGE/$NAME/handheld/"
 fi
 find "$STAGE" \( -name __pycache__ -o -name '*.pyc' \) -prune -exec rm -rf {} +
-for f in install.sh LaBuche_Stump.sh stump_r36max_engine.c cockpit_feed.py cockpit_font.bin VERSION; do
+for f in install.sh admin_password.py LaBuche_Stump.sh stump_r36max_engine.c cockpit_feed.py cockpit_font.bin VERSION; do
   [ -f "$STAGE/$NAME/handheld/$f" ] || die "$f is missing from the package"
 done
 cp -p "$REPO/LICENSE" "$STAGE/$NAME/" 2>/dev/null || true

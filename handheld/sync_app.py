@@ -14,7 +14,7 @@ OUT = os.path.join(os.path.dirname(HERE), "src", "engine", "stumpNativeCode.ts")
 # (export name, file, id, language, title, summary)
 FILES = [
     ("STUMP_R36MAX_C_SOURCE", "stump_r36max_engine.c", "stump_r36max_c", "c",
-     "Cockpit engine v2.3.0-r36max (720x720, gamepad, QR)",
+     "Cockpit engine v2.4.0-r36max (720x720, gamepad, QR)",
      "The handheld's screen and gamepad: five panels (chats, board, files, network, setup). Reads "
      "/dev/shm/stump_live.txt and sends command lines to cockpit_feed.py; never touches the Stump's "
      "files or the network. The v1.8.8 KMSDRM display fixes are kept."),
@@ -29,7 +29,7 @@ FILES = [
      "(shown), the Stump's AP (any card that supports AP mode, one NetworkManager connection each, "
      "10.42.<slot>.1), or idle. Remember = NetworkManager brings the AP back on replug or at boot."),
     ("STUMP_R36MAX_PORTS_SCRIPT", "LaBuche_Stump.sh", "labuche_stump_sh", "bash",
-     "EmulationStation Ports launcher v2.3.0-r36max (/roms/ports/LaBuche_Stump.sh)",
+     "EmulationStation Ports launcher v2.4.0-r36max (/roms/ports/LaBuche_Stump.sh)",
      "Opens the cockpit on the Stump that runs in the background from boot; SELECT+START returns to "
      "EmulationStation and the Stump keeps running. No firewall flush, no NetworkManager masking."),
     ("STUMP_R36MAX_INSTALL_SH", "install.sh", "install_sh", "bash",

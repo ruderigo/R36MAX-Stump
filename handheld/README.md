@@ -51,7 +51,7 @@ To release, set `handheld/VERSION`, add its `## v…` section to
 `CHANGELOG.md` (the tests fail until every file agrees), merge, then:
 
 ```sh
-git tag v2.3.0-r36max && git push origin v2.3.0-r36max
+git tag v2.4.0-r36max && git push origin v2.4.0-r36max
 ```
 
 The tag runs every test, then publishes a GitHub release with

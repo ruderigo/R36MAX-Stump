@@ -52,6 +52,9 @@ lint_shell() {
 }
 run "shell" lint_shell
 
+step "Its passwords (admin_password.py${1:+, with $1})"
+run "passwords" env ${1:+STUMP_ON="$1"} python3 -I "$HERE/test_admin_password.py"
+
 step "install.sh's options (stops before touching anything)"
 install_options() {
   local out bad=0

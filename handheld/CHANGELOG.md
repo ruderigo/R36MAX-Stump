@@ -5,6 +5,25 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.4.0-r36max
+
+**Its passwords, asked and set.** SandBox_Stump_On's computer wizard
+(`provisioner.py --pc`) doesn't ask for an /admin password: the Stump kept
+the one in that repo's `final_firmware/config.py`, which isn't the
+handheld's own (and installing again with new answers puts it back).
+
+- After the wizard, `install.sh` sets the /admin password with the Stump's
+  own `settings.write_config` (what /admin uses; `config.py.bak` kept):
+  from the answers file's `_admin password` (the RK3326 Provisioner's form),
+  or, over SSH, asked twice, hidden, when it's still the repo's or none.
+- It says whether the /admin password is the Stump's own, and warns when the
+  fserv bot operator's is still the repo's (the wizard asks that one: the
+  Provisioner's form answers it).
+- `admin_password.py`: the state of either password (its own, the repo's,
+  none) and setting it; never printed or put on a command line.
+- Tests: `test_admin_password.py` (with SandBox_Stump_On's real
+  `settings.py` and `config.py` when given).
+
 ## v2.3.0-r36max
 
 **Installed and updated from the RK3326 Provisioner, with the gamepad.**
