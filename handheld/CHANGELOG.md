@@ -5,6 +5,22 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.3.0-r36max
+
+**Installed and updated from the RK3326 Provisioner, with the gamepad.**
+
+- `install.sh --answers FILE.json`: the same install or update, with no one
+  at the keyboard. The file answers SandBox_Stump_On's own wizard
+  (`provisioner.py --pc --answers`, 1.0.0-beta.48 or newer); nothing is read
+  from the keyboard, sudo must not ask for a password (dArkOS's `ark`
+  doesn't), and whatever would ask stops the install with its reason. The
+  RK3326 Provisioner's *This handheld's Stump* writes the file from a form on
+  the screen and runs this.
+- Without `--answers`, nothing changes: the wizard asks over SSH as before.
+- The first install still needs internet (packages, SandBox_Stump_On, the
+  Stump's Python packages); the messages say so when it's missing.
+- Tests: the options (`--answers`, a missing file, an unknown option).
+
 ## v2.2.0-r36max
 
 **Every Wi-Fi card is a limb with a job** (SandBox_RK3326_Stump, docs/PLAN.md).

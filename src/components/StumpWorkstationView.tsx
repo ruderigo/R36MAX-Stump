@@ -587,7 +587,7 @@ export const StumpWorkstationView: React.FC = () => {
       <div className="bg-emerald-950/30 border border-emerald-500/40 rounded-xl p-3.5 flex flex-wrap items-center justify-between gap-3">
         <div>
           <span className="text-[11px] font-mono uppercase tracking-wider text-emerald-400 block font-bold">
-            v2.2.0-r36max · A STOCK PC STUMP, LIKE THE OTHERS + THE 720×720 COCKPIT
+            v2.3.0-r36max · A STOCK PC STUMP, LIKE THE OTHERS + THE 720×720 COCKPIT
           </span>
           <p className="text-xs text-slate-200 mt-0.5">
             The handheld runs SandBox_Stump_On's own{' '}
@@ -604,7 +604,7 @@ export const StumpWorkstationView: React.FC = () => {
             {copiedId === 'fast_update_top' ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
             {copiedId === 'fast_update_top'
               ? 'Copied the install/update command!'
-              : 'Copy install/update command (v2.2.0-r36max)'}
+              : 'Copy install/update command (v2.3.0-r36max)'}
           </button>
           <button
             onClick={() => setSubView('deploy_ssh')}

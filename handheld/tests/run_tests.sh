@@ -52,6 +52,20 @@ lint_shell() {
 }
 run "shell" lint_shell
 
+step "install.sh's options (stops before touching anything)"
+install_options() {
+  local out bad=0
+  out="$(STUMP_INSTALL_PULLED=1 bash "$HERE/install.sh" --what 2>&1)"
+  echo "$out" | grep -q "unknown option: --what" || { echo "an unknown option isn't refused: $out"; bad=1; }
+  out="$(STUMP_INSTALL_PULLED=1 bash "$HERE/install.sh" --answers /nonexistent/answers.json 2>&1)"
+  echo "$out" | grep -q "can't read the answers file /nonexistent/answers.json" || { echo "a missing answers file: $out"; bad=1; }
+  out="$(STUMP_INSTALL_PULLED=1 bash "$HERE/install.sh" --answers 2>&1)"
+  echo "$out" | grep -q "can't read the answers file" || { echo "--answers with no file: $out"; bad=1; }
+  [ "$bad" = 0 ] && echo "refused, nothing done"
+  return "$bad"
+}
+run "install options" install_options
+
 step "The feed (unit tests)"
 run "feed" python3 -I "$HERE/test_cockpit_feed.py"
 

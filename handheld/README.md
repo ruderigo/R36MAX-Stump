@@ -51,7 +51,7 @@ To release, set `handheld/VERSION`, add its `## v…` section to
 `CHANGELOG.md` (the tests fail until every file agrees), merge, then:
 
 ```sh
-git tag v2.2.0-r36max && git push origin v2.2.0-r36max
+git tag v2.3.0-r36max && git push origin v2.3.0-r36max
 ```
 
 The tag runs every test, then publishes a GitHub release with
@@ -78,6 +78,12 @@ Provisioner asks its usual questions**. Answer them as you did for macOS1:
   address → the chain's secret;
 - Heltec: *on USB* if it's plugged in;
 - start at login: **yes**.
+
+**From the gamepad instead** (v2.3.0): the RK3326 Provisioner's *This
+handheld's Stump* asks the same things in a form on the screen and runs
+`install.sh --answers FILE.json`, which hands them to the wizard
+(`provisioner.py --pc --answers`); nothing is typed over SSH. The first
+install still needs internet.
 
 Run the same command again to update. It pulls both repos and re-runs
 `provisioner.py --pc`, which keeps `config.py`, the identity and everything
