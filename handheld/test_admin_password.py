@@ -61,6 +61,22 @@ class AdminPassword(unittest.TestCase):
             self.assertIn("AUTH_ADMIN_PASSWORD = 's3cret-pw'", f.read())
         self.assertTrue(os.path.isfile(os.path.join(self.stump, "config.py.bak")))
 
+    def test_one_password_as_team_stump_means_it(self):
+        """The repo's AUTH_ADMIN_PASSWORD cleared: /admin takes the fserv operator's."""
+        self.assertEqual(self.run_tool("--template", self.template, "state"), "DEFAULT")
+        self.assertEqual(self.run_tool("one", stdin="abc\n"), "SHORT")
+        out = self.run_tool("one", stdin="one-pass\n")
+        self.assertEqual(out, "SET")
+        with open(os.path.join(self.stump, "config.py")) as f:
+            text = f.read()
+        self.assertIn("AUTH_ADMIN_PASSWORD = ''", text)
+        self.assertIn("FSERVBOT_OP_PASSWORD = 'one-pass'", text)
+        self.assertEqual(self.run_tool("--template", self.template, "state"), "EMPTY")
+        self.assertEqual(self.run_tool("--key", "FSERVBOT_OP_PASSWORD", "--template", self.template, "state"), "SET")
+        shutil.copy(self.template, os.path.join(self.stump, "config.py"))
+        self.assertEqual(self.run_tool("clear"), "SET")
+        self.assertEqual(self.run_tool("--template", self.template, "state"), "EMPTY")
+
     def test_set_from_stdin_short_and_nothing(self):
         self.assertEqual(self.run_tool("set", stdin="abc\n"), "SHORT")
         self.assertEqual(self.run_tool("set", stdin="quatre4\n"), "SET")

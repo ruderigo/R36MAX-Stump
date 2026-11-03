@@ -7,20 +7,25 @@ below as its notes.
 
 ## v2.4.0-r36max
 
-**Its passwords, asked and set.** SandBox_Stump_On's computer wizard
-(`provisioner.py --pc`) doesn't ask for an /admin password: the Stump kept
-the one in that repo's `final_firmware/config.py`, which isn't the
-handheld's own (and installing again with new answers puts it back).
+**Its password reaches /admin.** Team Stump's design is one password:
+/admin takes the fserv operator password (which the computer wizard asks)
+unless `AUTH_ADMIN_PASSWORD` is set. But the wizard leaves
+`AUTH_ADMIN_PASSWORD` as SandBox_Stump_On's `final_firmware/config.py` has
+it unless "Change any of those now?" is answered yes, and that file isn't
+blank: the password asked never reached /admin (found on the bench).
 
-- After the wizard, `install.sh` sets the /admin password with the Stump's
-  own `settings.write_config` (what /admin uses; `config.py.bak` kept):
-  from the answers file's `_admin password` (the RK3326 Provisioner's form),
-  or, over SSH, asked twice, hidden, when it's still the repo's or none.
-- It says whether the /admin password is the Stump's own, and warns when the
-  fserv bot operator's is still the repo's (the wizard asks that one: the
-  Provisioner's form answers it).
-- `admin_password.py`: the state of either password (its own, the repo's,
-  none) and setting it; never printed or put on a command line.
+- After the wizard, `install.sh` clears the repo's `AUTH_ADMIN_PASSWORD`
+  when the fserv operator password is set, so /admin takes that one, with
+  the Stump's own `settings.write_config` (what /admin uses;
+  `config.py.bak` kept). Over SSH, with no password of its own yet, it asks
+  one (hidden, twice) for both.
+- A separate /admin password, if wanted, comes from the answers file's
+  `_admin password`.
+- It says which password /admin takes, and warns while either is still the
+  repo's.
+- `admin_password.py`: the state of either password, `one` (the fserv
+  operator's, and /admin's through it), `clear`, `set`; never printed or
+  put on a command line.
 - Tests: `test_admin_password.py` (with SandBox_Stump_On's real
   `settings.py` and `config.py` when given).
 
