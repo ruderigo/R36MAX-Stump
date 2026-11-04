@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.1.0-r36max)
+# install.sh — makes the R36MAX a Stump like any other (v2.2.0-r36max)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -136,12 +136,13 @@ case "$PY_REAL" in
   *) warn "the venv's python is a link to $PY_REAL, not its own copy: not giving it ports <1024"; CAP=0 ;;
 esac
 if [ "$CAP" = 1 ] && [ -d /etc/NetworkManager ]; then
-  # The hotspot (NetworkManager "shared", 10.42.0.1) keeps its DHCP; DNS goes to
-  # the Stump's own captive DNS on :53, as on a CAM's walk-up Wi-Fi.
+  # Every AP (NetworkManager "shared": 10.42.0.1, 10.42.1.1... one per Wi-Fi
+  # card) keeps its DHCP; DNS goes to the Stump's own captive DNS on :53, as
+  # on a CAM's walk-up Wi-Fi. 0.0.0.0 is dnsmasq's "this AP's own address".
   sudo mkdir -p /etc/NetworkManager/dnsmasq-shared.d
-  printf '%s\n' "# R36MAX Stump (R36MAX-Stump/handheld/install.sh): the hotspot's DNS is the Stump's own" \
-                "port=0" "dhcp-option=option:dns-server,10.42.0.1" | sudo tee /etc/NetworkManager/dnsmasq-shared.d/stump.conf >/dev/null
-  ok "hotspot phones use the Stump's DNS (sign-in pop-up)"
+  printf '%s\n' "# R36MAX Stump (R36MAX-Stump/handheld/install.sh): every AP's DNS is the Stump's own" \
+                "port=0" "dhcp-option=option:dns-server,0.0.0.0" | sudo tee /etc/NetworkManager/dnsmasq-shared.d/stump.conf >/dev/null
+  ok "AP phones use the Stump's DNS (sign-in pop-up)"
 fi
 # The screen and gamepad for the user who runs the cockpit: its groups (they
 # apply from the next boot), and the devices opened up now for this boot.
@@ -202,7 +203,7 @@ fi
 # ── 6. The cockpit ──────────────────────────────────────────────────────────
 step "6/6 The cockpit (720x720 screen, gamepad, Ports launcher)"
 mkdir -p "$COCKPIT_DIR"
-cp -f "$HERE/cockpit_feed.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \
+cp -f "$HERE/cockpit_feed.py" "$HERE/limbs.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \
       "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$COCKPIT_DIR/"
 ok "FireFly's font (DejaVu Sans Mono) next to the engine"
 CFLAGS="-O2 -Wall -Wno-format-truncation"

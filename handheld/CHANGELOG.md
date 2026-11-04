@@ -5,6 +5,33 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.2.0-r36max
+
+**Every Wi-Fi card is a limb with a job** (SandBox_RK3326_Stump, docs/PLAN.md).
+The cockpit lists every Wi-Fi card on the handheld, plugged in in any order,
+and gives each one a job: EmulationStation's network (shown, chosen there),
+the Stump's AP, or nothing.
+
+- **An AP on any card that supports AP mode**, the one EmulationStation uses
+  included (it asks first, and says the handheld leaves that network; turning
+  the AP off gives the network back). The card is asked, not a list, so a
+  future card qualifies by itself.
+- **As many APs as cards**, each on its own range (10.42.0.1, 10.42.1.1…),
+  channel (1, 6, 11) and name (`-2`, `-3`…), 5 GHz where the card has it.
+  Every AP hands out its own address for DNS, so each gets the sign-in page.
+- **Remember** (Y on a card): a remembered AP comes back by itself when the
+  card is plugged in again, or at boot, cockpit open or not
+  (NetworkManager's autoconnect, kept per card by its hardware address).
+- **Plugged in?** The cockpit says so and offers the card a job.
+- The NETWORK tab has one row per card (←/→ the job, A apply, Y remember);
+  SETUP shows the result. The old "stage, then apply in SETUP" is gone.
+- v2.0's single hotspot connection (`Stump-Hotspot`) is replaced by the
+  card's own the first time an AP is set.
+- Tests: `test_limbs.py`, with the R36MAX's own `iw` output, a fake `/sys`
+  and a NetworkManager that keeps state (take-over and back, N APs, ranges,
+  5 GHz, remember, hotplug in any order); every character the cockpit draws
+  is checked against its font.
+
 ## v2.1.0-r36max
 
 **The Wi-Fi is EmulationStation's.** The network and its password are

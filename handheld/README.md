@@ -25,6 +25,7 @@ which sit **outside** the Stump and talk to it the way any app does:
 |---|---|
 | `install.sh` | Installs or updates everything, on the handheld |
 | `LaBuche_Stump.sh` | The Ports launcher: opens the cockpit; SELECT+START returns to EmulationStation |
+| `limbs.py` | The Wi-Fi cards and their jobs (EmulationStation's network, an AP, idle), for the feed |
 | `cockpit_feed.py` | The cockpit's client of the Stump (`/rrc/poll`, `/rrc/send`, `/post`, `/upload`, `/chain.json`…) and of NetworkManager for the hotspot |
 | `stump_r36max_engine.c` | The cockpit (v1.8.8's, minus everything that went around the Stump) |
 | `stump_pygame_display.py` | The KMSDRM presenter from v1.8.8, unchanged |
@@ -34,6 +35,7 @@ which sit **outside** the Stump and talk to it the way any app does:
 | `tests/test_with_stump.py` | Every cockpit command, against a real stock Stump |
 | `tests/test_keyboard.c` | The keyboard driven with the R36MAX's real button codes |
 | `test_cockpit_feed.py` | Unit tests for the feed |
+| `test_limbs.py` | The Wi-Fi cards, with the R36MAX's own `iw` output, a fake `/sys` and NetworkManager |
 | `package.sh` | The release tarball, its checksums and notes |
 | `sync_app.py` | Regenerates `src/engine/stumpNativeCode.ts` so the web app shows these exact files |
 
@@ -49,7 +51,7 @@ To release, set `handheld/VERSION`, add its `## v…` section to
 `CHANGELOG.md` (the tests fail until every file agrees), merge, then:
 
 ```sh
-git tag v2.1.0-r36max && git push origin v2.1.0-r36max
+git tag v2.2.0-r36max && git push origin v2.2.0-r36max
 ```
 
 The tag runs every test, then publishes a GitHub release with
@@ -96,12 +98,17 @@ that's been saved.
   Stump uses whatever network the handheld is on and follows a change by
   itself (new address, announced to the other Stumps, chain parent found
   again). The cockpit shows that network; it doesn't join or change networks.
-- **Hotspot** (NETWORK/SETUP panels): an open Wi-Fi named `PC_HOTSPOT_NAME`
-  (from `config.py`) at `10.42.0.1`, which is the Linux hotspot in `docs/PC.md`.
-  It only goes on an adapter EmulationStation's Wi-Fi isn't using (the RT3070
-  next to the internal one), so the handheld stays on its network; with one
-  adapter in use it says so and does nothing. The Stump restarts to pick up
-  the address.
+- **Wi-Fi cards and their jobs** (NETWORK tab): every Wi-Fi card on the
+  handheld, plugged in in any order, is listed with its job:
+  *Local LAN (ES)* (EmulationStation's network, shown), *AP 2.4 GHz* /
+  *AP 5 GHz* (the Stump's open Wi-Fi with its sign-in page), or *Idle*.
+  ←/→ chooses a job, A applies it (it asks first, and says when the handheld
+  would leave its network), Y remembers it: a remembered AP comes back by
+  itself when the card is plugged in again, or at boot. Any card that supports
+  AP mode can be an AP, the Blueway included, and as many as there are cards:
+  the first at `10.42.0.1` (`PC_HOTSPOT_NAME`), the next at `10.42.1.1`
+  (`…-2`) and so on, each on its own channel. The Stump restarts when the APs
+  change, to answer the sign-in page on the right address.
 - **Sharing files:** put them in `/roms/ports/stump_r36max/drop/` (on the TF
   card), then FILES → share. Each file goes through the Stump's own `/upload`.
   Files the old v1.x node had shared were copied there for you.
