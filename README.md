@@ -1,6 +1,3 @@
-> **Sandbox.** This is where the RK3326 (R36MAX) Stump is iterated on. Releases are made in
-> [R36MAX-Stump](https://github.com/ruderigo/R36MAX-Stump). Current work: [docs/PLAN.md](docs/PLAN.md).
-
 # R36MAX Stump
 
 <img width="300" height="400" alt="r36MAX_Stump" src="https://github.com/user-attachments/assets/75b1b8cb-2e83-4600-9b95-d44c42bc2c31" />
@@ -20,7 +17,7 @@ installer that sets it all up.
 
 | | |
 |---|---|
-| **Latest release** | [v2.0.0-r36max](https://github.com/ruderigo/R36MAX-Stump/releases/latest) |
+| **Latest release** | [v2.4.0-r36max](https://github.com/ruderigo/R36MAX-Stump/releases/latest) |
 | **Handheld details** | [handheld/README.md](handheld/README.md): how it works, controls, tests, releases |
 | **Changes** | [handheld/CHANGELOG.md](handheld/CHANGELOG.md) |
 
