@@ -5,6 +5,46 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.4.0-r36max
+
+**Its password reaches /admin.** Team Stump's design is one password:
+/admin takes the fserv operator password (which the computer wizard asks)
+unless `AUTH_ADMIN_PASSWORD` is set. But the wizard leaves
+`AUTH_ADMIN_PASSWORD` as SandBox_Stump_On's `final_firmware/config.py` has
+it unless "Change any of those now?" is answered yes, and that file isn't
+blank: the password asked never reached /admin (found on the bench).
+
+- After the wizard, `install.sh` clears the repo's `AUTH_ADMIN_PASSWORD`
+  when the fserv operator password is set, so /admin takes that one, with
+  the Stump's own `settings.write_config` (what /admin uses;
+  `config.py.bak` kept). Over SSH, with no password of its own yet, it asks
+  one (hidden, twice) for both.
+- A separate /admin password, if wanted, comes from the answers file's
+  `_admin password`.
+- It says which password /admin takes, and warns while either is still the
+  repo's.
+- `admin_password.py`: the state of either password, `one` (the fserv
+  operator's, and /admin's through it), `clear`, `set`; never printed or
+  put on a command line.
+- Tests: `test_admin_password.py` (with SandBox_Stump_On's real
+  `settings.py` and `config.py` when given).
+
+## v2.3.0-r36max
+
+**Installed and updated from the RK3326 Provisioner, with the gamepad.**
+
+- `install.sh --answers FILE.json`: the same install or update, with no one
+  at the keyboard. The file answers SandBox_Stump_On's own wizard
+  (`provisioner.py --pc --answers`, 1.0.0-beta.48 or newer); nothing is read
+  from the keyboard, sudo must not ask for a password (dArkOS's `ark`
+  doesn't), and whatever would ask stops the install with its reason. The
+  RK3326 Provisioner's *This handheld's Stump* writes the file from a form on
+  the screen and runs this.
+- Without `--answers`, nothing changes: the wizard asks over SSH as before.
+- The first install still needs internet (packages, SandBox_Stump_On, the
+  Stump's Python packages); the messages say so when it's missing.
+- Tests: the options (`--answers`, a missing file, an unknown option).
+
 ## v2.2.0-r36max
 
 **Every Wi-Fi card is a limb with a job** (SandBox_RK3326_Stump, docs/PLAN.md).

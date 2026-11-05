@@ -1,11 +1,19 @@
 #!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.2.0-r36max)
+# install.sh — makes the R36MAX a Stump like any other (v2.4.0-r36max)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
 #   bash ~/R36MAX-Stump/handheld/install.sh
 # Run it again to update (it pulls both repos and re-runs the Stump's own update).
+#
+# With nobody at the keyboard (the RK3326 Provisioner's "This handheld's
+# Stump", from the gamepad):
+#   bash install.sh --answers FILE.json
+# FILE.json answers SandBox_Stump_On's wizard (provisioner.py --pc --answers,
+# 1.0.0-beta.48 or newer; --pc --answers-template lists the questions). Nothing
+# is read from the keyboard: sudo must work without a password (dArkOS's ark
+# has it), and anything that would ask stops the install with its reason.
 #
 # What it does:
 #   1. Packages: git, python3-venv, gcc + ALSA headers, NetworkManager, iw, pygame.
@@ -36,13 +44,31 @@ ok()   { printf '    \033[32m✓\033[0m %s\n' "$*"; }
 warn() { printf '    \033[31m!\033[0m %s\n' "$*"; }
 die()  { printf '\n\033[31m[x] %s\033[0m\n' "$*"; exit 1; }
 
+ANSWERS=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --answers) ANSWERS="${2:-}"; [ -n "$ANSWERS" ] || die "can't read the answers file: none given"; shift 2 ;;
+    --answers=*) ANSWERS="${1#--answers=}"; shift ;;
+    *) die "unknown option: $1 (only --answers FILE.json)" ;;
+  esac
+done
+if [ -n "$ANSWERS" ]; then
+  case "$ANSWERS" in /*) ;; *) ANSWERS="$PWD/$ANSWERS" ;; esac
+  [ -r "$ANSWERS" ] || die "can't read the answers file $ANSWERS"
+  exec </dev/null                 # nothing is ever read from the keyboard
+fi
 [ "$MY_UID" -eq 0 ] && die "Run this as your user (ark), not root: it asks for sudo when it needs it."
 # This repo first (an update), then start again on the new copy of this script.
 if [ -z "${STUMP_INSTALL_PULLED:-}" ] && [ -d "$REPO/.git" ]; then
   git -C "$REPO" pull --ff-only -q 2>/dev/null || true
-  STUMP_INSTALL_PULLED=1 exec bash "$HERE/install.sh" "$@"
+  if [ -n "$ANSWERS" ]; then STUMP_INSTALL_PULLED=1 exec bash "$HERE/install.sh" --answers "$ANSWERS"; fi
+  STUMP_INSTALL_PULLED=1 exec bash "$HERE/install.sh"
 fi
-sudo -v || die "sudo is needed for packages and the hotspot settings."
+if [ -n "$ANSWERS" ]; then
+  sudo -n true 2>/dev/null || die "sudo asks for a password here: with --answers it must not (run install.sh over SSH instead)"
+else
+  sudo -v || die "sudo is needed for packages and the hotspot settings."
+fi
 
 # ── 1. packages ──────────────────────────────────────────────────────────────
 step "1/6 Packages"
@@ -60,7 +86,8 @@ if ! "$HOME/firefly/venv/bin/python" -c "import pygame" >/dev/null 2>&1 && ! pyt
 fi
 if [ -n "$NEED" ]; then
   echo "    installing:$NEED"
-  sudo apt-get update -q && sudo apt-get install -y -q $NEED || die "apt-get couldn't install:$NEED"
+  sudo apt-get update -q && sudo apt-get install -y -q $NEED \
+    || die "apt-get couldn't install:$NEED (the first install needs internet)"
   sudo apt-get clean
 fi
 ok "packages ready"
@@ -70,7 +97,7 @@ step "2/6 SandBox_Stump_On (the Stump firmware and its Provisioner)"
 if [ -d "$SANDBOX/.git" ]; then
   git -C "$SANDBOX" pull --ff-only || warn "couldn't update $SANDBOX (keeping what's there)"
 else
-  git clone --depth 1 "$SANDBOX_URL" "$SANDBOX" || die "couldn't clone $SANDBOX_URL"
+  git clone --depth 1 "$SANDBOX_URL" "$SANDBOX" || die "couldn't clone $SANDBOX_URL (the first install needs internet)"
 fi
 ok "$(cd "$SANDBOX" && git log -1 --format='%h %s' | cut -c1-70)"
 
@@ -111,15 +138,62 @@ if [ ! -x "$STUMP_DIR/venv/bin/python" ]; then
   mkdir -p "$STUMP_DIR"
   python3 -m venv --copies "$STUMP_DIR/venv" || die "python3 -m venv failed (sudo apt install python3-venv)"
 fi
-echo
-echo "    The Provisioner asks its questions now. Answer them as for macOS1:"
-echo "      folder: $STUMP_DIR  ·  chain: 'Joins another Stump's Wi-Fi' -> 'On the Wi-Fi it's on now'"
-echo "      -> LaBuche3's address -> the chain's secret  ·  Heltec: 'on USB' if it's plugged in"
-echo "      ·  start at login: yes"
-echo
-(cd "$SANDBOX" && python3 provisioner.py --pc "$STUMP_DIR") || die "provisioner.py --pc stopped (its message is above)"
+if [ -n "$ANSWERS" ]; then
+  grep -q -- "--answers" "$SANDBOX/provisioner.py" \
+    || die "this SandBox_Stump_On is older than 1.0.0-beta.48: it can't take answers from a file (update it with internet)"
+  (cd "$SANDBOX" && python3 provisioner.py --pc "$STUMP_DIR" --answers "$ANSWERS") \
+    || die "provisioner.py --pc --answers stopped (its message is above)"
+else
+  echo
+  echo "    The Provisioner asks its questions now. Answer them as for macOS1:"
+  echo "      folder: $STUMP_DIR  ·  chain: 'Joins another Stump's Wi-Fi' -> 'On the Wi-Fi it's on now'"
+  echo "      -> LaBuche3's address -> the chain's secret  ·  Heltec: 'on USB' if it's plugged in"
+  echo "      ·  start at login: yes"
+  echo
+  (cd "$SANDBOX" && python3 provisioner.py --pc "$STUMP_DIR") || die "provisioner.py --pc stopped (its message is above)"
+fi
 [ -f "$STUMP_DIR/stump_pc.py" ] || die "no Stump in $STUMP_DIR after the Provisioner"
 ok "the Stump is in $STUMP_DIR"
+
+# Its password. Team Stump's design is one: /admin takes the fserv operator
+# password (which the wizard asks) unless AUTH_ADMIN_PASSWORD is set. But the
+# wizard leaves AUTH_ADMIN_PASSWORD as SandBox_Stump_On's config.py has it
+# unless "Change any of those now?" gets a yes, and that file's isn't blank:
+# the one password then never reaches /admin. So: the repo's is cleared (or,
+# with no fserv password, one is asked over SSH), a separate one from the
+# answers file's "_admin password" is set; never printed.
+ADMIN_PY=("$STUMP_DIR/venv/bin/python" "$HERE/admin_password.py" --stump "$STUMP_DIR")
+TEMPLATE="$SANDBOX/final_firmware/config.py"
+if [ -n "$ANSWERS" ]; then
+  case "$("${ADMIN_PY[@]}" --answers "$ANSWERS")" in
+    SET) ok "a separate /admin password is set (from the answers)" ;;
+    SHORT) warn "the /admin password in the answers is under 4 characters: not set" ;;
+  esac
+fi
+ADMIN="$("${ADMIN_PY[@]}" --template "$TEMPLATE" state)"
+OPPW="$("${ADMIN_PY[@]}" --key FSERVBOT_OP_PASSWORD --template "$TEMPLATE" state)"
+if [ "$ADMIN" = DEFAULT ] && [ "$OPPW" = SET ]; then
+  [ "$("${ADMIN_PY[@]}" clear)" = SET ] && { ok "/admin takes its fserv operator password (one password; SandBox_Stump_On's was left in config.py)"; ADMIN=EMPTY; }
+fi
+if { [ "$ADMIN" = DEFAULT ] || [ "$OPPW" = DEFAULT ] || { [ "$ADMIN" = EMPTY ] && [ "$OPPW" != SET ]; }; } \
+   && [ -z "$ANSWERS" ] && [ -t 0 ]; then
+  echo "    Its password (for /admin and the fserv bot): none of its own yet."
+  for _ in 1 2 3; do
+    read -rsp "    Its password (4+ characters): " P1; echo
+    read -rsp "    Again: " P2; echo
+    if [ "$P1" != "$P2" ]; then warn "they differ"; continue; fi
+    if [ "${#P1}" -lt 4 ]; then warn "4 characters or more"; continue; fi
+    [ "$(printf '%s\n' "$P1" | "${ADMIN_PY[@]}" one)" = SET ] && { ok "its password is set"; ADMIN=EMPTY; OPPW=SET; }
+    break
+  done
+  unset P1 P2
+fi
+if [ "$ADMIN" = SET ] || [ "$OPPW" = SET ] && [ "$ADMIN" != DEFAULT ]; then
+  ok "/admin's password is its own$([ "$ADMIN" = SET ] && echo " (a separate one)" || echo " (its fserv operator password)")"
+else
+  warn "/admin's password isn't its own yet: set it (RK3326 Provisioner: This handheld's Stump -> Its password, or run this over SSH)"
+fi
+[ "$OPPW" = DEFAULT ] && warn "the fserv operator password is still SandBox_Stump_On's: set one (RK3326 Provisioner: This handheld's Stump -> Its password)"
 
 # ── 5. Walk-up extras, outside the Stump ────────────────────────────────────
 step "5/6 Ports 80 and 53 for the Stump's own Python, and the hotspot's captive DNS"

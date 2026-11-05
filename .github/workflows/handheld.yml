@@ -85,5 +85,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # From the sandbox, a pre-release: the RK3326 Provisioner offers it as "Sandbox"
+          # (R36MAX-Stump's releases are the official ones).
+          PRE=""; [ "${GITHUB_REPOSITORY#*/}" = "SandBox_RK3326_Stump" ] && PRE="--prerelease"
           gh release create "$GITHUB_REF_NAME" dist/R36MAX-Stump-handheld-*.tar.gz dist/SHA256SUMS \
-            --title "R36MAX Stump $GITHUB_REF_NAME" --notes-file dist/RELEASE_NOTES.md --verify-tag
+            --title "R36MAX Stump $GITHUB_REF_NAME" --notes-file dist/RELEASE_NOTES.md --verify-tag $PRE
