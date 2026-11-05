@@ -1,3 +1,6 @@
+> **Sandbox.** This is where the RK3326 (R36MAX) Stump is iterated on. Releases are made in
+> [R36MAX-Stump](https://github.com/ruderigo/R36MAX-Stump). Current work: [docs/PLAN.md](docs/PLAN.md).
+
 # R36MAX Stump
 
 <img width="300" height="400" alt="r36MAX_Stump" src="https://github.com/user-attachments/assets/75b1b8cb-2e83-4600-9b95-d44c42bc2c31" />
