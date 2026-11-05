@@ -1,7 +1,7 @@
 # The R36MAX handheld: tests on every push and pull request; on a tag
 # v<VERSION> (handheld/VERSION), the tests, then the GitHub release.
 #
-#   git tag v2.0.0-r36max && git push origin v2.0.0-r36max
+#   git tag v2.1.0-r36max && git push origin v2.1.0-r36max
 name: handheld
 
 on:

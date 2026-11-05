@@ -94,10 +94,59 @@ class Live(unittest.TestCase):
 
     def test_ssids_shown_map_back_to_the_real_name(self):
         feed = F.Feed()
-        feed.net["ssids"] = [{"active": False, "signal": 70, "sec": "WPA2", "ssid": "Caf\u00e9 \U0001F332 Guest|5G"}]
+        feed.net["ssids"] = [{"active": True, "signal": 70, "sec": "WPA2", "ssid": "Caf\u00e9 \U0001F332 Guest|5G"}]
         line = [l for l in feed.live_lines() if l.startswith("SSID|")][0]
         shown = line.split("|", 4)[4]
         self.assertEqual(feed.full_ssids[shown], "Caf\u00e9 \U0001F332 Guest|5G")
+
+
+class FakeNM:
+    """nmcli as the feed sees it: two adapters, wlan0 on EmulationStation's network."""
+    def __init__(self, devices):
+        self.devices, self.calls = devices, []
+
+    def __call__(self, *args, timeout=25):
+        self.calls.append(args)
+        if args[:4] == ("-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"):
+            return True, "\n".join(self.devices)
+        if "wifi" in args and "list" in args:
+            return True, "*:81:WPA2:Bob\\:s house\n :60:WPA2:Neighbour\n :40::Cafe"
+        return True, ""
+
+
+class EmulationStationWifi(unittest.TestCase):
+    """The Wi-Fi is EmulationStation's: shown, never chosen or taken over."""
+    def feed(self, devices):
+        feed = F.Feed()
+        feed._nmcli = FakeNM(devices)
+        feed.restart_stump = lambda why: None
+        return feed
+
+    def test_only_the_network_the_handheld_is_on_is_shown(self):
+        feed = self.feed(["wlan0:wifi:connected:Bob's house", "wlan1:wifi:disconnected:"])
+        feed.refresh_net()
+        self.assertEqual([w["ssid"] for w in feed.net["ssids"]], ["Bob:s house"])
+
+    def test_join_and_scan_never_touch_the_network(self):
+        feed = self.feed(["wlan0:wifi:connected:Bob's house"])
+        for cmd in ("WIFI_JOIN|Neighbour|secret", "WIFI_SCAN", "NET_APPLY|LAN|Neighbour|secret"):
+            feed.handle(cmd)
+        sent = [a for a in feed._nmcli.calls if "connect" in a or "add" in a or "modify" in a]
+        self.assertEqual(sent, [])
+        self.assertNotIn("secret", repr(feed._nmcli.calls))
+
+    def test_hotspot_goes_on_the_free_adapter(self):
+        feed = self.feed(["wlan0:wifi:connected:Bob's house", "wlan1:wifi:disconnected:"])
+        feed.hotspot(True)
+        add = [a for a in feed._nmcli.calls if a[:2] == ("connection", "add")]
+        self.assertEqual(len(add), 1)
+        self.assertEqual(add[0][add[0].index("ifname") + 1], "wlan1")
+
+    def test_hotspot_never_takes_emulationstations_adapter(self):
+        feed = self.feed(["wlan0:wifi:connected:Bob's house"])
+        feed.hotspot(True)
+        self.assertEqual([a for a in feed._nmcli.calls if a[:2] in (("connection", "add"), ("connection", "up"))], [])
+        self.assertIn("EmulationStation", feed.busy_msg)
 
 
 if __name__ == "__main__":

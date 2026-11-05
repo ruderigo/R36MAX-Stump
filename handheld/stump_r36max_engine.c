@@ -1,6 +1,6 @@
 /*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.0.0-r36max.
+ * (RK3326 / dArkOS), v2.1.0-r36max.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -48,7 +48,9 @@
 #define IPC_UDP_PORT    42421
 
 #define LIVE_STATE_FILE "/dev/shm/stump_live.txt"
+#ifndef CMD_QUEUE_FILE                   /* a test can point it elsewhere */
 #define CMD_QUEUE_FILE  "/dev/shm/stump_cmd.txt"
+#endif
 #define SHM_FB_FILE     "/dev/shm/stump_fb.rgba"
 
 #define SDL_INIT_VIDEO              0x00000020u
@@ -702,7 +704,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.0.0-r36max"
+#define STUMP_ENGINE_VERSION "v2.1.0-r36max"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 10
 #define MAX_DBG_LINES 16
@@ -799,17 +801,15 @@ typedef struct {
     int             qr_mode;       /* 0 = HTTP Portal URL QR, 1 = WIFI Auto-Join QR */
     WifiSsidItem    wifi_list[6];
     int             wifi_count;
-    int             wifi_cursor;   /* 0 = Stage Radio Mode, 1 = Wi-Fi Tool Bar, 2.. = Stage SSID */
-    int             wifi_bar_mode; /* 0 = SCAN WIFI, 1 = SWITCH QR MODE, 2 = PASSWORD OSK */
+    int             wifi_cursor;   /* 0 = Stage Radio Mode, 1 = Wi-Fi Tool Bar, 2.. = the Wi-Fi (EmulationStation's, shown only) */
+    int             wifi_bar_mode; /* network tab tool: 0 = chain secret, 1 = find Stumps */
     char            wifi_status_msg[80];
     /* Staged Network Settings Revision (Panel 4 & Panel 5) */
     bool            net_staged_init;
     bool            net_staged_dirty;
     bool            net_staged_ap;
     char            net_staged_ssid[32];
-    char            net_staged_pass[64];
-    int             net_ssid_cycle_idx;
-    int             rev_cursor;    /* Panel 5 rows: 0=Mode, 1=SSID, 2=ChainSecret/Role, 3=Apply/Revert, 4=ToolBar, 5=Logs */
+    int             rev_cursor;    /* Panel 5 rows: 0=Mode, 1=Wi-Fi (shown), 2=ChainSecret/Role, 3=Apply/Revert, 4=ToolBar, 5=Logs */
     int             debug_bar_mode;/* 0 = SCAN & LINK LAN CHAIN, 1 = EDIT CHAIN SECRET, 2 = EXPORT DIAG->TF, 3 = HEAL HTTP */
     int             debug_scroll;
     char            debug_logs[MAX_DBG_LINES][64];
@@ -992,7 +992,6 @@ static void revert_staged_network_revision(void) {
             break;
         }
     }
-    g_st.net_staged_pass[0] = '\0';
     g_st.net_staged_dirty = false;
     g_st.net_staged_init = true;
 }
@@ -1014,19 +1013,12 @@ static void apply_staged_network_revision(void) {
                  "HOTSPOT ON: %.40s", g_st.ap_ssid[0] ? g_st.ap_ssid : "STUMP");
         trigger_chime(880, 85);
     } else {
+        /* Hotspot off: the handheld stays on EmulationStation's Wi-Fi (chosen there). */
         g_st.ap_active = false;
-        char cmd[384];
-        const char *pw = (g_st.osk_target == 0 && g_st.input_len > 0) ? g_st.input_buf : g_st.net_staged_pass;
-        snprintf(cmd, sizeof(cmd), "NET_APPLY|LAN|%s|%s", g_st.net_staged_ssid, pw);
-        send_bridge_cmd(cmd);
+        send_bridge_cmd("NET_APPLY|LAN");
         g_st.suppress_poll_frames = 300;
-        char bmsg[64];
-        snprintf(bmsg, sizeof(bmsg), "IN PROCESS: APPLYING LOCAL LAN (%.22s)...",
-                 g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "SAVED DHCP");
-        set_ui_busy(bmsg, 5200);
-        snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg),
-                 "LAN APPLIED: %.26s",
-                 g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "SAVED DHCP");
+        set_ui_busy("Hotspot off: on EmulationStation's Wi-Fi", 5200);
+        snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "HOTSPOT OFF");
         trigger_chime(784, 80);
     }
     g_st.net_staged_dirty = false;
@@ -1042,9 +1034,7 @@ static void open_network_revision_confirm(void) {
         snprintf(g_st.confirm_label, sizeof(g_st.confirm_label),
                  "HOTSPOT: %.40s", g_st.ap_ssid[0] ? g_st.ap_ssid : "STUMP");
     } else {
-        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label),
-                 "LOCAL LAN WIFI: %s",
-                 g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "SAVED WIFI DHCP");
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "Hotspot off (EmulationStation's Wi-Fi stays)");
     }
     trigger_chime(660, 45);
 }
@@ -1058,42 +1048,18 @@ static void action_wifi_tab_confirm(void) {
         set_ui_busy("Staged: apply it in SETUP (A), or B to cancel", 2200);
         trigger_chime(740, 55);
     } else if (g_st.wifi_cursor == 1) {
-        /* Row 1: Utility Toggle Bar (0=Set Chain Secret OSK, 1=Scan LAN Chain, 2=Rescan Wi-Fi, 3=Wi-Fi Pass OSK) */
-        int m = g_st.wifi_bar_mode % 4;
-        if (m == 0) {
+        /* Row 1: the tools (0 = chain secret, 1 = find Stumps on this network) */
+        if (g_st.wifi_bar_mode % 2 == 0) {
             open_chain_secret_osk();
-        } else if (m == 1) {
+        } else {
             send_bridge_cmd("CHAIN_SCAN");
             set_ui_busy("Looking for Stumps on this network…", 3000);
             trigger_chime(880, 65);
-        } else if (m == 2) {
-            send_bridge_cmd("WIFI_SCAN");
-            set_ui_busy("Scanning Wi-Fi…", 4000);
-            snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "SCANNING 2.4GHZ WIFI NETWORKS...");
-            trigger_chime(700, 50);
-        } else {
-            g_st.osk_target = 0;
-            g_st.input_len = (int)strlen(g_st.net_staged_pass);
-            snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%s", g_st.net_staged_pass);
-            g_st.osk_open = !g_st.osk_open;
-            trigger_chime(g_st.osk_open ? 740 : 520, 45);
         }
-    } else if (g_st.wifi_cursor - 2 < g_st.wifi_count) {
-        /* Rows 2..: Stage selected Wi-Fi SSID (+ optional password) into Panel 5 for revision! */
-        int widx = g_st.wifi_cursor - 2;
-        g_st.net_staged_ap = false;
-        snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s", g_st.wifi_list[widx].ssid);
-        if (g_st.input_len > 0 && g_st.osk_target == 0) {
-            snprintf(g_st.net_staged_pass, sizeof(g_st.net_staged_pass), "%.63s", g_st.input_buf);
-        }
-        g_st.net_staged_dirty = true;
-        g_st.osk_open = false;
-        g_st.tab_idx = 4;
-        g_st.rev_cursor = 3; /* Jump to Panel 5 [APPLY REVISION] row */
-        char bmsg[64];
-        snprintf(bmsg, sizeof(bmsg), "STAGED LAN SSID %.22s -> REVIEW IN PANEL 5", g_st.net_staged_ssid);
-        set_ui_busy(bmsg, 2400);
-        trigger_chime(780, 60);
+    } else {
+        /* Rows 2..: the network EmulationStation is on. It's chosen there, not here. */
+        set_ui_busy("Wi-Fi is set in EmulationStation: the Stump follows it", 2600);
+        trigger_chime(520, 30);
     }
 }
 
@@ -1104,13 +1070,6 @@ static void send_typed_chat(void) {
         g_st.osk_target = 0;
         g_st.input_len = 0;
         g_st.input_buf[0] = '\0';
-        return;
-    }
-    if (g_st.tab_idx == 3) {
-        snprintf(g_st.net_staged_pass, sizeof(g_st.net_staged_pass), "%.63s", g_st.input_buf);
-        g_st.osk_open = false;
-        set_ui_busy("Wi-Fi password staged", 1500);
-        trigger_chime(740, 45);
         return;
     }
     if (g_st.input_len <= 0) return;
@@ -1753,8 +1712,8 @@ static void update_qr_if_needed(void) {
  * pushed screen does): A key, B delete, X space, Y shift, L/R page, START
  * send/OK, SELECT cancel, the D-pad to move; a USB keyboard types too. Real
  * lower and upper case, symbols and accents: what you type is what is sent
- * (a Wi-Fi password keeps its exact case). Done, it hands the text to
- * send_typed_chat(), which knows the purpose (chat, Wi-Fi password, chain). */
+ * (a chain secret keeps its exact case). Done, it hands the text to
+ * send_typed_chat(), which knows the purpose (chat or chain secret). */
 static const char *CMP_PAGES[3][4] = {
     { "1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm,.?" },
     { "!@#$%&*()-", "_=+/\\:;\"<>", "[]{}~`|^€£", "°±×÷…«»¿¡·" },
@@ -1794,7 +1753,6 @@ static bool cmp_is_chat(void) { return g_st.tab_idx != 3 && g_st.tab_idx != 4 &&
 static const char *cmp_send_label(void) { return cmp_is_chat() ? "SEND" : "OK"; }
 static int cmp_max_bytes(void) {
     if (g_st.osk_target == 1 || g_st.tab_idx == 4) return 50;    /* chain secret */
-    if (g_st.tab_idx == 3) return 63;                             /* WPA passphrase: 8..63 */
     return 295;                                                   /* one LoRa packet's text */
 }
 static int cmp_row_len(int r) { return r < 4 ? utf8_count(CMP_PAGES[g_cmp.page][r]) : 5; }
@@ -1824,7 +1782,7 @@ static void cmp_close(bool keep) {
 
 static void cmp_finish(void) {
     if (g_st.input_len <= 0 && cmp_is_chat()) { cmp_close(false); return; }
-    send_typed_chat();                 /* chat line, Wi-Fi password or chain secret, by purpose */
+    send_typed_chat();                 /* chat line or chain secret, by purpose */
     cmp_close(false);
 }
 
@@ -1937,8 +1895,6 @@ static void compose_draw(uint32_t *fb, const ThemeColors *th) {
     int line = cline(F24);
     char title[96];
     if (g_st.osk_target == 1 || g_st.tab_idx == 4) snprintf(title, sizeof(title), "Chain secret");
-    else if (g_st.tab_idx == 3) snprintf(title, sizeof(title), "Wi-Fi password%s%.40s",
-                                         g_st.net_staged_ssid[0] ? ": " : "", g_st.net_staged_ssid);
     else {
         const char *rooms[3] = { "#main", "#lora-mesh", "#wifi-mesh" };
         snprintf(title, sizeof(title), "To %s", rooms[g_st.room_idx % 3]);
@@ -2029,7 +1985,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.0.0-r36max");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.1.0-r36max");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -2043,7 +1999,7 @@ int main(int argc, char **argv) {
     snprintf(g_st.ap_ssid, sizeof(g_st.ap_ssid), "Stump");
     snprintf(g_st.ap_mac, sizeof(g_st.ap_mac), "00:0f:00:5e:11:ee");
     snprintf(g_st.ap_driver, sizeof(g_st.ap_driver), "rt2800usb");
-    snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "STAGE IN PANEL 4 -> APPLY IN PANEL 5 ([A]=ACCEPT [B]=CANCEL)");
+    snprintf(g_st.wifi_status_msg, sizeof(g_st.wifi_status_msg), "Wi-Fi: EmulationStation's");
 
     scan_transports(&g_st.net);
     poll_live_bridge();
@@ -2349,7 +2305,7 @@ int main(int argc, char **argv) {
                                 }
                                 if (g_st.tab_idx == 4) {
                                     g_st.osk_target = 1;
-                                } else if (g_st.tab_idx != 0 && g_st.tab_idx != 3) {
+                                } else if (g_st.tab_idx != 0) {
                                     g_st.tab_idx = 0;
                                     g_st.osk_target = 0;
                                 }
@@ -2550,15 +2506,7 @@ int main(int argc, char **argv) {
                                 }
                                 else if (ev.code == 307) { input_backspace(); trigger_chime(420, 25); }
                             } else if (ev.code == 308) {
-                                if (g_st.wifi_cursor >= 2) {
-                                    g_st.osk_target = 0;
-                                    g_st.input_len = (int)strlen(g_st.net_staged_pass);
-                                    snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%s", g_st.net_staged_pass);
-                                    g_st.osk_open = true;
-                                    trigger_chime(740, 45);
-                                } else {
-                                    open_chain_secret_osk();
-                                }
+                                open_chain_secret_osk();
                             } else {
                                 int total_rows = 2 + g_st.wifi_count;
                                 if (g_st.wifi_cursor >= total_rows) g_st.wifi_cursor = total_rows - 1;
@@ -2575,7 +2523,7 @@ int main(int argc, char **argv) {
                                         g_st.net_staged_dirty = true;
                                         trigger_chime(580, 25);
                                     } else if (g_st.wifi_cursor == 1) {
-                                        g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 3) % 4;
+                                        g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 1) % 2;
                                         trigger_chime(540, 25);
                                     }
                                 } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
@@ -2585,7 +2533,7 @@ int main(int argc, char **argv) {
                                         g_st.net_staged_dirty = true;
                                         trigger_chime(580, 25);
                                     } else if (g_st.wifi_cursor == 1) {
-                                        g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 1) % 4;
+                                        g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 1) % 2;
                                         trigger_chime(540, 25);
                                     }
                                 } else if (ev.code == R36_BTN_A_ACCEPT) {
@@ -2636,13 +2584,6 @@ int main(int argc, char **argv) {
                                     g_st.net_staged_ap = !g_st.net_staged_ap;
                                     g_st.net_staged_dirty = true;
                                     trigger_chime(580, 25);
-                                } else if (g_st.rev_cursor == 1 && g_st.wifi_count > 0) {
-                                    g_st.net_ssid_cycle_idx = (g_st.net_ssid_cycle_idx + g_st.wifi_count - 1) % g_st.wifi_count;
-                                    snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s",
-                                             g_st.wifi_list[g_st.net_ssid_cycle_idx].ssid);
-                                    g_st.net_staged_ap = false;
-                                    g_st.net_staged_dirty = true;
-                                    trigger_chime(580, 25);
                                 } else if (g_st.rev_cursor == 2) {
                                     int next_role = (g_st.chain_role_idx + 2) % 3;
                                     commit_chain_settings(g_st.chain_secret, next_role);
@@ -2653,13 +2594,6 @@ int main(int argc, char **argv) {
                             } else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) {
                                 if (g_st.rev_cursor == 0) {
                                     g_st.net_staged_ap = !g_st.net_staged_ap;
-                                    g_st.net_staged_dirty = true;
-                                    trigger_chime(580, 25);
-                                } else if (g_st.rev_cursor == 1 && g_st.wifi_count > 0) {
-                                    g_st.net_ssid_cycle_idx = (g_st.net_ssid_cycle_idx + 1) % g_st.wifi_count;
-                                    snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s",
-                                             g_st.wifi_list[g_st.net_ssid_cycle_idx].ssid);
-                                    g_st.net_staged_ap = false;
                                     g_st.net_staged_dirty = true;
                                     trigger_chime(580, 25);
                                 } else if (g_st.rev_cursor == 2) {
@@ -2675,9 +2609,8 @@ int main(int argc, char **argv) {
                                     g_st.net_staged_dirty = true;
                                     trigger_chime(600, 30);
                                 } else if (g_st.rev_cursor == 1) {
-                                    g_st.tab_idx = 3;
-                                    g_st.wifi_cursor = (g_st.wifi_count > 0) ? 2 : 1;
-                                    trigger_chime(620, 35);
+                                    set_ui_busy("Wi-Fi is set in EmulationStation: the Stump follows it", 2600);
+                                    trigger_chime(520, 30);
                                 } else if (g_st.rev_cursor == 2) {
                                     open_chain_secret_osk();
                                 } else if (g_st.rev_cursor == 3) {
@@ -2774,7 +2707,7 @@ int main(int argc, char **argv) {
                                     g_st.net_staged_dirty = true;
                                     trigger_chime(580, 25);
                                 } else if (g_st.wifi_cursor == 1) {
-                                    g_st.wifi_bar_mode = (g_st.wifi_bar_mode + (ev.value > 0 ? 1 : 3)) % 4;
+                                    g_st.wifi_bar_mode = (g_st.wifi_bar_mode + 1) % 2;
                                     trigger_chime(540, 25);
                                 }
                             }
@@ -2796,13 +2729,6 @@ int main(int argc, char **argv) {
                         } else if (ev.code == ABS_HAT0X) {
                             if (g_st.rev_cursor == 0) {
                                 g_st.net_staged_ap = !g_st.net_staged_ap;
-                                g_st.net_staged_dirty = true;
-                                trigger_chime(580, 25);
-                            } else if (g_st.rev_cursor == 1 && g_st.wifi_count > 0) {
-                                g_st.net_ssid_cycle_idx = (g_st.net_ssid_cycle_idx + (ev.value > 0 ? 1 : g_st.wifi_count - 1)) % g_st.wifi_count;
-                                snprintf(g_st.net_staged_ssid, sizeof(g_st.net_staged_ssid), "%.31s",
-                                         g_st.wifi_list[g_st.net_ssid_cycle_idx].ssid);
-                                g_st.net_staged_ap = false;
                                 g_st.net_staged_dirty = true;
                                 trigger_chime(580, 25);
                             } else if (g_st.rev_cursor == 2) {
@@ -3006,17 +2932,16 @@ int main(int argc, char **argv) {
             /* Network: where this Stump is, what's staged, the networks, the QR code. */
             char now[120], staged[160];
             if (g_st.ap_active) snprintf(now, sizeof(now), "Hotspot %s · %s", g_st.ap_ssid, disp_ip);
-            else snprintf(now, sizeof(now), "Wi-Fi network · %s", disp_ip);
+            else snprintf(now, sizeof(now), "%.32s · %s", g_st.wifi_count > 0 ? g_st.wifi_list[0].ssid : "no Wi-Fi", disp_ip);
             if (g_st.net_staged_dirty)
-                snprintf(staged, sizeof(staged), "staged: %s — apply it in SETUP",
-                         g_st.net_staged_ap ? "hotspot" : (g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "saved Wi-Fi"));
+                snprintf(staged, sizeof(staged), "staged: hotspot %s — apply it in SETUP", g_st.net_staged_ap ? "on" : "off");
             else snprintf(staged, sizeof(staged), "nothing staged");
             ctext(fb, F16, 14, 134, "THIS STUMP", th->ember, 0);
             ctext(fb, F24, 14, 154, now, th->text, PANEL_W - 28);
             ctext(fb, F16, 14, 184, staged, g_st.net_staged_dirty ? th->ok : th->muted, PANEL_W - 28);
 
             ctext(fb, F16, 14, 212, "STAGE", th->ember, 0);
-            static const char *tools[4] = { "Chain secret", "Scan LAN for Stumps", "Rescan Wi-Fi", "Type Wi-Fi password" };
+            static const char *tools[2] = { "Chain secret", "Find Stumps on this network" };
             int lw = 440;
             for (int row = 0; row < 2 + (g_st.wifi_count < 4 ? g_st.wifi_count : 4); row++) {
                 int y = 232 + row * 38;
@@ -3026,11 +2951,11 @@ int main(int argc, char **argv) {
                 uint32_t vc = th->muted;
                 if (row == 0) {
                     snprintf(lab, sizeof(lab), "Mode");
-                    snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ap ? "Hotspot" : "Wi-Fi network");
+                    snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ap ? "Hotspot on" : "Hotspot off");
                     vc = g_st.net_staged_ap ? th->ok : th->text;
                 } else if (row == 1) {
                     snprintf(lab, sizeof(lab), "Tool");
-                    snprintf(val, sizeof(val), "◀ %s ▶", tools[g_st.wifi_bar_mode % 4]);
+                    snprintf(val, sizeof(val), "◀ %s ▶", tools[g_st.wifi_bar_mode % 2]);
                 } else {
                     int w = row - 2;
                     snprintf(lab, sizeof(lab), "%s%.24s", g_st.wifi_list[w].active ? "● " : "", g_st.wifi_list[w].ssid);
@@ -3053,15 +2978,10 @@ int main(int argc, char **argv) {
                     if (g_st.qr_grid[rr][cc]) fill_rect(fb, qx + (cc + 2) * qs, qy + (rr + 2) * qs, qs, qs, 0xFF000000u);
             ctext(fb, F16, qx0 + (240 - font_width(F16, g_st.qr_url)) / 2, qy + qbox + 6, g_st.qr_url, th->muted, 240);
 
-            ctext(fb, F16, 14, 480, "WI-FI PASSWORD", th->ember, 0);
-            char pw[160];
-            int plen = utf8_count(g_st.net_staged_pass);
-            if (plen > 0) {
-                char dots[100] = "";
-                for (int k = 0; k < plen && k < 30; k++) strcat(dots, "•");
-                snprintf(pw, sizeof(pw), "%s  (%d characters)", dots, plen);
-            } else snprintf(pw, sizeof(pw), "none — Y to type it (case kept)");
-            ctext(fb, F20, 14, 502, pw, plen > 0 ? th->text : th->muted, PANEL_W - 28);
+            ctext(fb, F16, 14, 480, "WI-FI", th->ember, 0);
+            ctext(fb, F20, 14, 502, g_st.wifi_count > 0 ? "EmulationStation's network: the Stump follows it"
+                                                       : "No Wi-Fi: connect in EmulationStation",
+                  g_st.wifi_count > 0 ? th->text : th->muted, PANEL_W - 28);
             ctext(fb, F16, 14, 540, "CHAIN", th->ember, 0);
             ctext(fb, F20, 14, 562, g_st.chain_status_msg, g_st.chain_peers > 0 ? th->ok : th->text, PANEL_W - 28);
             ctext(fb, F16, 14, 594, "secret, role and the Stump above: in /admin, as on every Stump", th->muted, PANEL_W - 28);
@@ -3080,12 +3000,12 @@ int main(int argc, char **argv) {
                 uint32_t vc = th->muted;
                 if (row == 0) {
                     snprintf(lab, sizeof(lab), "Mode");
-                    snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ap ? "Hotspot (10.42.0.1)" : "Wi-Fi network");
+                    snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ap ? "Hotspot on (10.42.0.1)" : "Hotspot off");
                     vc = th->text;
                 } else if (row == 1) {
-                    snprintf(lab, sizeof(lab), "Network");
-                    if (g_st.net_staged_ap) snprintf(val, sizeof(val), "name from config.py (PC_HOTSPOT_NAME)");
-                    else snprintf(val, sizeof(val), "◀ %s ▶", g_st.net_staged_ssid[0] ? g_st.net_staged_ssid : "saved Wi-Fi");
+                    snprintf(lab, sizeof(lab), "Wi-Fi");
+                    snprintf(val, sizeof(val), "%.32s (set in EmulationStation)",
+                             g_st.wifi_count > 0 ? g_st.wifi_list[0].ssid : "none");
                     vc = th->text;
                 } else if (row == 2) {
                     snprintf(lab, sizeof(lab), "Chain");
@@ -3157,7 +3077,7 @@ int main(int argc, char **argv) {
             draw_hint_bar(fb, th, k, l, 6);
         } else if (g_st.tab_idx == 3) {
             static const char *const k[6] = { "A", "B", "Y", "X", "↑↓", "L/R" };
-            static const char *const l[6] = { "stage", "cancel", "password", "QR", "move", "tab" };
+            static const char *const l[6] = { "stage", "cancel", "secret", "QR", "move", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
         } else if (g_st.tab_idx == 4) {
             static const char *const k[6] = { "A", "B", "X", "START", "↑↓", "L/R" };

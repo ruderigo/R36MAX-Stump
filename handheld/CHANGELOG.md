@@ -5,6 +5,20 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.1.0-r36max
+
+**The Wi-Fi is EmulationStation's.** The network and its password are
+chosen in dArkOS's own Wi-Fi settings; the Stump uses whatever network the
+handheld is on, and follows a change by itself.
+
+- The cockpit shows the network the handheld is on (name, signal, address).
+  It no longer scans, joins networks or takes a Wi-Fi password.
+- The hotspot only goes on a Wi-Fi adapter that network isn't using (the
+  RT3070 next to the internal one). With one adapter in use it says so and
+  leaves the network alone: it used to replace it.
+- Tests: the feed never joins or changes a network, never sends a password,
+  and keeps the hotspot off EmulationStation's adapter.
+
 ## v2.0.0-r36max
 
 **The R36MAX runs the stock PC Stump.** It is now a Stump like macOS1 or any
