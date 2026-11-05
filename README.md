@@ -17,7 +17,7 @@ installer that sets it all up.
 
 | | |
 |---|---|
-| **Latest release** | [v2.0.0-r36max](https://github.com/ruderigo/R36MAX-Stump/releases/latest) |
+| **Latest release** | [v2.4.0-r36max](https://github.com/ruderigo/R36MAX-Stump/releases/latest) |
 | **Handheld details** | [handheld/README.md](handheld/README.md): how it works, controls, tests, releases |
 | **Changes** | [handheld/CHANGELOG.md](handheld/CHANGELOG.md) |
 
