@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.5.3-b.82)
+# install.sh — makes the R36MAX a Stump like any other (v2.5.4-b.86)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -352,4 +352,9 @@ fi
 if grep -q -- '"--save-identity"' "$SANDBOX/provisioner.py" 2>/dev/null; then
   echo "  its identity: cd $SANDBOX && python3 provisioner.py --save-identity $STUMP_DIR   (keep the file safe:"
   echo "    a fresh install brings it back with --restore-identity $STUMP_DIR FILE, the same Stump on the mesh)"
+fi
+# 1.0.0-beta.86: Reticulum 1.6.1's announce stamps (Announce stamps ticked in its /admin).
+if grep -q -- '"--stamp-announces"' "$SANDBOX/provisioner.py" 2>/dev/null; then
+  echo "  its announce stamps now: cd $SANDBOX && python3 provisioner.py --stamp-announces $STUMP_DIR"
+  echo "    (it also finds them by itself in the background once Announce stamps is ticked in its /admin)"
 fi

@@ -7,6 +7,21 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.5.4-b.86
+
+Tested against SandBox_Stump_On **1.0.0-beta.86** (the cockpit's feed with a
+real b86 Stump: all pass; the RK3326 Provisioner's answers through b86's own
+wizard: all pass).
+
+- **Its announce stamps** (beta.86, Reticulum 1.6.1's proof of work on
+  announces). With *Announce stamps* ticked in its /admin, the handheld's
+  Stump finds them by itself in the background; the end of an install now
+  also names Team Stump's tool to do it at once, every core on it:
+  `provisioner.py --stamp-announces ~/Stump`. The RK3326 Provisioner
+  (0.3.0-beta.20) does it from its screen.
+- Nothing else needed changing for b83 to b86: the cockpit reads the Stump
+  over its HTTP API, which stamps (on announces over the mesh) don't touch.
+
 ## v2.5.3-b.82
 
 Tested against SandBox_Stump_On **1.0.0-beta.82** (the cockpit's feed with a
