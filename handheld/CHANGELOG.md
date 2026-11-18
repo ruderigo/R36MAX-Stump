@@ -7,6 +7,21 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.5.3-b.82
+
+Tested against SandBox_Stump_On **1.0.0-beta.82** (the cockpit's feed with a
+real b82 Stump: all pass; the RK3326 Provisioner's answers through b82's own
+wizard: all pass).
+
+- **Its packs and its identity, from Team Stump's own tools.** The end of an
+  install says how, when its SandBox_Stump_On has them: `provisioner.py
+  --packs ~/Stump` (beta.75: install, update, remove, nothing else asked)
+  and `--save-identity ~/Stump` (beta.76: the file that brings back the same
+  Stump on the mesh after a fresh install, with `--restore-identity`). The
+  RK3326 Provisioner (0.3.0-beta.19) does both from its screen.
+- Nothing else needed changing for b63 to b82: the cockpit reads the Stump
+  over its HTTP API, which packed text (b82, LXMF over LoRa) doesn't touch.
+
 ## v2.5.2-b.62
 
 Tested against SandBox_Stump_On **1.0.0-beta.62** (the cockpit's feed with a
