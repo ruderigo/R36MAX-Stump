@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.5.2-b.62)
+# install.sh — makes the R36MAX a Stump like any other (v2.5.3-b.82)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -345,3 +345,11 @@ echo "The Stump runs only while that Port is open (nothing in the background, li
 echo "  log: $STUMP_DIR/stump.log    by hand: $STUMP_DIR/start-stump.sh / stop-stump.sh"
 echo "  update: bash $HERE/install.sh   (pulls SandBox_Stump_On, runs provisioner.py --pc again)"
 echo "  chain check: cd $SANDBOX && python3 provisioner.py --check-chain"
+# 1.0.0-beta.75 / .76: its packs on their own, its identity in a file.
+if grep -q -- '"--packs"' "$SANDBOX/provisioner.py" 2>/dev/null; then
+  echo "  its packs: cd $SANDBOX && python3 provisioner.py --packs $STUMP_DIR   (install, update, remove)"
+fi
+if grep -q -- '"--save-identity"' "$SANDBOX/provisioner.py" 2>/dev/null; then
+  echo "  its identity: cd $SANDBOX && python3 provisioner.py --save-identity $STUMP_DIR   (keep the file safe:"
+  echo "    a fresh install brings it back with --restore-identity $STUMP_DIR FILE, the same Stump on the mesh)"
+fi
