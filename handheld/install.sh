@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.5.4-b.86)
+# install.sh — makes the R36MAX a Stump like any other (v2.6.0-b.87)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump

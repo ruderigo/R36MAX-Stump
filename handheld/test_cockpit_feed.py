@@ -100,5 +100,120 @@ class Live(unittest.TestCase):
         self.assertEqual(feed.full_ssids[shown], "Caf\u00e9 \U0001F332 Guest|5G")
 
 
+PAGE = """<h1>Admin</h1><p class='sub'><b>Saved. &amp; it&#39;s live.</b></p>
+<form method='POST' action='/admin/setup'><input type='hidden' name='admin_pass' value='tok'>
+<details class='inner'><summary>Names <span class='pk'>Oak · Bot</span></summary>
+<label>Stump's name<br><input name='node_name' maxlength='20' required value='Oak'></label>
+<label>Greeting<br><textarea name='greeting' maxlength='200'>Hi &amp; welcome</textarea></label></details>
+<details class='inner'><summary>Language <span class='pk'>English</span></summary>
+<label class='opt'><input type='radio' name='default_lang' value='fr'> Français</label>
+<label class='opt'><input type='radio' name='default_lang' value='en' checked> English</label></details>
+<details class='inner'><summary>Features</summary>
+<label class='opt'><input type='checkbox' name='f_chat' value='1' checked> Chat</label>
+<label class='opt'><input type='checkbox' name='f_about' value='1'> About</label>
+<label class='opt'><input type='checkbox' name='keep_awake' value='1' disabled> Keep awake</label>
+<button type='submit' formaction='/admin/announce'>Announce now</button></details>
+<button type='submit'>Save</button></form><form action='/admin/logout'></form>"""
+
+
+class AdminForms(unittest.TestCase):
+    def test_read_as_a_browser_reads_it(self):
+        f = F.parse_forms(PAGE)
+        self.assertEqual(sorted(f), ["/admin/logout", "/admin/setup"])
+        c = {x["name"] + ("=" + x["value"] if x["type"] == "radio" else ""): x for x in f["/admin/setup"]}
+        self.assertEqual((c["node_name"]["label"], c["node_name"]["value"], c["node_name"]["group"]),
+                         ("Stump's name", "Oak", "Names"))
+        self.assertEqual(c["greeting"]["value"], "Hi & welcome")
+        self.assertEqual((c["default_lang=en"]["checked"], c["default_lang=en"]["label"]), (True, "English"))
+        self.assertEqual(c["default_lang=fr"]["group"], "Language")          # the preview isn't the title
+        self.assertTrue(c["keep_awake"]["disabled"])
+        self.assertNotIn("Announce now", [x["label"] for x in f["/admin/setup"]])   # buttons aren't fields
+        self.assertEqual(F.page_notice(PAGE), "Saved. & it's live.")
+
+    def test_submitted_as_a_browser_submits_it(self):
+        ctl = F.parse_forms(PAGE)["/admin/setup"]
+        body = F.form_body(ctl, {})
+        self.assertEqual(body, "admin_pass=tok&node_name=Oak&greeting=Hi%20%26%20welcome&default_lang=en&f_chat=1")
+        body = F.form_body(ctl, {"f_about": "1", "f_chat": "0", "default_lang": "fr", "admin_pass": "pw"})
+        self.assertEqual(body, "admin_pass=pw&node_name=Oak&greeting=Hi%20%26%20welcome&default_lang=fr&f_about=1")
+
+    def test_the_settings_form_rows(self):
+        feed = F.Feed()
+        feed.admin_pw = lambda: "pw"
+        feed.setup, feed.form = F.parse_forms(PAGE)["/admin/setup"], "setup"
+        title, parent, rows = feed.form_rows()
+        self.assertEqual((title, parent), ("Stump settings", "owner"))
+        kinds = [(r["key"], r["kind"]) for r in rows]
+        self.assertEqual(kinds, [("node_name", "text"), ("greeting", "text"), ("default_lang", "choice"),
+                                 ("f_chat", "toggle"), ("f_about", "toggle"), ("keep_awake", "toggle")])
+        lang = rows[2]
+        self.assertEqual((lang["options"], lang["sel"], lang["label"]), (["Français", "English"], 1, "Language"))
+        self.assertEqual(rows[0]["max"], 20)
+
+    def test_no_admin_password_no_owner_tools(self):
+        feed = F.Feed()
+        feed.admin_pw = lambda: ""
+        title, _, rows = feed.form_rows()
+        self.assertEqual([r["kind"] for r in rows], ["info"])
+
+
+class Rooms(unittest.TestCase):
+    def feed(self, answers):
+        feed = F.Feed()
+        feed.stump.port = 80
+        feed.admin_pw = lambda: "pw"
+        sent = []
+
+        def send(line):
+            sent.append(line)
+            return answers.get(line.split(" ")[0], [])
+        feed.stump.send = send
+        return feed, sent
+
+    def test_every_room_the_stump_has(self):
+        feed, sent = self.feed({
+            "/rooms": ["#main \u00b72  General", "#lora-mesh \u00b70  \u2298 No LoRa", "#quiz \u00b71  trivia night",
+                       "#jardin \u00b70  [Wi-Fi]", "#bad name \u00b71"],
+            "/setchan": ["#lora-mesh  lora", "#main  local", "#wifi-mesh  wifi", "#jardin  wifi"]})
+        feed.refresh_rooms()
+        self.assertEqual(sent, ["/rooms", "/setchan pw"])
+        self.assertEqual(feed.room_order, ["main", "lora-mesh", "wifi-mesh", "quiz", "jardin"])
+        self.assertEqual(feed.room_info["quiz"], {"count": 1, "topic": "trivia night", "scope": ""})
+        self.assertEqual(feed.room_info["jardin"], {"count": 0, "topic": "", "scope": "wifi"})
+        feed.want_room = "quiz"
+        lines = feed.live_lines()
+        rooms = [l for l in lines if l.startswith("ROOM|")]
+        self.assertEqual(rooms[3], "ROOM|3|quiz|0||trivia night|1")      # on screen: its own people count
+        self.assertEqual(rooms[4], "ROOM|4|jardin|0|wifi||0")
+
+    def test_a_new_room(self):
+        feed, sent = self.feed({"/create": ["\u2717 #jardin exists"]})
+        feed.new_room("Jardin Club!", "local")
+        self.assertEqual(sent[-1], "/join #jardin-club")
+        self.assertEqual(feed.want_room, "jardin-club")
+        feed.new_room("jardin", "lora")
+        self.assertEqual(sent[-1], "/create pw #jardin -lora confirm")      # refused: not joined
+        self.assertEqual(feed.want_room, "jardin-club")
+        feed.new_room("  ", "local")
+        self.assertIn("letters, digits", feed.busy_msg)
+
+    def test_owner_commands_carry_the_password(self):
+        feed, sent = self.feed({})
+        feed.stump.room = "quiz"
+        feed.form_set("rooms", "room:quiz", "1")
+        feed.form_set("people", "p:zoe", str(F.MOD_ACTS.index("ban") + 1))
+        feed.form_set("people", "where", "1")
+        feed.form_set("people", "p:zoe", str(F.MOD_ACTS.index("kick") + 1))     # a kick: one room, always
+        feed.form_set("people", "p:zoe", str(F.MOD_ACTS.index("mute") + 1))
+        feed.form_set("rooms", "req:2", "2")
+        feed.form = "rooms"
+        self.assertEqual(sent, ["/setchan pw #quiz -wifi", "/ban pw #quiz zoe", "/kick pw #quiz zoe",
+                                "/mute pw -stump zoe", "/chanreq pw -r 2"])
+        lines = feed.live_lines()
+        self.assertTrue(any(l.startswith("FORM|rooms|Rooms|owner") for l in lines))
+        for l in [l for l in lines if l.startswith("FIELD|")]:
+            self.assertEqual(len(l.split("|")), 11, l)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

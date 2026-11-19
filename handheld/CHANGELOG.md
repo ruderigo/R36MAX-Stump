@@ -7,6 +7,45 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.6.0-b.87
+
+Tested against SandBox_Stump_On **1.0.0-beta.87** (the feed with a real
+Stump: every command, the new ones included; the cockpit's keys and screens).
+
+- **Every room the Stump has** on the CHATS tab, not just #main, #lora-mesh
+  and #wifi-mesh: the rooms people made, with how many are in each, as the
+  Stump's own chat page lists them. ←/→ moves between them (as many as fit,
+  the rest scroll), and under them: how far the room reaches (this Stump,
+  the chain's Wi-Fi, the LoRa) and its topic.
+- **A new room** from the quick commands (*new room…*, where *announce* was:
+  the Stump announces by itself): its name on the keyboard, made with
+  `/join` on this Stump, and on screen. START with nothing written opens the
+  keyboard.
+- **OWNER, a sixth tab: the Stump's owner on their own handheld.** It uses
+  the admin password in `~/Stump/config.py`, which stays on the handheld:
+  - **Stump settings**: the very form `/admin` shows, read from the Stump's
+    page (its labels, in its language) and sent back as a browser would. So
+    it's always what this Stump offers: name, bot and greeting, language,
+    announces and Reticulum 1.6.1's announce stamps, file sharing, storage,
+    who may enter, features. The Stump's answer is shown: saved, waits for
+    a restart, or which value it refused.
+  - **Rooms**: each room's reach (`/setchan`), a room reaching the chain or
+    the LoRa (`/create`), the topic, and the LoRa rooms other Stumps offer
+    (`/chanreq`, accept or refuse).
+  - **People in the room**: op, deop, mod, demod, kick, mute, unmute, ban,
+    unban, in the room or every room of the Stump; who's op or mod, who's
+    banned or muted. The Stump's replies show under the list.
+  - **Announce now** and **Restart the Stump**.
+  ←/→ picks, A applies, and what changes the Stump asks first (No is
+  highlighted). The rest of `/admin` (radio, chain, plugins, themes) stays on
+  the web, from a phone on the hotspot.
+- The tab names are a size smaller, so six fit beside the link dot.
+- Tests: the feed against a real Stump now makes rooms, changes a setting
+  through `/admin/setup` (the others untouched), makes a Wi-Fi room, changes
+  a room's reach, and kicks someone; the feed's unit tests read and submit a
+  form as a browser does; the C tests drive the rooms and the OWNER tab with
+  the R36MAX's buttons.
+
 ## v2.5.4-b.86
 
 Tested against SandBox_Stump_On **1.0.0-beta.86** (the cockpit's feed with a

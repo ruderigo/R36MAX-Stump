@@ -100,6 +100,27 @@ that's been saved.
   Wi-Fi local-discovery port).
 - Its pages: `http://r36max.local/` (or the address in the cockpit's header).
   `/admin` works as on every Stump: radio, chain, plugins, turning it off.
+- **Rooms** (CHATS tab): every room the Stump has, not just the three
+  built-in ones, with how many people are in each; ←/→ moves between them,
+  and the line under them says how far the room reaches (this Stump, the
+  chain's Wi-Fi, the LoRa) and its topic. *new room…* in the quick commands
+  makes one on this Stump (`/join`) and opens it.
+- **OWNER tab** (v2.6.0): the Stump's owner on their own handheld, with the
+  admin password from `~/Stump/config.py` (it never leaves the handheld):
+  - *Stump settings*: the same form as `/admin`'s, read from the Stump's own
+    page in its language and saved the same way (name, bot, greeting,
+    language, announces and stamps, file sharing, storage, who may enter,
+    features). The Stump answers as on the web: saved, or waits for a
+    restart, or which value it didn't accept.
+  - *Rooms*: each room's reach (`/setchan`), a new room reaching the chain
+    or the LoRa (`/create`), the topic, the LoRa rooms other Stumps offer
+    (`/chanreq`: accept or refuse).
+  - *People in the room*: op, mod, kick, mute, ban and back, in that room or
+    every room of the Stump; who's op or mod, who's banned or muted.
+  - *Announce now*, *Restart the Stump*.
+  ↑/↓ moves, ←/→ picks, A applies (what changes the Stump asks first), B
+  goes back. The rest of `/admin` (radio, chain, plugins, themes, layout,
+  profiles) from a phone on its hotspot.
 - **Chain secret, role, parent:** in `/admin` or with
   `python3 ~/SandBox_Stump_On/provisioner.py --pc --reconfigure`, as on every
   Stump. The cockpit shows the chain's state but doesn't edit it.
