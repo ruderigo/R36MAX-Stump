@@ -79,7 +79,9 @@ def main():
                                                pc_storage_mb=256, chain={"enabled": False}))
         cfg = os.path.join(stump_dir, "config.py")
         text = open(cfg, encoding="utf-8").read()
-        text += "\nAUTH_ADMIN_PASSWORD = 'test-admin-pw'\nPC_HTTP_PORT = %d\nPC_HOTSPOT_IP = '127.0.0.1'\n" % http
+        # As a Stump installed without the provisioner: /admin's blank, the fserv
+        # operator's set (the Stump takes it for /admin, deletes, /op, /setchan).
+        text += "\nAUTH_ADMIN_PASSWORD = ''\nFSERVBOT_OP_PASSWORD = 'test-admin-pw'\nPC_HTTP_PORT = %d\nPC_HOTSPOT_IP = '127.0.0.1'\n" % http
         open(cfg, "w", encoding="utf-8").write(text)
         procs.append(subprocess.Popen([sys.executable, "-u", "stump_pc.py"], cwd=stump_dir,
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))

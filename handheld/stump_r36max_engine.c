@@ -1,6 +1,6 @@
 /*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.7.0-b.87.
+ * (RK3326 / dArkOS), v2.7.1-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -706,7 +706,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.7.0-b.87"
+#define STUMP_ENGINE_VERSION "v2.7.1-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 60      /* a room's scrollback: all the Stump keeps (MAX_MESSAGES_PER_ROOM) */
 #define MAX_ITEMS 20          /* notices and files listed (scrolled) */
@@ -2548,7 +2548,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.0-b.87");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.1-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;

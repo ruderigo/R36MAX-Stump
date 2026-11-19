@@ -7,6 +7,26 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.7.1-b.87
+
+- **Type the admin password on the handheld.** OWNER → *Set the admin
+  password* when the Stump has none (with *Make one for me* beside it), and
+  *Change the admin password* when it has one: the keyboard opens, START
+  saves it. It's written with the Stump's own `admin_password.py`
+  (`config.py.bak` kept) as `AUTH_ADMIN_PASSWORD`, and the Stump restarts to
+  take it. 4 characters or more, no spaces (the chat's owner commands take
+  it as one word), no `•` and no `|`; anything else is refused with why and
+  the old password kept. It's never logged or shown on the row.
+- **Deleting from the billboard and the files works again** on a Stump with
+  only the file bot operator's password (installed without the
+  provisioner): those two still read `AUTH_ADMIN_PASSWORD` alone, missed in
+  v2.7.0. Op, deop and the other moderation already took either.
+- Tests: set, then changed, through `admin_password.py`; the passwords it
+  won't take leave the old one; deletes with the operator's password. The
+  real-Stump test now runs as such a Stump (`/admin`'s password blank, the
+  operator's set): settings, rooms, deletes, op and the menu's `•` all pass
+  through it.
+
 ## v2.7.0-b.87
 
 - **The sticks scroll.** The chat had no way back to what was said before:
