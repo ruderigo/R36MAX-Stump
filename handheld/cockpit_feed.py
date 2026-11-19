@@ -50,9 +50,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.5.4-b.86"
+            return f.read().strip() or "2.6.0-b.87"
     except OSError:
-        return "2.5.4-b.86"
+        return "2.6.0-b.87"
 
 
 FEED_VERSION = _version()
@@ -69,7 +69,18 @@ NICK = os.environ.get("STUMP_COCKPIT_NICK", "r36max")
 HOTSPOT_CON = limbs.OLD_HOTSPOT                  # v2.0's single hotspot (limbs.py moves it)
 LIMBS_FILE = os.environ.get("STUMP_LIMBS_FILE", os.path.join(APP_DIR, "limbs.json"))
 
-ROOMS = ("main", "lora-mesh", "wifi-mesh")      # the cockpit's three room tabs, in order
+ROOMS = ("main", "lora-mesh", "wifi-mesh")      # the Stump's built-in rooms: always first, in this order
+MAX_ROOMS = 16                                  # what the cockpit shows (the Stump's others: /rooms)
+ROOMS_S = 8.0                                   # the room list (/rooms, /setchan) asked again
+MOD_ACTS = ("op", "deop", "mod", "demod", "kick", "mute", "unmute", "ban", "unban")
+SCOPES = ("local", "wifi", "lora")
+SCOPE_NAMES = ("local", "Wi-Fi chain", "LoRa")
+
+import re  # noqa: E402
+ROOM_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
+ROOMS_LINE = re.compile(r"^#(\S+) \u00b7(\d+)(?:  (.*))?$")      # /rooms: "#quiz ·2  its topic  [Wi-Fi]"
+SETCHAN_LINE = re.compile(r"^#(\S+)  (local|wifi|lora)$")          # /setchan <pw>: "#quiz  wifi"
+CHANREQ_LINE = re.compile(r"^(\d+)\. #(\S+)  (.*?)  \(")          # /chanreq <pw>: "1. #jardin  Oak  (3 min)"
 
 POLL_S = 2.0          # the reference client's cadence (CLIENT_QUICKSTART "Polling cadence")
 INFO_S = 5.0
@@ -191,6 +202,117 @@ def read_config():
     return out
 
 
+# ── the Stump's own /admin forms, read as a browser reads them ──────
+
+import html as _html
+from html.parser import HTMLParser
+
+
+class _Forms(HTMLParser):
+    """Every <form> of a page: its action, and its controls as a browser
+    sees them (name, type, value, checked, disabled), each with the text of
+    the <label> around it and the <summary> of the group it's in -- so the
+    cockpit shows the Stump's own words, in its language, and sends back
+    exactly what a browser would."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.forms, self.form = {}, None
+        self.label = None            # the control(s) of the <label> being read, and its text
+        self.summary, self.in_summary, self.pk = "", False, 0
+        self.textarea = None
+
+    def handle_starttag(self, tag, attrs):
+        a = dict((k, v if v is not None else "") for k, v in attrs)
+        if tag == "form":
+            self.form = self.forms.setdefault(a.get("action", ""), [])
+        elif tag == "summary":
+            self.in_summary, self.summary = True, ""
+        elif tag == "span" and self.in_summary:
+            self.pk += 1                                    # the summary's preview: not its title
+        elif tag == "label":
+            self.label = {"text": "", "controls": []}
+        elif self.form is not None and tag in ("input", "textarea", "select") and a.get("name"):
+            c = {"name": a["name"], "type": (a.get("type") or ("textarea" if tag == "textarea" else "text")).lower(),
+                 "value": a.get("value", ""), "checked": "checked" in a, "disabled": "disabled" in a,
+                 "label": "", "group": self.summary.strip(), "max": a.get("maxlength") or a.get("max") or ""}
+            if c["type"] in ("submit", "button", "reset", "image", "file"):
+                return
+            self.form.append(c)
+            if self.label is not None:
+                self.label["controls"].append(c)
+            if tag == "textarea":
+                self.textarea = c
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self.form = None
+        elif tag == "summary":
+            self.in_summary = False
+        elif tag == "span" and self.in_summary and self.pk:
+            self.pk -= 1
+        elif tag == "label" and self.label is not None:
+            for c in self.label["controls"]:
+                c["label"] = " ".join(self.label["text"].split())
+            self.label = None
+        elif tag == "textarea":
+            self.textarea = None
+
+    def handle_data(self, data):
+        if self.textarea is not None:
+            self.textarea["value"] += data
+        elif self.in_summary and not self.pk:
+            self.summary += data
+        elif self.label is not None:
+            self.label["text"] += data
+
+
+def parse_forms(page):
+    """{action: [control, ...]} of an HTML page."""
+    p = _Forms()
+    try:
+        p.feed(page or "")
+        p.close()
+    except Exception:
+        pass
+    return p.forms
+
+
+def form_body(controls, changes):
+    """What a browser submits for this form, with changes ({name: value};
+    a checkbox: "1" ticked, "" not): text, textareas and hidden fields, the
+    radio and checkboxes that are checked; disabled ones left out, as a
+    browser does."""
+    out, done = [], set()
+    for c in controls:
+        n, t = c["name"], c["type"]
+        if t == "radio":
+            if n in done:
+                continue
+            if n in changes:
+                v = changes[n]
+            else:
+                v = next((x["value"] for x in controls if x["name"] == n and x["type"] == "radio" and x["checked"]), None)
+            done.add(n)
+            if v is not None:
+                out.append((n, v))
+        elif t == "checkbox":
+            on = (changes[n] not in ("", "0")) if n in changes else (c["checked"] and not c["disabled"])
+            if on:
+                out.append((n, c["value"] or "1"))
+        elif not c["disabled"] or n in changes:
+            out.append((n, changes.get(n, c["value"])))
+    return "&".join("%s=%s" % (urllib.parse.quote(k, safe=""), urllib.parse.quote(str(v), safe="")) for k, v in out)
+
+
+def page_notice(page):
+    """The message the Stump puts on top of its page after a form (saved,
+    unchanged, a field not accepted...)."""
+    import re
+    m = re.search(r"<p class='sub'><b>(.*?)</b></p>", page or "", re.S)
+    return " ".join(_html.unescape(re.sub(r"<[^>]+>", "", m.group(1))).split()) if m else ""
+
+
 # ── the Stump, over HTTP ───────────────────────────────────────────
 
 class Stump:
@@ -279,6 +401,20 @@ class Feed:
         self.want_room = "wifi-mesh"       # the cockpit opens on #wifi-mesh
         self.msgs = {r: [] for r in ROOMS}
         self.users = {r: 0 for r in ROOMS}
+        # Every room the Stump has (its poll's list, /rooms' counts and topics,
+        # /setchan's reach), as the web chat lists them; who's in ours.
+        self.room_info = {r: {"count": 0, "topic": "", "scope": ""} for r in ROOMS}
+        self.room_order = list(ROOMS)
+        self.people = []
+        self.my_nick = NICK
+        self.next_rooms = 0.0
+        # The OWNER tab: the form on screen, what it last heard back.
+        self.form = "owner"
+        self.replies = []
+        self.new_scope = "local"
+        self.mod_where = "room"
+        self.setup = None                  # the Stump's /admin/setup form, as a browser reads it
+        self.requests = []                 # LoRa rooms other Stumps offer (/chanreq)
         self.node = None
         self.hw = {}
         self.chain = {"enabled": False}
@@ -356,18 +492,28 @@ class Feed:
                 # Joined (or moved to) another room: the poll below brings its
                 # whole scrollback, so start that room's lines afresh.
                 st.room, st.since = room, 0
-                if room in self.msgs:
-                    self.msgs[room] = []
+                self.msgs[room] = []
             for m in (d.get("messages") or []) + (d.get("dms") or []):
                 mid = int(m.get("id") or 0)
                 st.since = max(st.since, mid)
-                if room in self.msgs and all(int(x.get("id") or 0) != mid for x in self.msgs[room]):
+                if all(int(x.get("id") or 0) != mid for x in self.msgs.setdefault(room, [])):
                     self.msgs[room].append(m)
                     del self.msgs[room][:-10]
                 if m.get("kind") == "dm":
                     log("DM", "%s: %s" % (m.get("nick"), m.get("body")))
-            if room in self.users:
-                self.users[room] = len(d.get("users") or [])
+            self.users[room] = len(d.get("users") or [])
+            self.people = [u for u in (d.get("users") or []) if isinstance(u, str)]
+            self.my_nick = str(d.get("nick") or NICK)
+            self.msgs.setdefault(room, [])
+            for r in [room] + [x for x in (d.get("rooms") or []) if isinstance(x, str)]:
+                if r not in self.room_order and ROOM_RE.match(r):
+                    self.room_order.append(r)
+                    self.room_info.setdefault(r, {"count": 0, "topic": "", "scope": ""})
+            if d.get("rooms"):                       # gone from the Stump: off the list (not the built-in ones)
+                live = set(d["rooms"]) | set(ROOMS) | {room, self.want_room}
+                self.room_order = [r for r in self.room_order if r in live]
+            if d.get("topic") is not None:
+                self.room_info.setdefault(room, {"count": 0, "topic": "", "scope": ""})["topic"] = str(d["topic"])
             self.chat_stumps = set(d.get("stumps") or [])
             st.fail = 0
             st.next_poll = time.time() + POLL_S * (1 + 0.3 * (os.getpid() % 10) / 10)
@@ -376,6 +522,246 @@ class Feed:
             st.next_poll = time.time() + min(30.0, POLL_S * (2 ** st.fail))
             if st.fail in (1, 4):
                 log("CHAT", "poll failed: %s" % e)
+
+    # -- every room the Stump has --
+    def admin_pw(self):
+        return str(read_config().get("AUTH_ADMIN_PASSWORD") or "")
+
+    def refresh_rooms(self):
+        """Its rooms, as /rooms lists them (people, topic) and /setchan (each
+        one's reach: this Stump, the chain's Wi-Fi, the LoRa); and, on the
+        owner's Rooms page, the LoRa rooms other Stumps offer (/chanreq)."""
+        st = self.stump
+        if st.port is None:
+            return
+        for line in st.send("/rooms"):
+            m = ROOMS_LINE.match(str(line).strip())
+            if not m or not ROOM_RE.match(m.group(1)):
+                continue
+            r, rest = m.group(1), (m.group(3) or "")
+            rest = re.sub(r"\s*\[(Wi-Fi|LoRa[^\]]*)\]$", "", rest).strip()
+            info = self.room_info.setdefault(r, {"count": 0, "topic": "", "scope": ""})
+            info["count"], info["topic"] = int(m.group(2)), rest
+            if r not in self.room_order:
+                self.room_order.append(r)
+        pw = self.admin_pw()
+        if not pw:
+            return
+        for line in st.send("/setchan %s" % pw):
+            m = SETCHAN_LINE.match(str(line).strip())
+            if m and m.group(1) in self.room_info:
+                self.room_info[m.group(1)]["scope"] = m.group(2)
+        if self.form == "rooms":
+            self.requests = []
+            for line in st.send("/chanreq %s" % pw):
+                m = CHANREQ_LINE.match(str(line).strip())
+                if m:
+                    self.requests.append({"n": int(m.group(1)), "room": m.group(2), "name": m.group(3)})
+
+    def new_room(self, name, scope):
+        """A room: "local" (only on this Stump: /join makes it, anyone may),
+        or reaching the chain or the LoRa (/create, the owner's); then it's
+        the room on screen."""
+        slug = re.sub(r"[^a-z0-9_.-]", "", str(name).strip().lower().lstrip("#").replace(" ", "-"))[:32].strip(".-")
+        st = self.stump
+        if not slug or not ROOM_RE.match(slug):
+            self.busy("A room's name: letters, digits, - or _", 3)
+            return
+        if st.port is None:
+            self.busy("The Stump isn't answering yet", 2.5)
+            return
+        if scope != "local":
+            pw = self.admin_pw()
+            if not pw:
+                self.busy("No admin password on this Stump: no rooms beyond it", 4)
+                return
+            said = st.send("/create %s #%s -%s%s" % (pw, slug, scope, " confirm" if scope == "lora" else ""))
+            self.heard(said)
+            if any(str(x).startswith("\u2717") for x in said):
+                return
+        for r in st.send("/join #" + slug):
+            log("CHAT", r)
+        self.room_info.setdefault(slug, {"count": 0, "topic": "", "scope": scope})
+        if slug not in self.room_order:
+            self.room_order.append(slug)
+        self.want_room, st.next_poll, self.next_rooms = slug, 0, 0
+        self.busy("#%s: you're in it" % slug, 3)
+
+    def heard(self, said):
+        """What the Stump answered an owner's command: on the status line, and
+        under the form it came from."""
+        said = [str(x) for x in said or [] if str(x).strip()]
+        for x in said:
+            log("OWNER", x)
+        if said:
+            self.busy(said[0], 4)
+        self.replies = (self.replies + said)[-6:]
+
+    # -- the OWNER tab: the Stump's owner on their own handheld --
+    def open_form(self, fid):
+        if fid not in ("owner", "setup", "rooms", "people"):
+            return
+        self.form, self.replies = fid, []
+        if fid == "setup":
+            self.fetch_setup()
+        elif fid == "rooms":
+            self.next_rooms = 0
+
+    def admin_page(self, path="/admin", body=None):
+        """An /admin page, logged in with the owner's password (a session, as
+        a browser keeps one): (status, html)."""
+        pw = self.admin_pw()
+        st = self.stump
+        if not pw or st.port is None:
+            return 0, ""
+        if body is None:
+            body = "admin_pass=" + urllib.parse.quote(pw, safe="")
+        return st.post(path, body, "application/x-www-form-urlencoded", {"Accept": "text/html"}, timeout=20)
+
+    def fetch_setup(self):
+        s, page = self.admin_page()
+        forms = parse_forms(page) if s == 200 else {}
+        self.setup = forms.get("/admin/setup")
+        if self.setup is None:
+            self.busy("Couldn't read the Stump's settings (%s)" % (s or "no admin password"), 4)
+
+    def form_set(self, fid, key, value):
+        st, pw = self.stump, self.admin_pw()
+        if not pw:
+            self.busy("No admin password on this Stump", 3)
+            return
+        try:
+            n = int(value)
+        except ValueError:
+            n = -1
+        if fid == "owner":
+            if key == "announce":
+                s, page = self.admin_page("/admin/announce")
+                self.busy(page_notice(page) or ("Announce: HTTP %s" % s), 4)
+            elif key == "restart":
+                self.busy("Restarting the Stump\u2026", 6)
+                self.restart_stump("from the owner tools")
+        elif fid == "setup":
+            ctl = [c for c in (self.setup or []) if c["name"] == key]
+            if not ctl:
+                return
+            if ctl[0]["type"] == "radio":
+                if not 0 <= n < len(ctl):
+                    return
+                value = ctl[n]["value"]
+            s, page = self.admin_page("/admin/setup", form_body(self.setup, {key: value, "admin_pass": pw}))
+            self.busy(page_notice(page) or ("Settings: HTTP %s" % s), 5)
+            self.fetch_setup()
+            self.next_info = 0
+        elif fid == "rooms":
+            if key.startswith("room:") and 0 <= n < len(SCOPES):
+                r = key[5:]
+                self.heard(st.send("/setchan %s #%s -%s%s" % (pw, r, SCOPES[n], " confirm" if SCOPES[n] == "lora" else "")))
+            elif key == "new_scope" and 0 <= n < len(SCOPES):
+                self.new_scope = SCOPES[n]
+            elif key == "new":
+                self.new_room(value, self.new_scope)
+            elif key == "topic":
+                self.heard(st.send("/topic " + value.strip()) or ["\u270e #%s" % (st.room or self.want_room)])
+            elif key.startswith("req:") and n in (1, 2):
+                self.heard(st.send("/chanreq %s -%s %s" % (pw, "a" if n == 1 else "r", key[4:])))
+            self.next_rooms = 0
+        elif fid == "people":
+            room = st.room or self.want_room
+            if key == "where" and n in (0, 1):
+                self.mod_where = ("room", "stump")[n]
+            elif key.startswith("p:") and 1 <= n <= len(MOD_ACTS):
+                act, nick = MOD_ACTS[n - 1], key[2:]
+                where = "-stump" if self.mod_where == "stump" and act != "kick" else "#" + room
+                self.heard(st.send("/%s %s %s %s" % (act, pw, where, nick)))
+            elif key == "roles":
+                self.heard(st.send("/roles " + ("-stump" if self.mod_where == "stump" else "#" + room)))
+            elif key == "bans":
+                self.heard(st.send("/bans %s %s" % (pw, "-stump" if self.mod_where == "stump" else "#" + room)))
+            st.next_poll = 0
+
+    def form_rows(self):
+        """The form on screen: (title, the form B goes back to, rows). A row:
+        {key, kind (open, choice, toggle, text, action, info), label, value,
+        options, sel, ask (1: asks first; 2: a choice that applies as it's
+        picked), max (bytes), hint}."""
+        def row(key, kind, label, value="", options=(), sel=0, ask=False, mx=0, hint=""):
+            return {"key": key, "kind": kind, "label": label, "value": value, "options": list(options), "sel": sel,
+                    "ask": ask, "max": mx, "hint": hint}
+        room = self.stump.room or self.want_room
+        pw = self.admin_pw()
+        if not pw:
+            return "Owner tools", "", [row("", "info", "No admin password on this Stump yet",
+                                           hint="set one: provisioner.py --pc ~/Stump --reconfigure")]
+        if self.form == "setup":
+            rows, seen = [], set()
+            for c in self.setup or []:
+                t, nm = c["type"], c["name"]
+                if t == "hidden" or nm in seen:
+                    continue
+                if t == "radio":
+                    seen.add(nm)
+                    opts = [x for x in self.setup if x["name"] == nm and x["type"] == "radio"]
+                    sel = next((i for i, x in enumerate(opts) if x["checked"]), 0)
+                    rows.append(row(nm, "choice", c["group"] or nm, opts[sel]["label"],
+                                    [x["label"].split(" \u2014 ")[0] for x in opts], sel, hint=opts[sel]["label"]))
+                elif t == "checkbox":
+                    rows.append(row(nm, "toggle", c["label"] or nm, "1" if c["checked"] else "0",
+                                    hint=c["label"] if len(c["label"]) > 42 else c["group"]))
+                else:
+                    mx = int(c["max"]) if t != "number" and str(c["max"]).isdigit() else (200 if t == "textarea" else 64)
+                    rows.append(row(nm, "text", c["label"] or nm, c["value"], mx=mx,
+                                    hint=c["label"] if len(c["label"]) > 42 else c["group"]))
+            if not rows:
+                rows.append(row("", "info", "Reading the Stump's own settings\u2026"))
+            return "Stump settings", "owner", rows
+        if self.form == "rooms":
+            rows = [row("", "info", "Each room reaches this Stump, the chain or LoRa",
+                        hint="local: only here  \u00b7  Wi-Fi: every Stump of the chain  \u00b7  LoRa: the radio")]
+            for r in self.room_order:
+                i = self.room_info.get(r) or {}
+                sc = i.get("scope") or "local"
+                what = "%d here%s" % (i.get("count", 0), ("  \u00b7  " + i["topic"]) if i.get("topic") else "")
+                if r in ROOMS:
+                    rows.append(row("", "info", "#%s  %s (built in)" % (r, dict(zip(SCOPES, SCOPE_NAMES)).get(sc, sc)),
+                                    hint=what))
+                else:
+                    rows.append(row("room:" + r, "choice", "#" + r, sc, SCOPE_NAMES, SCOPES.index(sc) if sc in SCOPES else 0,
+                                    ask=True, hint=what))
+            rows.append(row("new_scope", "choice", "A new room reaches", self.new_scope,
+                            ("this Stump", "the chain (Wi-Fi)", "the LoRa"), SCOPES.index(self.new_scope), ask=2))
+            rows.append(row("new", "text", "Create a room", "", mx=32, hint="its name; you join it"))
+            rows.append(row("topic", "text", "Topic of #" + room, (self.room_info.get(room) or {}).get("topic", ""),
+                            mx=120, hint="/topic in the room on screen"))
+            for q in self.requests:
+                rows.append(row("req:%d" % q["n"], "choice", "LoRa room #%s from %s" % (q["room"], q["name"]), "",
+                                ("\u2014", "accept", "refuse"), 0, ask=True, hint="another Stump offers it (/chanreq)"))
+            rows += [row("", "info", x) for x in self.replies]
+            return "Rooms", "owner", rows
+        if self.form == "people":
+            rows = [row("where", "choice", "Where", "", ("#" + room + " only", "every room of this Stump"),
+                        0 if self.mod_where == "room" else 1, ask=2)]
+            others = [u for u in self.people if u != self.my_nick]
+            for u in others:
+                rows.append(row("p:" + u, "choice", u, "", ("\u2014",) + MOD_ACTS, 0, ask=True,
+                                hint="op, mod, kick, mute, ban... (A asks first)"))
+            if not others:
+                rows.append(row("", "info", "Nobody else in #%s right now" % room))
+            rows += [row("roles", "action", "Who's op or mod"), row("bans", "action", "Who's banned or muted")]
+            rows += [row("", "info", x) for x in self.replies]
+            return "People in #" + room, "owner", rows
+        n = len(self.room_order)
+        here = len([u for u in self.people if u != self.my_nick])
+        return "Owner tools", "", [
+            row("setup", "open", "Stump settings", hint="name, bot, language, announces, files, who may enter, features"),
+            row("rooms", "open", "Rooms", hint="%d rooms  \u00b7  their reach, new rooms, LoRa offers" % n),
+            row("people", "open", "People in #" + room, hint="%d other%s here  \u00b7  op, mod, kick, mute, ban"
+                % (here, "" if here == 1 else "s")),
+            row("announce", "action", "Announce now", ask=True, hint="its address and beacon, at once"),
+            row("restart", "action", "Restart the Stump", ask=True, hint="settings that wait for a restart"),
+            row("", "info", "The rest: /admin on a phone",
+                hint="on its hotspot: the radio, the chain, plugins, themes, layout..."),
+        ]
 
     # -- the handheld's Wi-Fi (the OS's, via NetworkManager) --
     def _nmcli(self, *args, timeout=25):
@@ -499,12 +885,20 @@ class Feed:
         st = self.stump
         try:
             if op == "ROOM_VIEW" and len(parts) >= 2:
-                room = parts[1].strip().lower()
-                if room in ROOMS and room != self.want_room:
+                room = parts[1].strip().lower().lstrip("#")
+                if ROOM_RE.match(room) and room in self.room_order and room != self.want_room:
                     self.want_room = room
                     st.next_poll = 0
+            elif op == "ROOM_NEW" and len(parts) >= 2:
+                self.new_room(parts[1], "local")
+            elif op == "FORM_OPEN" and len(parts) >= 2:
+                self.open_form(parts[1].strip().lower())
+            elif op == "FORM_SET" and len(parts) >= 4:
+                self.form_set(parts[1].strip().lower(), parts[2].strip(), "|".join(parts[3:]))
             elif op == "RRC" and len(parts) >= 3:
-                room = parts[1].strip().lower() or self.want_room
+                room = parts[1].strip().lower().lstrip("#") or self.want_room
+                if not ROOM_RE.match(room):
+                    room = self.want_room
                 text = "|".join(parts[2:]).strip()
                 if not text or st.port is None:
                     self.busy("The Stump isn't answering yet", 2.5)
@@ -720,9 +1114,25 @@ class Feed:
                 clean(c["key"], 17), clip(clean(screen_line(c["name"]), 28), 28), clean(c["driver"], 15), c["job"],
                 1 if c["ap_ok"] else 0, bands, "a" if c.get("band") == "a" else "bg", 1 if c["remember"] else 0,
                 clean(c["iface"], 15), clip(clean(screen_line(c["info"]), 44), 44), c["clients"]))
-        for i, room in enumerate(ROOMS):
-            out.append("ROOM|%d|%s|%d" % (i, room.upper(), self.users[room]))
-            for m in self.msgs[room][-10:]:
+        # Every room the Stump has (the built-in ones first), the one on screen
+        # marked; its last messages. ROOM|i|room|people|reach|topic|on screen
+        view = self.stump.room or self.want_room
+        order = list(self.room_order)
+        if view not in order:
+            order.append(view)
+        if len(order) > MAX_ROOMS:
+            order = order[:MAX_ROOMS]
+            if view not in order:
+                order[-1] = view
+        for i, room in enumerate(order):
+            info = self.room_info.get(room) or {}
+            count = self.users.get(room, 0) if room == view else info.get("count", 0)
+            out.append("ROOM|%d|%s|%d|%s|%s|%d" % (i, clean(room, 32), count, clean(info.get("scope") or "", 6),
+                                                   clip(clean(screen_line(info.get("topic") or ""), 40), 41),
+                                                   1 if room == view else 0))
+            if room != view:
+                continue
+            for m in self.msgs.get(room, [])[-10:]:
                 sys_ = m.get("kind") == "system"
                 nick = "*" if sys_ else (m.get("nick") or "?")
                 if m.get("kind") == "dm":
@@ -732,6 +1142,16 @@ class Feed:
                     nick, body = "*", "%s %s" % (m.get("nick") or "?", body or "")
                 out.append("MSG|%d|%d|%s|%s" % (i, 1 if sys_ else 0, clip(clean(screen_line(nick), 16), 17),
                                                 clip(clean(screen_line(body), 44), 45)))
+        # The OWNER tab's form: FORM|id|title|back to; then its rows,
+        # FIELD|i|key|kind|asks|max|label|value|choice|opt~opt~...|hint
+        title, parent, rows = self.form_rows()
+        out.append("FORM|%s|%s|%s" % (self.form, clip(clean(screen_line(title), 40), 41), parent))
+        for i, r in enumerate(rows[:24]):
+            opts = "~".join(clip(clean(screen_line(o), 28).replace("~", "-"), 29) for o in r["options"][:10])
+            out.append("FIELD|%d|%s|%s|%d|%d|%s|%s|%d|%s|%s" % (
+                i, clean(r["key"], 40), r["kind"], int(r["ask"] or 0), int(r["max"] or 0),
+                clip(clean(screen_line(r["label"]), 44), 45), clip(clean(screen_line(r["value"]), 120), 121),
+                int(r["sel"]), opts, clip(clean(screen_line(r["hint"]), 64), 65)))
         for p in self.board[:8]:
             out.append("BOARD|%s|%s|%s|%s" % (clean(p.get("id") or "", 24), clip(clean(screen_line(p.get("sig")), 14), 15),
                                               clip(clean(screen_line(p.get("title")), 44), 45),
@@ -806,6 +1226,12 @@ class Feed:
                 self.refresh_net()
                 self.next_net = now + NET_S
             self.poll()
+            if now >= self.next_rooms and self.stump.port is not None:
+                try:
+                    self.refresh_rooms()
+                except Exception as e:
+                    log("CHAT", "rooms: %s" % e)
+                self.next_rooms = time.time() + ROOMS_S
             self.write_live()
             if once:
                 return

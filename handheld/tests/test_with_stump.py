@@ -151,6 +151,60 @@ def main():
         send("FILE_DEL_MULTI|%s" % shown)
         check("a file is deleted by its shown name (the feed maps it back)", wait(lambda: not files(), 20), files())
 
+        # ── rooms: every room the Stump has, a new one, the one on screen ──
+        rooms = lambda: [l.split("|") for l in lines() if l.startswith("ROOM|")]
+        check("the live file lists the built-in rooms first",
+              wait(lambda: [r[2] for r in rooms()][:3] == ["main", "lora-mesh", "wifi-mesh"], 20), rooms())
+        send("ROOM_NEW|Jardin Club")
+        check("a new room is made with /join, and is the one on screen",
+              wait(lambda: any(r[2] == "jardin-club" and r[6] == "1" for r in rooms()), 25), rooms())
+        brooms = lambda: json.loads(browser.open(base + "/rrc/poll?room=wifi-mesh&since=0").read()).get("rooms", [])
+        check("... the Stump has it (a browser sees it in its list)", wait(lambda: "jardin-club" in brooms(), 10), brooms())
+        send("RRC|jardin-club|Bonjour le jardin")
+        check("a line in that room comes back in the live file",
+              wait(lambda: any(l.startswith("MSG|") and "Bonjour le jardin" in l for l in lines()), 20))
+        send("ROOM_VIEW|wifi-mesh")
+        check("ROOM_VIEW moves back to #wifi-mesh",
+              wait(lambda: any(r[2] == "wifi-mesh" and r[6] == "1" for r in rooms()), 20), rooms())
+
+        # ── the OWNER tab: the Stump's settings, rooms, people ──────────
+        fields = lambda: [l.split("|") for l in lines() if l.startswith("FIELD|")]
+        form = lambda: next((l.split("|") for l in lines() if l.startswith("FORM|")), [])
+        check("the owner tools are listed", wait(lambda: form()[1:2] == ["owner"] and len(fields()) >= 5, 15), fields())
+        send("FORM_OPEN|setup")
+        check("the Stump's own settings form, read from its /admin",
+              wait(lambda: form()[1:2] == ["setup"] and any(f[2] == "node_name" and f[7] == "R36Test" for f in fields()),
+                   20), fields())
+        send("FORM_SET|setup|bot_name|Barkeep")
+        send("FORM_SET|setup|announce_stamp|1")
+        cfgtext = lambda: open(cfg, encoding="utf-8").read()
+        check("a setting is saved through /admin/setup, into config.py",
+              wait(lambda: "BOT_NAME = 'Barkeep'" in cfgtext() and "ANNOUNCE_STAMP = True" in cfgtext(), 20),
+              [l for l in cfgtext().splitlines() if l.startswith(("BOT_NAME", "ANNOUNCE_STAMP"))])
+        check("... the others left as they were", "NODE_NAME = 'R36Test'" in cfgtext() and "'chat'" in cfgtext())
+        send("FORM_OPEN|rooms")
+        send("FORM_SET|rooms|new_scope|1")
+        send("FORM_SET|rooms|new|potluck")
+        check("a room reaching the chain is made with /create (the admin password from config.py)",
+              wait(lambda: any(r[2] == "potluck" and r[4] == "wifi" for r in rooms()), 25), rooms())
+        send("FORM_SET|rooms|room:jardin-club|1")
+        check("a room's reach is changed with /setchan",
+              wait(lambda: any(r[2] == "jardin-club" and r[4] == "wifi" for r in rooms()), 25), rooms())
+        # someone in #potluck to moderate (the feed's room now)
+        zoe = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(), urllib.request.ProxyHandler({}))
+        zoe.open(base + "/").read()
+        zsend = lambda t: zoe.open(urllib.request.Request(base + "/rrc/send", data=t.encode(), method="POST")).read()
+        zsend("/nick zoe")
+        zsend("/join #potluck")
+        send("ROOM_VIEW|potluck")
+        send("FORM_OPEN|people")
+        check("the people form lists who's in the room", wait(lambda: any(f[2] == "p:zoe" for f in fields()), 25),
+              fields())
+        send("FORM_SET|people|p:zoe|%d" % (["op", "deop", "mod", "demod", "kick", "mute", "unmute", "ban",
+                                           "unban"].index("kick") + 1))
+        zroom = lambda: json.loads(zoe.open(base + "/rrc/poll?room=potluck&since=0").read()).get("room")
+        check("a kick, with the admin password: zoe is out of #potluck", wait(lambda: zroom() == "main", 20), zroom())
+
         # ── the rest ─────────────────────────────────────────────────────
         send("DEBUG_EXPORT_TF")
         check("diagnostics saved to the TF card", wait(lambda: any(f.startswith("diagnostics_") for f in os.listdir(tf)), 15))

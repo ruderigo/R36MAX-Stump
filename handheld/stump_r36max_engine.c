@@ -1,6 +1,6 @@
 /*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.5.4-b.86.
+ * (RK3326 / dArkOS), v2.6.0-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -47,7 +47,9 @@
 #define ALSA_PERIOD     512
 #define IPC_UDP_PORT    42421
 
+#ifndef LIVE_STATE_FILE                  /* (a test too) */
 #define LIVE_STATE_FILE "/dev/shm/stump_live.txt"
+#endif
 #ifndef CMD_QUEUE_FILE                   /* a test can point it elsewhere */
 #define CMD_QUEUE_FILE  "/dev/shm/stump_cmd.txt"
 #endif
@@ -704,7 +706,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.5.4-b.86"
+#define STUMP_ENGINE_VERSION "v2.6.0-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 10
 #define MAX_DBG_LINES 16
@@ -723,6 +725,30 @@ typedef struct {
     char body[46];
     bool is_sys;
 } ChatLine;
+
+/* A room of the Stump, from the feed's ROOM| lines (every room it has). */
+#define MAX_ROOMS 16
+typedef struct {
+    char slug[33];
+    int  users;
+    char scope[8];       /* local, wifi, lora ("" not said) */
+    char topic[42];
+} RoomItem;
+
+/* The OWNER tab: one row of the form the feed sends (FIELD| lines). */
+#define MAX_FIELDS 24
+typedef struct {
+    char key[41];
+    char kind[8];        /* open, choice, toggle, text, action, info */
+    int  ask;            /* 1: asks first (Yes / No); 2: a choice that applies as it's picked */
+    int  max;            /* a text's most bytes */
+    char label[46];
+    char value[122];
+    int  sel;            /* a choice: the option it has */
+    int  nopts;
+    char opts[10][30];
+    char hint[66];
+} FormField;
 
 typedef struct {
     char id[28];
@@ -840,9 +866,23 @@ typedef struct {
     char            input_buf[300];
     int             input_len;
     TransportStatus net;
-    ChatLine        rooms[3][MAX_LOG_LINES];
-    int             room_counts[3];
-    int             room_users[3];
+    ChatLine        rooms[MAX_ROOMS][MAX_LOG_LINES];
+    int             room_counts[MAX_ROOMS];
+    RoomItem        room_list[MAX_ROOMS];
+    int             room_n;
+    char            view_room[33];        /* the room on screen, by name (its index can move) */
+    uint64_t        room_changed_ms;      /* when L/R last changed it (the feed's choice waits) */
+    char            form_id[16];          /* OWNER: the feed's form on screen */
+    char            form_title[42];
+    char            form_parent[16];
+    FormField       fields[MAX_FIELDS];
+    int             field_n;
+    int             form_cursor;
+    int             form_pick[MAX_FIELDS];   /* a choice being picked with ←/→ (-1: none) */
+    char            form_edit_key[41];       /* the text row the keyboard is writing */
+    int             form_edit_max;
+    char            form_edit_label[46];
+    char            pending_cmd[400];        /* what a Yes sends (confirm_type 4) */
     BoardItem       board[8];
     int             board_count;
     ShelfItem       files[8];
@@ -875,7 +915,10 @@ static void handle_sig(int sig) {
     g_st.running = false;
 }
 
-static const char *ROOM_SLUGS[3] = { "main", "lora-mesh", "wifi-mesh" };
+/* The room at an index of the list (or #wifi-mesh before the feed has said). */
+static const char *room_slug(int i) {
+    return (i >= 0 && i < g_st.room_n && g_st.room_list[i].slug[0]) ? g_st.room_list[i].slug : "wifi-mesh";
+}
 
 
 /* 4x10 On-Screen Keyboard (OSK) Grid (Y to open/close, A to type, B to cancel/close) */
@@ -932,7 +975,7 @@ static void send_bridge_cmd(const char *cmd_line) {
 }
 
 static void push_chat_local(int room, const char *nick, const char *body, bool is_sys) {
-    if (room < 0 || room > 2) return;
+    if (room < 0 || room >= MAX_ROOMS) return;
     int idx = g_st.room_counts[room];
     if (idx >= MAX_LOG_LINES) {
         memmove(&g_st.rooms[room][0], &g_st.rooms[room][1], sizeof(ChatLine) * (MAX_LOG_LINES - 1));
@@ -1108,6 +1151,22 @@ static void go_network_tab(void) {
 }
 
 static void send_typed_chat(void) {
+    if (g_st.osk_target == 2 || g_st.osk_target == 3) {
+        /* 2: a new room's name (it's made, and on screen); 3: an OWNER row's text */
+        char cmd[400];
+        if (g_st.osk_target == 2) snprintf(cmd, sizeof(cmd), "ROOM_NEW|%s", g_st.input_buf);
+        else snprintf(cmd, sizeof(cmd), "FORM_SET|%s|%s|%s", g_st.form_id, g_st.form_edit_key, g_st.input_buf);
+        if (g_st.input_len > 0 || g_st.osk_target == 3) {
+            send_bridge_cmd(cmd);
+            set_ui_busy(g_st.osk_target == 2 ? "Making the room…" : "Saving…", 1400);
+            trigger_chime(840, 55);
+        }
+        g_st.osk_open = false;
+        g_st.osk_target = 0;
+        g_st.input_len = 0;
+        g_st.input_buf[0] = '\0';
+        return;
+    }
     if (g_st.tab_idx == 4 || g_st.osk_target == 1) {
         commit_chain_settings(g_st.input_buf, g_st.chain_role_idx);
         g_st.osk_open = false;
@@ -1118,7 +1177,7 @@ static void send_typed_chat(void) {
     }
     if (g_st.input_len <= 0) return;
     int r = g_st.room_idx;
-    const char *rslug = ROOM_SLUGS[r];
+    const char *rslug = room_slug(r);
     char cmd[400];
     snprintf(cmd, sizeof(cmd), "RRC|%s|%s", rslug, g_st.input_buf);
     send_bridge_cmd(cmd);
@@ -1227,6 +1286,145 @@ static void sync_disk_fallback(void) {
     snprintf(g_st.node_lxmf, sizeof(g_st.node_lxmf), "WAITING FOR THE STUMP");
 }
 
+/* A live line's fields, split in place on '|' (n at most): how many. */
+static int split_bar(char *line, char **out, int n) {
+    int k = 0;
+    char *p = line;
+    while (k < n) {
+        out[k++] = p;
+        char *q = strchr(p, '|');
+        if (!q) break;
+        *q = '\0';
+        p = q + 1;
+    }
+    return k;
+}
+
+static bool form_row_does(int i) {
+    return i >= 0 && i < g_st.field_n && strcmp(g_st.fields[i].kind, "info") != 0;
+}
+
+/* ↑/↓ on the OWNER tab: the next row that does something (dir 0: stay on
+ * one, or go to the nearest). */
+static void form_move(int dir) {
+    int n = g_st.field_n;
+    if (n <= 0) { g_st.form_cursor = 0; return; }
+    int c = g_st.form_cursor;
+    if (c < 0 || c >= n) c = 0;
+    if (dir == 0) {
+        if (form_row_does(c)) { g_st.form_cursor = c; return; }
+        dir = 1;
+    } else {
+        g_st.form_pick[c] = -1;                  /* leaving a choice unpicked */
+    }
+    for (int k = 1; k <= n; k++) {
+        int i = ((c + dir * k) % n + n) % n;
+        if (form_row_does(i)) { g_st.form_cursor = i; trigger_chime(500, 20); return; }
+    }
+    g_st.form_cursor = c;
+}
+
+/* L/R on the chat tab: the next or previous room the Stump has. */
+static void room_step(int dir) {
+    if (g_st.room_n <= 0) return;
+    g_st.room_idx = ((g_st.room_idx + dir) % g_st.room_n + g_st.room_n) % g_st.room_n;
+    snprintf(g_st.view_room, sizeof(g_st.view_room), "%s", room_slug(g_st.room_idx));
+    g_st.room_changed_ms = monotonic_ms();
+    trigger_chime(520, 20);
+}
+
+/* The OWNER tab's rows. A choice: ←/→ picks, A applies (asking first where
+ * the feed says so); a toggle: A flips it; a text: A opens the keyboard on
+ * it; open: A goes into that form; action: A does it. */
+static void form_send(const char *cmd, bool ask, const char *what) {
+    if (ask) {
+        snprintf(g_st.pending_cmd, sizeof(g_st.pending_cmd), "%s", cmd);
+        snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "%.55s", what);
+        g_st.confirm_type = 4;
+        g_st.confirm_choice = 0;                 /* No first: these change the Stump */
+        g_st.confirm_open = true;
+        trigger_chime(660, 40);
+        return;
+    }
+    send_bridge_cmd(cmd);
+    set_ui_busy("Sending to the Stump…", 1400);
+    trigger_chime(840, 55);
+}
+
+static void form_pick_dir(int dir) {
+    int c = g_st.form_cursor;
+    if (!form_row_does(c)) return;
+    FormField *ff = &g_st.fields[c];
+    if (strcmp(ff->kind, "choice") != 0 || ff->nopts <= 0) return;
+    int cur = g_st.form_pick[c] >= 0 ? g_st.form_pick[c] : ff->sel;
+    g_st.form_pick[c] = ((cur + dir) % ff->nopts + ff->nopts) % ff->nopts;
+    trigger_chime(540, 25);
+    if (ff->ask == 2) {                          /* a setting of this page: applied as it's picked */
+        char cmd[400];
+        snprintf(cmd, sizeof(cmd), "FORM_SET|%s|%s|%d", g_st.form_id, ff->key, g_st.form_pick[c]);
+        ff->sel = g_st.form_pick[c];
+        g_st.form_pick[c] = -1;
+        send_bridge_cmd(cmd);
+    }
+}
+
+static void form_activate(void) {
+    int c = g_st.form_cursor;
+    if (!form_row_does(c)) return;
+    FormField *ff = &g_st.fields[c];
+    char cmd[400], what[120];
+    if (strcmp(ff->kind, "open") == 0) {
+        snprintf(cmd, sizeof(cmd), "FORM_OPEN|%s", ff->key);
+        send_bridge_cmd(cmd);
+        g_st.suppress_poll_frames = 0;
+        trigger_chime(620, 35);
+    } else if (strcmp(ff->kind, "choice") == 0) {
+        int pick = g_st.form_pick[c];
+        if (pick < 0 || pick == ff->sel || pick >= ff->nopts) {
+            set_ui_busy("←/→ to pick, then A", 1400);
+            trigger_chime(480, 30);
+            return;
+        }
+        snprintf(cmd, sizeof(cmd), "FORM_SET|%s|%s|%d", g_st.form_id, ff->key, pick);
+        snprintf(what, sizeof(what), "%s: %s", ff->label, ff->opts[pick]);
+        g_st.form_pick[c] = -1;
+        form_send(cmd, ff->ask == 1, what);
+    } else if (strcmp(ff->kind, "toggle") == 0) {
+        bool on = strcmp(ff->value, "1") == 0;
+        snprintf(cmd, sizeof(cmd), "FORM_SET|%s|%s|%d", g_st.form_id, ff->key, on ? 0 : 1);
+        snprintf(what, sizeof(what), "%s: %s", ff->label, on ? "off" : "on");
+        form_send(cmd, ff->ask == 1, what);
+    } else if (strcmp(ff->kind, "text") == 0) {
+        snprintf(g_st.form_edit_key, sizeof(g_st.form_edit_key), "%s", ff->key);
+        snprintf(g_st.form_edit_label, sizeof(g_st.form_edit_label), "%s", ff->label);
+        g_st.form_edit_max = ff->max > 0 ? ff->max : 64;
+        snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%.*s", g_st.form_edit_max, ff->value);
+        g_st.input_len = (int)strlen(g_st.input_buf);
+        g_st.osk_target = 3;
+        g_st.osk_open = true;
+        trigger_chime(740, 45);
+    } else if (strcmp(ff->kind, "action") == 0) {
+        snprintf(cmd, sizeof(cmd), "FORM_SET|%s|%s|1", g_st.form_id, ff->key);
+        form_send(cmd, ff->ask == 1, ff->label);
+    }
+}
+
+static void form_back(void) {
+    int c = g_st.form_cursor;
+    if (c >= 0 && c < MAX_FIELDS && g_st.form_pick[c] >= 0) {
+        g_st.form_pick[c] = -1;                  /* a pick undone first */
+        trigger_chime(460, 30);
+        return;
+    }
+    if (g_st.form_parent[0]) {
+        char cmd[48];
+        snprintf(cmd, sizeof(cmd), "FORM_OPEN|%s", g_st.form_parent);
+        send_bridge_cmd(cmd);
+        g_st.suppress_poll_frames = 0;
+        trigger_chime(460, 35);
+    }
+}
+
 static void poll_live_bridge(void) {
     if (g_st.suppress_poll_frames > 0) return;
     FILE *f = fopen(LIVE_STATE_FILE, "r");
@@ -1250,7 +1448,12 @@ static void poll_live_bridge(void) {
         }
     }
 
-    int r_counts[3] = {0, 0, 0};
+    int r_counts[MAX_ROOMS] = {0};
+    int rm_count = 0, feed_view = -1;
+    int fl_count = 0;
+    char new_form[16] = "";
+    char keep_view[33];
+    snprintf(keep_view, sizeof(keep_view), "%s", g_st.view_room[0] ? g_st.view_room : room_slug(g_st.room_idx));
     int b_count = 0;
     int f_count = 0;
     int w_count = 0;
@@ -1429,17 +1632,56 @@ static void poll_live_bridge(void) {
                 snprintf(l->info, sizeof(l->info), "%.47s", fld[9]);
                 l->clients = atoi(fld[10]);
             }
-        } else if (strncmp(line, "ROOM|", 5) == 0) {
-            int r_idx = atoi(line + 5);
-            char *p2 = strchr(line + 5, '|');
-            if (p2 && r_idx >= 0 && r_idx < 3) {
-                char *p3 = strchr(p2 + 1, '|');
-                if (p3) g_st.room_users[r_idx] = atoi(p3 + 1);
+        } else if (strncmp(line, "ROOM|", 5) == 0 && rm_count < MAX_ROOMS) {
+            /* ROOM|i|room|people|reach|topic|on screen */
+            char *f[7];
+            if (split_bar(line + 5, f, 7) >= 3) {
+                RoomItem *ri = &g_st.room_list[rm_count];
+                snprintf(ri->slug, sizeof(ri->slug), "%.32s", f[1]);
+                ri->users = atoi(f[2]);
+                snprintf(ri->scope, sizeof(ri->scope), "%.7s", f[3] ? f[3] : "");
+                snprintf(ri->topic, sizeof(ri->topic), "%.41s", f[4] ? f[4] : "");
+                if (f[5] && atoi(f[5]) == 1) feed_view = rm_count;
+                rm_count++;
+            }
+        } else if (strncmp(line, "FORM|", 5) == 0) {
+            /* FORM|id|title|back to */
+            char *f[3];
+            int n = split_bar(line + 5, f, 3);
+            snprintf(new_form, sizeof(new_form), "%.15s", f[0]);
+            snprintf(g_st.form_title, sizeof(g_st.form_title), "%.41s", n > 1 ? f[1] : "");
+            snprintf(g_st.form_parent, sizeof(g_st.form_parent), "%.15s", n > 2 ? f[2] : "");
+        } else if (strncmp(line, "FIELD|", 6) == 0 && fl_count < MAX_FIELDS) {
+            /* FIELD|i|key|kind|asks|max|label|value|choice|opt~opt~...|hint */
+            char *f[10];
+            if (split_bar(line + 6, f, 10) >= 7) {
+                FormField *ff = &g_st.fields[fl_count];
+                bool same = (strcmp(ff->key, f[1]) == 0);
+                snprintf(ff->key, sizeof(ff->key), "%.40s", f[1]);
+                snprintf(ff->kind, sizeof(ff->kind), "%.7s", f[2]);
+                ff->ask = atoi(f[3]);
+                ff->max = atoi(f[4]);
+                snprintf(ff->label, sizeof(ff->label), "%.45s", f[5]);
+                snprintf(ff->value, sizeof(ff->value), "%.121s", f[6]);
+                ff->sel = f[7] ? atoi(f[7]) : 0;
+                ff->nopts = 0;
+                if (f[8] && f[8][0]) {
+                    char *o = f[8];
+                    while (o && ff->nopts < 10) {
+                        char *t = strchr(o, '~');
+                        if (t) *t++ = '\0';
+                        snprintf(ff->opts[ff->nopts++], 30, "%.29s", o);
+                        o = t;
+                    }
+                }
+                snprintf(ff->hint, sizeof(ff->hint), "%.65s", f[9] ? f[9] : "");
+                if (!same) g_st.form_pick[fl_count] = -1;
+                fl_count++;
             }
         } else if (strncmp(line, "MSG|", 4) == 0) {
             int r_idx = atoi(line + 4);
             char *p1 = strchr(line + 4, '|');
-            if (p1 && r_idx >= 0 && r_idx < 3 && r_counts[r_idx] < MAX_LOG_LINES) {
+            if (p1 && r_idx >= 0 && r_idx < MAX_ROOMS && r_counts[r_idx] < MAX_LOG_LINES) {
                 int is_sys = atoi(p1 + 1);
                 char *p2 = strchr(p1 + 1, '|');
                 if (p2) {
@@ -1504,7 +1746,27 @@ static void poll_live_bridge(void) {
         }
     }
     fclose(f);
-    for (int r = 0; r < 3; r++) g_st.room_counts[r] = r_counts[r];
+    for (int r = 0; r < MAX_ROOMS; r++) g_st.room_counts[r] = r_counts[r];
+    if (rm_count > 0) {
+        /* The room on screen stays the one it was, by name; the feed's wins when
+         * it moved on its own (a room just made) and L/R hasn't been used lately. */
+        g_st.room_n = rm_count;
+        int at = -1;
+        for (int i = 0; i < rm_count; i++) if (strcmp(g_st.room_list[i].slug, keep_view) == 0) at = i;
+        bool quiet = monotonic_ms() - g_st.room_changed_ms > 4000;
+        if (feed_view >= 0 && (at < 0 || (quiet && feed_view != at))) at = feed_view;
+        g_st.room_idx = at >= 0 ? at : 0;
+        snprintf(g_st.view_room, sizeof(g_st.view_room), "%s", room_slug(g_st.room_idx));
+    }
+    if (new_form[0]) {
+        if (strcmp(new_form, g_st.form_id) != 0) {
+            snprintf(g_st.form_id, sizeof(g_st.form_id), "%s", new_form);
+            g_st.form_cursor = -1;                       /* (to its first row that does something) */
+            for (int i = 0; i < MAX_FIELDS; i++) g_st.form_pick[i] = -1;
+        }
+        g_st.field_n = fl_count;
+        form_move(0);
+    }
     g_st.board_count = b_count;
     g_st.file_count = f_count;
     g_st.wifi_count = w_count;
@@ -1573,7 +1835,7 @@ static void *alsa_chime_thread(void *arg) {
 
 static void execute_rrc_deck_action(void) {
     int r = g_st.room_idx;
-    const char *rslug = ROOM_SLUGS[r];
+    const char *rslug = room_slug(r);
     int c = g_st.cmd_cursor;
     char cmd[256];
     set_ui_busy("Sending the command…", 1200);
@@ -1602,12 +1864,13 @@ static void execute_rrc_deck_action(void) {
         push_chat_local(r, "r36max", "!roll 2d6", false);
         trigger_chime(740, 60);
     } else if (c == 4) {
-        g_st.beacons_sent++;
-        broadcast_udp_beacon("BEACON", "STUMP.NODE ANNOUNCE");
-        snprintf(cmd, sizeof(cmd), "ANNOUNCE|%s", rslug);
-        send_bridge_cmd(cmd);
-        push_chat_local(r, "r36max", "[BEACON] Announced on Wi-Fi + Mesh", true);
-        trigger_chime(987, 80);
+        /* A new room on this Stump: its name on the keyboard (OWNER -> Rooms for one reaching further) */
+        set_ui_busy("", 0);
+        g_st.osk_target = 2;
+        g_st.osk_open = true;
+        g_st.input_len = 0;
+        g_st.input_buf[0] = '\0';
+        trigger_chime(740, 45);
     } else {
         broadcast_udp_beacon("CHAT", "Hello from R36MAX handheld operator!");
         snprintf(cmd, sizeof(cmd), "RRC|%s|Hello from R36MAX handheld operator!", rslug);
@@ -1822,9 +2085,13 @@ static uint32_t cp_upper(uint32_t c) {
     return c;
 }
 
-static bool cmp_is_chat(void) { return g_st.tab_idx != 3 && g_st.tab_idx != 4 && g_st.osk_target != 1; }
+static bool cmp_is_chat(void) {
+    return g_st.osk_target == 0 && g_st.tab_idx != 3 && g_st.tab_idx != 4 && g_st.tab_idx != 5;
+}
 static const char *cmp_send_label(void) { return cmp_is_chat() ? "SEND" : "OK"; }
 static int cmp_max_bytes(void) {
+    if (g_st.osk_target == 2) return 32;                          /* a room's name */
+    if (g_st.osk_target == 3) return g_st.form_edit_max > 0 ? g_st.form_edit_max : 64;
     if (g_st.osk_target == 1 || g_st.tab_idx == 4) return 50;    /* chain secret */
     return 295;                                                   /* one LoRa packet's text */
 }
@@ -1854,7 +2121,7 @@ static void cmp_close(bool keep) {
 }
 
 static void cmp_finish(void) {
-    if (g_st.input_len <= 0 && cmp_is_chat()) { cmp_close(false); return; }
+    if (g_st.input_len <= 0 && (cmp_is_chat() || g_st.osk_target == 2)) { cmp_close(false); return; }
     send_typed_chat();                 /* chat line or chain secret, by purpose */
     cmp_close(false);
 }
@@ -1967,11 +2234,10 @@ static void compose_draw(uint32_t *fb, const ThemeColors *th) {
     fill_rect(fb, 0, 0, W, H, th->bg);
     int line = cline(F24);
     char title[96];
-    if (g_st.osk_target == 1 || g_st.tab_idx == 4) snprintf(title, sizeof(title), "Chain secret");
-    else {
-        const char *rooms[3] = { "#main", "#lora-mesh", "#wifi-mesh" };
-        snprintf(title, sizeof(title), "To %s", rooms[g_st.room_idx % 3]);
-    }
+    if (g_st.osk_target == 2) snprintf(title, sizeof(title), "A new room on this Stump");
+    else if (g_st.osk_target == 3) snprintf(title, sizeof(title), "%.90s", g_st.form_edit_label);
+    else if (g_st.osk_target == 1 || g_st.tab_idx == 4) snprintf(title, sizeof(title), "Chain secret");
+    else snprintf(title, sizeof(title), "To #%.80s", room_slug(g_st.room_idx));
     ctext(fb, F30B, 14, 8, title, th->ember, W - 28);
 
     /* The text, wrapped, the end of it shown, a cursor after it. */
@@ -2058,7 +2324,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.5.4-b.86");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.6.0-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -2187,7 +2453,7 @@ int main(int argc, char **argv) {
     uint32_t *fb = calloc(PANEL_W * PANEL_H, sizeof(uint32_t));
     bool select_held = false, start_held = false;
     int frames = 0;
-    int last_room_view = -1;
+    char last_room_view[33] = "";
 
     while (g_st.running) {
         if (fn_PumpEvents && tex) fn_PumpEvents();
@@ -2195,7 +2461,7 @@ int main(int argc, char **argv) {
         if (g_st.suppress_poll_frames > 0) g_st.suppress_poll_frames--;
         if (g_st.osk_open && !g_cmp.was_open) cmp_reset();
         g_cmp.was_open = g_st.osk_open;
-        if (getenv("STUMP_COCKPIT_TAB") && frames == 0) g_st.tab_idx = atoi(getenv("STUMP_COCKPIT_TAB")) % 5;
+        if (getenv("STUMP_COCKPIT_TAB") && frames == 0) g_st.tab_idx = atoi(getenv("STUMP_COCKPIT_TAB")) % 6;
         if (getenv("STUMP_COCKPIT_CONFIRM") && frames == 0) {          /* screenshots in tests */
             g_st.confirm_open = true;
             g_st.confirm_type = atoi(getenv("STUMP_COCKPIT_CONFIRM"));
@@ -2212,12 +2478,12 @@ int main(int argc, char **argv) {
         }
 
         /* The room on screen: the feed joins it (the Stump keeps one current room per client). */
-        if (g_st.room_idx != last_room_view || frames % 300 == 0) {
+        if (g_st.room_n > 0 && (strcmp(room_slug(g_st.room_idx), last_room_view) != 0 || frames % 300 == 0)) {
             char rv[48];
-            snprintf(rv, sizeof(rv), "ROOM_VIEW|%s", ROOM_SLUGS[g_st.room_idx]);
+            snprintf(rv, sizeof(rv), "ROOM_VIEW|%s", room_slug(g_st.room_idx));
             send_bridge_cmd(rv);
             g_st.suppress_poll_frames = 0;
-            last_room_view = g_st.room_idx;
+            snprintf(last_room_view, sizeof(last_room_view), "%s", room_slug(g_st.room_idx));
         }
 
         /* Poll live Python Stump state every 10 frames (~160ms) */
@@ -2318,6 +2584,11 @@ int main(int argc, char **argv) {
                                 if (g_st.confirm_type == 1) action_board_delete_checked();
                                 else if (g_st.confirm_type == 2) action_file_delete_checked();
                                 else if (g_st.confirm_type == 3) limb_confirmed();
+                                else if (g_st.confirm_type == 4) {
+                                    send_bridge_cmd(g_st.pending_cmd);
+                                    set_ui_busy("Sending to the Stump…", 1400);
+                                    trigger_chime(840, 55);
+                                }
                             } else {
                                 if (g_st.confirm_type == 3) g_st.limb_pick = -1;
                                 set_ui_busy("Cancelled: nothing changed", 1000);
@@ -2342,6 +2613,7 @@ int main(int argc, char **argv) {
                             if (g_st.tab_idx == 1) action_board_add();
                             else if (g_st.tab_idx == 2) action_file_add();
                             else if (g_st.tab_idx == 3) network_tab_a();
+                            else if (g_st.tab_idx == 5) form_activate();
                             else if (g_st.tab_idx == 4) {
                                 if (g_st.osk_open || g_st.input_len > 0) send_typed_chat();
                                 else if (g_st.rev_cursor == 2) open_chain_secret_osk();
@@ -2354,11 +2626,11 @@ int main(int argc, char **argv) {
                         } else if (ev.code == KEY_ESC && pressed) {
                             if (g_st.osk_open) { g_st.osk_open = false; g_st.osk_target = 0; }
                             else if (g_st.tab_idx == 3) g_st.limb_pick = -1;
+                            else if (g_st.tab_idx == 5) form_back();
                             trigger_chime(480, 30);
                             continue;
                         } else if (ev.code == KEY_TAB && pressed) {
-                            g_st.room_idx = (g_st.room_idx + 1) % 3;
-                            trigger_chime(520, 25);
+                            room_step(1);
                             continue;
                         } else if (key_press_or_rep) {
                             char kch = translate_linux_key(ev.code, g_st.shift_held);
@@ -2377,6 +2649,7 @@ int main(int argc, char **argv) {
                                     open_delete_confirm(g_st.tab_idx);
                                     continue;
                                 }
+                                if (g_st.tab_idx == 5) continue;     /* OWNER: A on a text row opens the keyboard */
                                 if (g_st.tab_idx == 4) {
                                     g_st.osk_target = 1;
                                 } else if (g_st.tab_idx != 0) {
@@ -2402,11 +2675,14 @@ int main(int argc, char **argv) {
                             } else if (g_st.tab_idx == 4) {
                                 if (g_st.osk_open) send_typed_chat();
                                 else go_network_tab();
+                            } else if (g_st.tab_idx == 5) {
+                                form_activate();
                             } else if (g_st.input_len > 0) {
                                 send_typed_chat();
-                            } else {
-                                g_st.cmd_cursor = 4;
-                                execute_rrc_deck_action();
+                            } else {                     /* nothing written yet: the keyboard */
+                                g_st.osk_target = 0;
+                                g_st.osk_open = true;
+                                trigger_chime(740, 45);
                             }
                         }
                     }
@@ -2421,12 +2697,12 @@ int main(int argc, char **argv) {
                         if (ev.code == BTN_TL || ev.code == 310) {
                             g_st.confirm_open = false;
                             g_st.osk_open = false;
-                            g_st.tab_idx = (g_st.tab_idx + 4) % 5;
+                            g_st.tab_idx = (g_st.tab_idx + 5) % 6;
                             trigger_chime(523, 35);
                         } else if (ev.code == BTN_TR || ev.code == 311) {
                             g_st.confirm_open = false;
                             g_st.osk_open = false;
-                            g_st.tab_idx = (g_st.tab_idx + 1) % 5;
+                            g_st.tab_idx = (g_st.tab_idx + 1) % 6;
                             trigger_chime(659, 35);
                         } else if (ev.code == BTN_TL2 || ev.code == BTN_TR2 || ev.code == 312 || ev.code == 313) {
                             g_st.theme_idx = (g_st.theme_idx + 1) % 5;
@@ -2446,8 +2722,8 @@ int main(int argc, char **argv) {
                                 else if (ev.code == R36_BTN_B_CANCEL) { g_st.osk_open = false; trigger_chime(480, 35); }
                                 else if (ev.code == 307) { input_backspace(); trigger_chime(420, 25); }
                             } else {
-                                if (ev.code == BTN_DPAD_LEFT || ev.code == 546) { g_st.room_idx = (g_st.room_idx + 2) % 3; trigger_chime(520, 20); }
-                                else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) { g_st.room_idx = (g_st.room_idx + 1) % 3; trigger_chime(520, 20); }
+                                if (ev.code == BTN_DPAD_LEFT || ev.code == 546) room_step(-1);
+                                else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) room_step(1);
                                 else if (ev.code == BTN_DPAD_UP || ev.code == 544) { g_st.cmd_cursor = (g_st.cmd_cursor + 5) % 6; trigger_chime(500, 20); }
                                 else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) { g_st.cmd_cursor = (g_st.cmd_cursor + 1) % 6; trigger_chime(500, 20); }
                                 else if (ev.code == R36_BTN_A_ACCEPT) {
@@ -2610,6 +2886,14 @@ int main(int argc, char **argv) {
                                     trigger_chime(660, 45);
                                 }
                             }
+                        } else if (g_st.tab_idx == 5) {
+                            /* Panel 6 (OWNER): the feed's form */
+                            if (ev.code == BTN_DPAD_UP || ev.code == 544) form_move(-1);
+                            else if (ev.code == BTN_DPAD_DOWN || ev.code == 545) form_move(1);
+                            else if (ev.code == BTN_DPAD_LEFT || ev.code == 546) form_pick_dir(-1);
+                            else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547) form_pick_dir(1);
+                            else if (ev.code == R36_BTN_A_ACCEPT) form_activate();
+                            else if (ev.code == R36_BTN_B_CANCEL) form_back();
                         } else if (g_st.tab_idx == 4) {
                             /* Panel 5 (SETUP): the Wi-Fi cards (shown; jobs on NETWORK), chain, tools, log */
                             if (g_st.osk_open) {
@@ -2699,8 +2983,8 @@ int main(int argc, char **argv) {
                             if (ev.code == ABS_HAT0Y && ev.value < 0) g_st.osk_row = (g_st.osk_row + 3) % 4;
                             if (ev.code == ABS_HAT0Y && ev.value > 0) g_st.osk_row = (g_st.osk_row + 1) % 4;
                         } else {
-                            if (ev.code == ABS_HAT0X && ev.value < 0) g_st.room_idx = (g_st.room_idx + 2) % 3;
-                            if (ev.code == ABS_HAT0X && ev.value > 0) g_st.room_idx = (g_st.room_idx + 1) % 3;
+                            if (ev.code == ABS_HAT0X && ev.value < 0) room_step(-1);
+                            if (ev.code == ABS_HAT0X && ev.value > 0) room_step(1);
                             if (ev.code == ABS_HAT0Y && ev.value < 0) g_st.cmd_cursor = (g_st.cmd_cursor + 5) % 6;
                             if (ev.code == ABS_HAT0Y && ev.value > 0) g_st.cmd_cursor = (g_st.cmd_cursor + 1) % 6;
                         }
@@ -2757,6 +3041,9 @@ int main(int argc, char **argv) {
                                 }
                             }
                         }
+                    } else if (g_st.tab_idx == 5) {
+                        if (ev.code == ABS_HAT0Y) form_move(ev.value < 0 ? -1 : 1);
+                        if (ev.code == ABS_HAT0X) form_pick_dir(ev.value < 0 ? -1 : 1);
                     } else if (g_st.tab_idx == 4) {
                         if (g_st.osk_open) {
                             if (ev.code == ABS_HAT0X && ev.value < 0) g_st.osk_col = (g_st.osk_col + 9) % 10;
@@ -2799,14 +3086,13 @@ int main(int argc, char **argv) {
             fill_rect(fb, 0, 0, PANEL_W, hl + 14, th->panel2);
             ctext(fb, F30B, 12, 4, "Stump", th->ember, 0);
             int tx = 12 + font_width(F30B, "Stump  ");
-            const char *tabs[5] = { "CHATS", "BOARD", "FILES", "NETWORK", "SETUP" };
-            for (int t = 0; t < 5; t++) {
-                int w = font_width(F24, tabs[t]) + 14;
+            const char *tabs[6] = { "CHATS", "BOARD", "FILES", "NETWORK", "SETUP", "OWNER" };
+            for (int t = 0; t < 6; t++) {               /* six tabs: a size smaller, so the link dot fits */
+                int w = font_width(F20, tabs[t]) + 12;
                 bool act = (t == g_st.tab_idx);
-                bool dirty = false;
-                if (act) fill_rrect(fb, tx, 6, w, hl + 2, 4, th->ember);
-                ctext(fb, F24, tx + 7, 7, tabs[t], act ? th->bg : (dirty ? th->ok : th->muted), 0);
-                tx += w + 3;
+                if (act) fill_rrect(fb, tx, 7, w, hl, 4, th->ember);
+                ctext(fb, F20, tx + 6, 10, tabs[t], act ? th->bg : th->muted, 0);
+                tx += w + 2;
             }
             const char *link = stump_up ? "● link" : "○ no link";
             ctext(fb, F16, PANEL_W - 10 - font_width(F16, link), 12, link, stump_up ? th->ok : th->warn, 0);
@@ -2833,23 +3119,48 @@ int main(int argc, char **argv) {
          * chat bubbles. Same cursors and actions as before; only the drawing. ---- */
         const uint32_t ACTION_C = 0xFFC8B48Fu, DM_C = 0xFFC8A2C8u;   /* FireFly's ACTION, DM_BODY */
         if (g_st.tab_idx == 0) {
-            /* Rooms: FireFly's pills, the current one outlined. */
-            static const char *rooms[3] = { "#main", "#lora-mesh", "#wifi-mesh" };
-            int rx = 12;
-            for (int r = 0; r < 3; r++) {
-                char lbl[40];
-                snprintf(lbl, sizeof(lbl), "%s %d", rooms[r], g_st.room_users[r]);
-                int w = font_width(F20, lbl) + 20;
+            /* Rooms: every room the Stump has, FireFly's pills, the current one
+             * outlined; as many as fit, scrolled to keep it in view. */
+            int nrooms = g_st.room_n > 0 ? g_st.room_n : 1;
+            int pw_[MAX_ROOMS];
+            char plbl[MAX_ROOMS][48];
+            for (int r = 0; r < nrooms; r++) {
+                snprintf(plbl[r], sizeof(plbl[r]), "#%s %d", room_slug(r), g_st.room_n > 0 ? g_st.room_list[r].users : 0);
+                pw_[r] = font_width(F20, plbl[r]) + 20;
+            }
+            int first = 0, avail = PANEL_W - 24 - 40;
+            for (;;) {                                 /* the first pill shown: the current one must fit */
+                int used = 0, last = first;
+                for (int r = first; r < nrooms && used + pw_[r] <= avail; r++) { used += pw_[r] + 8; last = r; }
+                if (last >= g_st.room_idx || first >= g_st.room_idx) break;
+                first++;
+            }
+            int rx = first > 0 ? 32 : 12;
+            if (first > 0) ctext(fb, F20, 10, 136, "◀", th->muted, 0);
+            int r_last = first;
+            for (int r = first; r < nrooms; r++) {
+                if (rx + pw_[r] > PANEL_W - 32) break;
                 bool act = (r == g_st.room_idx);
-                if (act) stroke_rrect(fb, rx, 132, w, 30, 6, th->ember, th->panel);
-                ctext(fb, F20, rx + 10, 136, lbl, act ? th->ember_bright : th->muted, 0);
-                rx += w + 8;
+                if (act) stroke_rrect(fb, rx, 132, pw_[r], 30, 6, th->ember, th->panel);
+                ctext(fb, F20, rx + 10, 136, plbl[r], act ? th->ember_bright : th->muted, 0);
+                rx += pw_[r] + 8;
+                r_last = r;
+            }
+            if (r_last < nrooms - 1) ctext(fb, F20, PANEL_W - 26, 136, "▶", th->muted, 0);
+            /* the room's reach and topic */
+            if (g_st.room_n > 0) {
+                const RoomItem *ri = &g_st.room_list[g_st.room_idx];
+                char about[120];
+                const char *reach = strcmp(ri->scope, "wifi") == 0 ? "the chain (Wi-Fi)" :
+                                    strcmp(ri->scope, "lora") == 0 ? "the LoRa" : "this Stump";
+                snprintf(about, sizeof(about), "%s%s%s", reach, ri->topic[0] ? "  ·  " : "", ri->topic);
+                ctext(fb, F16, 14, 168, about, th->muted, PANEL_W - 28);
             }
 
             /* Messages: bubbles, newest at the bottom (FireFly's chat view). */
             int r = g_st.room_idx, ybot = 466;
             if (g_st.room_counts[r] == 0)
-                ctext(fb, F20, 20, 190, "No messages yet. Y to write.", th->muted, 0);
+                ctext(fb, F20, 20, 200, "No messages yet. Y to write.", th->muted, 0);
             for (int i = g_st.room_counts[r] - 1; i >= 0; i--) {
                 const char *nk = g_st.rooms[r][i].nick, *bd = g_st.rooms[r][i].body;
                 bool sys = g_st.rooms[r][i].is_sys;
@@ -2883,7 +3194,7 @@ int main(int argc, char **argv) {
                 int bw = (w1 > w2 ? w1 : w2) + 20, bh = lines * 24 + 12;
                 if (bw > PANEL_W - 60) bw = PANEL_W - 60;
                 int by = ybot - bh;
-                if (by < 170) break;
+                if (by < 192) break;
                 int bx = out ? PANEL_W - 12 - bw : 12;
                 stroke_rrect(fb, bx, by, bw, bh, 8, out ? th->ember : th->border, th->panel);
                 uint32_t fg = sys ? th->muted : act ? ACTION_C : dm ? DM_C : th->text;
@@ -2904,7 +3215,7 @@ int main(int argc, char **argv) {
 
             /* Quick commands. */
             static const char *quick[6] = { "/whoami + /names", "/auth", "!find jardinage",
-                                            "!roll 2d6", "announce", "say hello" };
+                                            "!roll 2d6", "new room…", "say hello" };
             ctext(fb, F16, 14, 524, "QUICK", th->ember, 0);
             for (int c = 0; c < 6; c++) {
                 int cx = 12 + (c % 2) * 354, cy = 546 + (c / 2) * 42;
@@ -3044,6 +3355,60 @@ int main(int argc, char **argv) {
                     if (g_st.qr_grid[rr][cc]) fill_rect(fb, qx + (cc + 2) * qs, qy + (rr + 2) * qs, qs, qs, 0xFF000000u);
             ctext(fb, F16, qx0 + (240 - font_width(F16, g_st.qr_url)) / 2, qy + qbox + 6, g_st.qr_url, th->muted, 240);
 
+        } else if (g_st.tab_idx == 5) {
+            /* Owner: the form the feed sends (the Stump's settings, rooms,
+             * people...), a row each: label and hint on the left, its value on
+             * the right; ←/→ picks a choice, A applies or opens. */
+            char head[80];
+            snprintf(head, sizeof(head), "OWNER%s%s", g_st.form_parent[0] ? "  ·  B: back" : "", "");
+            ctext(fb, F16, 14, 134, head, th->ember, 0);
+            ctext(fb, F24, 14, 154, g_st.form_title[0] ? g_st.form_title : "Owner tools", th->text, PANEL_W - 28);
+            if (g_st.field_n == 0) ctext(fb, F20, 20, 196, "Waiting for the Stump…", th->muted, 0);
+            int rh = 58, top = 190, vis = (636 - top) / rh;
+            int firstr = g_st.form_cursor - (vis - 2);
+            if (firstr < 0) firstr = 0;
+            if (firstr > g_st.field_n - vis) firstr = g_st.field_n > vis ? g_st.field_n - vis : 0;
+            if (firstr > 0) ctext(fb, F16, PANEL_W - 70, 134, "↑ more", th->muted, 0);
+            for (int k = 0; k < vis && firstr + k < g_st.field_n; k++) {
+                int i = firstr + k, y = top + k * rh;
+                const FormField *ff = &g_st.fields[i];
+                bool sel = (i == g_st.form_cursor);
+                bool info = strcmp(ff->kind, "info") == 0;
+                if (sel && !info) stroke_rrect(fb, 12, y, PANEL_W - 24, rh - 6, 8, th->ember, th->panel);
+                char val[160];
+                uint32_t vc = th->text;
+                int pick = g_st.form_pick[i];
+                if (strcmp(ff->kind, "choice") == 0) {
+                    int shown = pick >= 0 ? pick : ff->sel;
+                    const char *o = (shown >= 0 && shown < ff->nopts) ? ff->opts[shown] : ff->value;
+                    if (sel) snprintf(val, sizeof(val), "◀ %s ▶", o);
+                    else snprintf(val, sizeof(val), "%s", o);
+                    vc = (pick >= 0 && pick != ff->sel) ? th->ember_bright : th->text;
+                } else if (strcmp(ff->kind, "toggle") == 0) {
+                    bool on = strcmp(ff->value, "1") == 0;
+                    snprintf(val, sizeof(val), "%s", on ? "✓ on" : "off");
+                    vc = on ? th->ok : th->muted;
+                } else if (strcmp(ff->kind, "text") == 0) {
+                    snprintf(val, sizeof(val), "%s", ff->value[0] ? ff->value : "(empty)");
+                    vc = ff->value[0] ? th->text : th->muted;
+                } else if (strcmp(ff->kind, "open") == 0) {
+                    snprintf(val, sizeof(val), "→");
+                    vc = th->ember;
+                } else if (strcmp(ff->kind, "action") == 0) {
+                    snprintf(val, sizeof(val), "A");
+                    vc = th->ember;
+                } else {
+                    val[0] = '\0';
+                }
+                int vw = val[0] ? font_width(F20, val) : 0;
+                int maxv = (PANEL_W - 48) / 2;
+                if (vw > maxv) vw = maxv;
+                ctext(fb, F20, 24, y + 4, ff->label, info ? th->muted : (sel ? th->ember_bright : th->text),
+                      PANEL_W - 60 - vw);
+                if (val[0]) ctext(fb, F20, PANEL_W - 24 - vw, y + 4, val, vc, maxv);
+                if (ff->hint[0]) ctext(fb, F16, 24, y + 30, ff->hint, th->muted, PANEL_W - 48);
+            }
+            if (firstr + vis < g_st.field_n) ctext(fb, F16, PANEL_W - 70, 640, "↓ more", th->muted, 0);
         } else {
             /* Setup: the staged change, apply or revert, the tools, the log. */
             ctext(fb, F16, 14, 134, "NETWORK", th->ember, 0);
@@ -3107,17 +3472,19 @@ int main(int argc, char **argv) {
 
         /* Confirm: a panel in the middle, No / Yes. */
         if (g_st.confirm_open) {
-            bool apply = (g_st.confirm_type == 3);
+            bool apply = (g_st.confirm_type == 3 || g_st.confirm_type == 4);
             uint32_t tone = apply ? th->ok : th->warn;
             stroke_rrect(fb, 60, 200, PANEL_W - 120, 270, 10, tone, th->panel);
-            ctext(fb, F24, 84, 220, apply ? "Change this card's job?" : "Erase what's checked?", tone, PANEL_W - 168);
+            ctext(fb, F24, 84, 220, g_st.confirm_type == 4 ? "Do this on the Stump?" :
+                  apply ? "Change this card's job?" : "Erase what's checked?", tone, PANEL_W - 168);
             ctext(fb, F16, 84, 262, apply ? "This change:" : (g_st.confirm_type == 1 ? "Checked notices:" : "Checked files:"),
                   th->muted, 0);
             ctext(fb, F20, 84, 286, g_st.confirm_label, th->ember_bright, PANEL_W - 168);
             for (int c = 0; c < 2; c++) {
                 bool sel = (g_st.confirm_choice == c);
                 int bx = 84 + c * 284;
-                const char *lbl = c == 0 ? "No, cancel" : (apply ? "Yes, apply" : "Yes, erase");
+                const char *lbl = c == 0 ? "No, cancel" : (g_st.confirm_type == 4 ? "Yes, do it" :
+                                                         apply ? "Yes, apply" : "Yes, erase");
                 uint32_t fillc = c == 0 ? th->ember : tone;
                 if (sel) fill_rrect(fb, bx, 380, 268, 54, 8, fillc);
                 else stroke_rrect(fb, bx, 380, 268, 54, 8, th->border, th->panel2);
@@ -3138,6 +3505,10 @@ int main(int argc, char **argv) {
             static const char *const k[6] = { "A", "←→", "Y", "X", "↑↓", "L/R" };
             static const char *const l[6] = { "apply", "job", "remember", "QR", "move", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
+        } else if (g_st.tab_idx == 5) {
+            static const char *const k[5] = { "A", "←→", "B", "↑↓", "L/R" };
+            static const char *const l[5] = { "do / open", "pick", "back", "move", "tab" };
+            draw_hint_bar(fb, th, k, l, 5);
         } else if (g_st.tab_idx == 4) {
             static const char *const k[6] = { "A", "B", "X", "START", "↑↓", "L/R" };
             static const char *const l[6] = { "do", "back", "scan LAN", "cards", "move", "tab" };
