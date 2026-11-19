@@ -1,6 +1,6 @@
 /*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.6.1-b.87.
+ * (RK3326 / dArkOS), v2.7.0-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -706,9 +706,11 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.6.1-b.87"
+#define STUMP_ENGINE_VERSION "v2.7.0-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
-#define MAX_LOG_LINES 10
+#define MAX_LOG_LINES 60      /* a room's scrollback: all the Stump keeps (MAX_MESSAGES_PER_ROOM) */
+#define MAX_ITEMS 20          /* notices and files listed (scrolled) */
+#define MAX_CMDS 120          /* the command menu's rows */
 #define MAX_DBG_LINES 16
 
 /* R36MAX Physical Gamepad Button Mapping:
@@ -721,6 +723,7 @@ static void scan_transports(TransportStatus *ts) {
 #define R36_BTN_B_CANCEL 304
 
 typedef struct {
+    int  id;             /* the Stump's message id (0: shown here before the Stump has it) */
     char nick[18];
     char body[1024];     /* the whole message: up to 400 characters (the Stump's MAX_MESSAGE_LEN) */
     bool is_sys;
@@ -749,6 +752,16 @@ typedef struct {
     char opts[10][30];
     char hint[66];
 } FormField;
+
+/* A command the Stump knows, from the feed's CMD| lines. */
+typedef struct {
+    char group[32];
+    char word[25];
+    char syntax[122];    /* how it's written; • is the admin password's place (the feed fills it) */
+    bool args;
+    bool pw;
+    char desc[162];
+} CmdItem;
 
 typedef struct {
     char id[28];
@@ -883,9 +896,21 @@ typedef struct {
     int             form_edit_max;
     char            form_edit_label[46];
     char            pending_cmd[400];        /* what a Yes sends (confirm_type 4) */
-    BoardItem       board[8];
+    int             chat_scroll;             /* messages hidden below (0: the newest at the bottom) */
+    bool            chat_at_top;             /* the oldest kept is on screen: nothing further up */
+    int             chat_newest_id;          /* the newest message id seen in the room on screen */
+    char            chat_scroll_room[33];
+    CmdItem         cmds[MAX_CMDS];          /* every command the Stump knows (the feed's CMD lines) */
+    int             cmd_n;
+    bool            menu_open;               /* the command menu, over the chat */
+    int             menu_cursor;
+    int             menu_offset;             /* its scroll, in pixels */
+    int             stick_x, stick_y;        /* the analog sticks, as one direction each (-1, 0, 1) */
+    int             stick_ax[8];             /* each stick axis's direction (ABS_X, Y, RX, RY...) */
+    uint64_t        stick_next_ms;           /* when a held stick repeats */
+    BoardItem       board[MAX_ITEMS];
     int             board_count;
-    ShelfItem       files[8];
+    ShelfItem       files[MAX_ITEMS];
     int             file_count;
     int             used_kb;
     int             ceil_kb;
@@ -983,6 +1008,7 @@ static void push_chat_local(int room, const char *nick, const char *body, bool i
     } else {
         g_st.room_counts[room]++;
     }
+    g_st.rooms[room][idx].id = 0;
     snprintf(g_st.rooms[room][idx].nick, sizeof(g_st.rooms[room][idx].nick), "%.17s", nick);
     snprintf(g_st.rooms[room][idx].body, sizeof(g_st.rooms[room][idx].body), "%.1023s", body);
     g_st.rooms[room][idx].is_sys = is_sys;
@@ -1183,6 +1209,7 @@ static void send_typed_chat(void) {
     send_bridge_cmd(cmd);
     broadcast_udp_beacon("CHAT", g_st.input_buf);
     push_chat_local(r, "r36max", g_st.input_buf, false);
+    g_st.chat_scroll = 0;                            /* back to the newest: what was just said */
     g_st.input_len = 0;
     g_st.input_buf[0] = '\0';
     set_ui_busy("Sending…", 1000);
@@ -1425,6 +1452,170 @@ static void form_back(void) {
     }
 }
 
+static void cmp_move(int dx, int dy);
+
+/* ---- The command menu (every command the Stump knows, from the feed) ---- */
+static void menu_open(void) {
+    if (g_st.cmd_n <= 0) { set_ui_busy("Asking the Stump for its commands…", 1600); trigger_chime(480, 30); return; }
+    g_st.menu_open = true;
+    if (g_st.menu_cursor < 0 || g_st.menu_cursor >= g_st.cmd_n) g_st.menu_cursor = 0;
+    trigger_chime(740, 40);
+}
+
+static void menu_move(int d) {
+    if (g_st.cmd_n <= 0) return;
+    g_st.menu_cursor = ((g_st.menu_cursor + d) % g_st.cmd_n + g_st.cmd_n) % g_st.cmd_n;
+    trigger_chime(500, 15);
+}
+
+/* ←/→: the first command of the previous or next group. */
+static int menu_group_start(int i) {
+    while (i > 0 && strcmp(g_st.cmds[i - 1].group, g_st.cmds[i].group) == 0) i--;
+    return i;
+}
+
+static void menu_group(int d) {
+    int n = g_st.cmd_n, c = g_st.menu_cursor;
+    if (n <= 0) return;
+    if (d > 0) {
+        int i = c;
+        while (i < n && strcmp(g_st.cmds[i].group, g_st.cmds[c].group) == 0) i++;
+        g_st.menu_cursor = i < n ? i : 0;
+    } else {
+        int s0 = menu_group_start(c);
+        g_st.menu_cursor = menu_group_start(s0 > 0 ? s0 - 1 : n - 1);
+    }
+    trigger_chime(540, 20);
+}
+
+/* A on a command: one with nothing to add is sent now; the others open the
+ * keyboard with it written up to its first argument (• where the admin
+ * password goes: the feed puts it in, the cockpit never has it). */
+static void menu_activate(void) {
+    if (g_st.menu_cursor < 0 || g_st.menu_cursor >= g_st.cmd_n) return;
+    const CmdItem *ci = &g_st.cmds[g_st.menu_cursor];
+    g_st.menu_open = false;
+    if (!ci->args) {
+        char cmd[400];
+        snprintf(cmd, sizeof(cmd), "RRC|%s|%s", room_slug(g_st.room_idx), ci->word);
+        send_bridge_cmd(cmd);
+        push_chat_local(g_st.room_idx, "r36max", ci->word, false);
+        g_st.chat_scroll = 0;
+        set_ui_busy("Sending…", 1000);
+        trigger_chime(840, 55);
+        return;
+    }
+    char pre[200] = "";
+    const char *p = ci->syntax;
+    while (*p) {
+        const char *q = strchr(p, ' ');
+        size_t len = q ? (size_t)(q - p) : strlen(p);
+        if (len == 0) { p++; continue; }
+        bool alt = false;                            /* "a¦b": one of several (the feed's | ) */
+        for (size_t k = 0; k + 1 < len; k++) if ((unsigned char)p[k] == 0xC2 && (unsigned char)p[k + 1] == 0xA6) alt = true;
+        if (p[0] == '<' || p[0] == '[' || p[0] == '#' || p[0] == '-' || alt || memchr(p, '|', len) || memchr(p, ':', len))
+            break;                                   /* its first argument: written by hand */
+        if (strlen(pre) + len + 2 >= sizeof(pre)) break;
+        strncat(pre, p, len);
+        strcat(pre, " ");
+        if (!q) break;
+        p = q + 1;
+    }
+    snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%s", pre);
+    g_st.input_len = (int)strlen(g_st.input_buf);
+    g_st.osk_target = 0;
+    g_st.osk_open = true;
+    trigger_chime(740, 45);
+}
+
+/* ---- Scrolling the chat (the sticks): older up, newer down ---- */
+static void chat_scroll_by(int d) {
+    int n = g_st.room_counts[g_st.room_idx];
+    if (d < 0) {                                     /* up: older, unless the oldest is already shown */
+        if (g_st.chat_at_top || g_st.chat_scroll >= n - 1) { trigger_chime(300, 20); return; }
+        g_st.chat_scroll++;
+    } else {
+        if (g_st.chat_scroll <= 0) return;
+        g_st.chat_scroll--;
+    }
+    trigger_chime(500, 10);
+}
+
+/* One step of a stick (either one): what ↑↓ or ←→ scrolls or moves on this tab. */
+static void stick_step(int dx, int dy) {
+    if (g_st.osk_open) { cmp_move(dx, dy); return; }
+    if (g_st.confirm_open) { if (dx) { g_st.confirm_choice = dx > 0 ? 1 : 0; trigger_chime(520, 20); } return; }
+    if (g_st.menu_open) { if (dy) menu_move(dy); else menu_group(dx); return; }
+    switch (g_st.tab_idx) {
+    case 0:
+        if (dy) chat_scroll_by(dy);
+        else room_step(dx);
+        break;
+    case 1: {
+        int rows = g_st.board_count + 1;
+        if (dy) { g_st.board_cursor = (g_st.board_cursor + dy + rows) % rows; trigger_chime(500, 15); }
+        break; }
+    case 2: {
+        int rows = g_st.file_count + 1;
+        if (dy) { g_st.file_cursor = (g_st.file_cursor + dy + rows) % rows; trigger_chime(500, 15); }
+        break; }
+    case 3: {
+        int rows = g_st.limb_count + 1;
+        if (dy) { g_st.wifi_cursor = (g_st.wifi_cursor + dy + rows) % rows; trigger_chime(520, 15); }
+        break; }
+    case 4:
+        if (dy < 0 && g_st.debug_scroll > 0) g_st.debug_scroll--;
+        else if (dy > 0 && g_st.debug_scroll + 1 < g_st.debug_log_count) g_st.debug_scroll++;
+        break;
+    case 5:
+        if (dy) form_move(dy);
+        else form_pick_dir(dx);
+        break;
+    }
+}
+
+/* The sticks' axes (ABS_X/Y left, ABS_RX/RY right), as directions: past
+ * half-way it's held, back under a third it's let go. A step at once, then
+ * after 350 ms one every 110 ms while held (stick_tick, each frame). */
+typedef struct { int min, max; bool ok; } AxisRange;
+static AxisRange g_axes[16][8];
+
+static void stick_probe(int e, int fd) {
+    static const int codes[4] = { ABS_X, ABS_Y, ABS_RX, ABS_RY };
+    for (int k = 0; k < 4; k++) {
+        struct input_absinfo ai;
+        g_axes[e][codes[k]].ok = (ioctl(fd, EVIOCGABS(codes[k]), &ai) == 0 && ai.maximum > ai.minimum + 20);
+        if (g_axes[e][codes[k]].ok) { g_axes[e][codes[k]].min = ai.minimum; g_axes[e][codes[k]].max = ai.maximum; }
+    }
+}
+
+static bool stick_event(int e, int code, int value) {
+    if (code != ABS_X && code != ABS_Y && code != ABS_RX && code != ABS_RY) return false;
+    if (e < 0 || e >= 16 || !g_axes[e][code].ok) return true;          /* (an axis that isn't a stick: ignored) */
+    int mn = g_axes[e][code].min, mx = g_axes[e][code].max;
+    double half = (mx - mn) / 2.0, v = (value - (mn + half)) / half;   /* -1 .. 1 */
+    int cur = g_st.stick_ax[code];
+    int d = cur;
+    if (v > 0.5) d = 1; else if (v < -0.5) d = -1; else if (v > -0.33 && v < 0.33) d = 0;
+    g_st.stick_ax[code] = d;
+    return true;
+}
+
+static void stick_tick(uint64_t now) {
+    int dy = g_st.stick_ax[ABS_Y] ? g_st.stick_ax[ABS_Y] : g_st.stick_ax[ABS_RY];
+    int dx = g_st.stick_ax[ABS_X] ? g_st.stick_ax[ABS_X] : g_st.stick_ax[ABS_RX];
+    if (dy) dx = 0;                                  /* one direction at a time: up/down first */
+    if (!dx && !dy) { g_st.stick_x = g_st.stick_y = 0; return; }
+    if (dx != g_st.stick_x || dy != g_st.stick_y) {
+        g_st.stick_x = dx; g_st.stick_y = dy;
+        stick_step(dx, dy);
+        g_st.stick_next_ms = now + 350;
+    } else if (now >= g_st.stick_next_ms) {
+        stick_step(dx, dy);
+        g_st.stick_next_ms = now + 110;
+    }
+}
+
 static void poll_live_bridge(void) {
     if (g_st.suppress_poll_frames > 0) return;
     FILE *f = fopen(LIVE_STATE_FILE, "r");
@@ -1433,16 +1624,16 @@ static void poll_live_bridge(void) {
         return;
     }
     /* Preserve existing checked [X] states by ID / filename across live refreshes */
-    char checked_board_ids[8][28];
+    char checked_board_ids[MAX_ITEMS][28];
     int checked_board_n = 0;
-    for (int i = 0; i < g_st.board_count && i < 8; i++) {
+    for (int i = 0; i < g_st.board_count && i < MAX_ITEMS; i++) {
         if (g_st.board[i].checked && g_st.board[i].id[0]) {
             snprintf(checked_board_ids[checked_board_n++], 28, "%s", g_st.board[i].id);
         }
     }
-    char checked_file_names[8][36];
+    char checked_file_names[MAX_ITEMS][36];
     int checked_file_n = 0;
-    for (int i = 0; i < g_st.file_count && i < 8; i++) {
+    for (int i = 0; i < g_st.file_count && i < MAX_ITEMS; i++) {
         if (g_st.files[i].checked && g_st.files[i].name[0]) {
             snprintf(checked_file_names[checked_file_n++], 36, "%s", g_st.files[i].name);
         }
@@ -1450,7 +1641,7 @@ static void poll_live_bridge(void) {
 
     int r_counts[MAX_ROOMS] = {0};
     int rm_count = 0, feed_view = -1;
-    int fl_count = 0;
+    int fl_count = 0, c_count = 0;
     char new_form[16] = "";
     char keep_view[33];
     snprintf(keep_view, sizeof(keep_view), "%s", g_st.view_room[0] ? g_st.view_room : room_slug(g_st.room_idx));
@@ -1644,6 +1835,18 @@ static void poll_live_bridge(void) {
                 if (f[5] && atoi(f[5]) == 1) feed_view = rm_count;
                 rm_count++;
             }
+        } else if (strncmp(line, "CMD|", 4) == 0 && c_count < MAX_CMDS) {
+            /* CMD|i|group|word|syntax|args|password|what it does */
+            char *f[7];
+            if (split_bar(line + 4, f, 7) >= 5) {
+                CmdItem *ci = &g_st.cmds[c_count++];
+                snprintf(ci->group, sizeof(ci->group), "%.31s", f[1]);
+                snprintf(ci->word, sizeof(ci->word), "%.24s", f[2]);
+                snprintf(ci->syntax, sizeof(ci->syntax), "%.121s", f[3]);
+                ci->args = atoi(f[4]) != 0;
+                ci->pw = f[5] && atoi(f[5]) != 0;
+                snprintf(ci->desc, sizeof(ci->desc), "%.161s", f[6] ? f[6] : "");
+            }
         } else if (strncmp(line, "FORM|", 5) == 0) {
             /* FORM|id|title|back to */
             char *f[3];
@@ -1682,21 +1885,25 @@ static void poll_live_bridge(void) {
             int r_idx = atoi(line + 4);
             char *p1 = strchr(line + 4, '|');
             if (p1 && r_idx >= 0 && r_idx < MAX_ROOMS && r_counts[r_idx] < MAX_LOG_LINES) {
+                /* MSG|room|system|id|nick|body */
                 int is_sys = atoi(p1 + 1);
-                char *p2 = strchr(p1 + 1, '|');
+                char *pid = strchr(p1 + 1, '|');
+                char *p2 = pid ? strchr(pid + 1, '|') : NULL;
+                int mid = pid ? atoi(pid + 1) : 0;
                 if (p2) {
                     *p2++ = '\0';
                     char *p3 = strchr(p2, '|');
                     if (p3) {
                         *p3++ = '\0';
                         int slot = r_counts[r_idx]++;
+                        g_st.rooms[r_idx][slot].id = mid;
                         snprintf(g_st.rooms[r_idx][slot].nick, sizeof(g_st.rooms[r_idx][slot].nick), "%.17s", p2);
                         snprintf(g_st.rooms[r_idx][slot].body, sizeof(g_st.rooms[r_idx][slot].body), "%.1023s", p3);
                         g_st.rooms[r_idx][slot].is_sys = (is_sys != 0);
                     }
                 }
             }
-        } else if (strncmp(line, "BOARD|", 6) == 0 && b_count < 8) {
+        } else if (strncmp(line, "BOARD|", 6) == 0 && b_count < MAX_ITEMS) {
             char *p1 = line + 6;
             char *p2 = strchr(p1, '|');
             if (p2) {
@@ -1718,7 +1925,7 @@ static void poll_live_bridge(void) {
                     b_count++;
                 }
             }
-        } else if (strncmp(line, "FILE|", 5) == 0 && f_count < 8) {
+        } else if (strncmp(line, "FILE|", 5) == 0 && f_count < MAX_ITEMS) {
             char *p1 = line + 5;
             char *p2 = strchr(p1, '|');
             if (p2) {
@@ -1757,6 +1964,25 @@ static void poll_live_bridge(void) {
         if (feed_view >= 0 && (at < 0 || (quiet && feed_view != at))) at = feed_view;
         g_st.room_idx = at >= 0 ? at : 0;
         snprintf(g_st.view_room, sizeof(g_st.view_room), "%s", room_slug(g_st.room_idx));
+    }
+    if (c_count > 0) {
+        g_st.cmd_n = c_count;
+        if (g_st.menu_cursor >= c_count) g_st.menu_cursor = c_count - 1;
+    }
+    {
+        /* Scrolled back in the room on screen: new messages arriving keep the
+         * view where it is (the offset grows by them); another room: the newest. */
+        int r = g_st.room_idx, newest = 0, fresh = 0;
+        for (int i = 0; i < g_st.room_counts[r]; i++) if (g_st.rooms[r][i].id > newest) newest = g_st.rooms[r][i].id;
+        if (strcmp(g_st.chat_scroll_room, room_slug(r)) != 0) {
+            snprintf(g_st.chat_scroll_room, sizeof(g_st.chat_scroll_room), "%s", room_slug(r));
+            g_st.chat_scroll = 0;
+        } else if (g_st.chat_scroll > 0 && newest > g_st.chat_newest_id) {
+            for (int i = 0; i < g_st.room_counts[r]; i++) if (g_st.rooms[r][i].id > g_st.chat_newest_id) fresh++;
+            g_st.chat_scroll += fresh;
+        }
+        if (newest > 0) g_st.chat_newest_id = newest;
+        if (g_st.chat_scroll > g_st.room_counts[r] - 1) g_st.chat_scroll = g_st.room_counts[r] > 0 ? g_st.room_counts[r] - 1 : 0;
     }
     if (new_form[0]) {
         if (strcmp(new_form, g_st.form_id) != 0) {
@@ -1872,11 +2098,9 @@ static void execute_rrc_deck_action(void) {
         g_st.input_buf[0] = '\0';
         trigger_chime(740, 45);
     } else {
-        broadcast_udp_beacon("CHAT", "Hello from R36MAX handheld operator!");
-        snprintf(cmd, sizeof(cmd), "RRC|%s|Hello from R36MAX handheld operator!", rslug);
-        send_bridge_cmd(cmd);
-        push_chat_local(r, "r36max", "Hello from R36MAX handheld operator!", false);
-        trigger_chime(784, 50);
+        /* Every command the Stump knows, its packs' too: a menu */
+        set_ui_busy("", 0);
+        menu_open();
     }
 }
 
@@ -2324,7 +2548,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.6.1-b.87");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.0-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -2438,6 +2662,7 @@ int main(int argc, char **argv) {
         char p[64];
         snprintf(p, sizeof(p), "/dev/input/event%d", i);
         ev_fds[i] = open(p, O_RDONLY | O_NONBLOCK);
+        if (ev_fds[i] >= 0) stick_probe(i, ev_fds[i]);
     }
 
     pthread_t audio_tid = 0;
@@ -2469,6 +2694,11 @@ int main(int argc, char **argv) {
             snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "%s", g_st.confirm_type == 3
                      ? "AP on Blueway High Power: leaves HomeNet" : "2 notices: March\u00e9 samedi, Potluck Sunday");
         }
+        if (getenv("STUMP_COCKPIT_MENU") && frames == 0) {    /* screenshots: the command menu, a row chosen */
+            g_st.menu_open = true;
+            g_st.menu_cursor = atoi(getenv("STUMP_COCKPIT_MENU"));
+        }
+        if (getenv("STUMP_COCKPIT_SCROLL") && frames == 0) g_st.chat_scroll = atoi(getenv("STUMP_COCKPIT_SCROLL"));
         if (getenv("STUMP_COCKPIT_OSK") && frames == 0) {     /* screenshots in tests: open it at start */
             g_st.osk_open = true; cmp_reset(); g_cmp.was_open = true;
             g_cmp.page = atoi(getenv("STUMP_COCKPIT_OSK")) % 3;
@@ -2501,6 +2731,7 @@ int main(int argc, char **argv) {
                     char p[64];
                     snprintf(p, sizeof(p), "/dev/input/event%d", i);
                     ev_fds[i] = open(p, O_RDONLY | O_NONBLOCK);
+                    if (ev_fds[i] >= 0) stick_probe(i, ev_fds[i]);
                 }
             }
         }
@@ -2511,6 +2742,9 @@ int main(int argc, char **argv) {
             if (ev_fds[e] < 0) continue;
             while (read(ev_fds[e], &ev, sizeof(ev)) == sizeof(ev)) {
                 uint64_t now_ms = monotonic_ms();
+                /* The analog sticks: their own state, read each frame (stick_tick); their
+                 * constant small moves never reach the D-pad's debounce below. */
+                if (ev.type == EV_ABS && stick_event(e, ev.code, ev.value)) continue;
                 if (ev.type == EV_KEY) {
                     bool pressed = (ev.value == 1);
                     bool key_press_or_rep = (ev.value == 1 || ev.value == 2);
@@ -2596,6 +2830,25 @@ int main(int argc, char **argv) {
                             }
                             g_st.confirm_open = false;
                             continue;
+                        }
+                        continue;
+                    }
+
+                    /* The command menu, while open, takes the D-pad, A, B (and a keyboard's arrows). */
+                    if (g_st.menu_open && key_press_or_rep) {
+                        if (ev.code == BTN_DPAD_UP || ev.code == 544 || ev.code == KEY_UP) menu_move(-1);
+                        else if (ev.code == BTN_DPAD_DOWN || ev.code == 545 || ev.code == KEY_DOWN) menu_move(1);
+                        else if (ev.code == BTN_DPAD_LEFT || ev.code == 546 || ev.code == KEY_LEFT) menu_group(-1);
+                        else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547 || ev.code == KEY_RIGHT) menu_group(1);
+                        else if (!pressed) continue;
+                        else if (ev.code == R36_BTN_A_ACCEPT || ev.code == KEY_ENTER || ev.code == KEY_KPENTER ||
+                                 ev.code == BTN_START || ev.code == 315) menu_activate();
+                        else if (ev.code == R36_BTN_B_CANCEL || ev.code == KEY_ESC || ev.code == 307 || ev.code == 308) {
+                            g_st.menu_open = false;
+                            trigger_chime(480, 30);
+                        } else if (ev.code == BTN_TL || ev.code == 310 || ev.code == BTN_TR || ev.code == 311) {
+                            g_st.menu_open = false;           /* a tab change closes it */
+                            g_st.tab_idx = (g_st.tab_idx + ((ev.code == BTN_TL || ev.code == 310) ? 5 : 1)) % 6;
                         }
                         continue;
                     }
@@ -2976,6 +3229,9 @@ int main(int argc, char **argv) {
                     if (g_st.confirm_open) {
                         if (ev.code == ABS_HAT0X && ev.value < 0) { g_st.confirm_choice = 0; trigger_chime(520, 20); }
                         if (ev.code == ABS_HAT0X && ev.value > 0) { g_st.confirm_choice = 1; trigger_chime(520, 20); }
+                    } else if (g_st.menu_open) {
+                        if (ev.code == ABS_HAT0Y) menu_move(ev.value < 0 ? -1 : 1);
+                        if (ev.code == ABS_HAT0X) menu_group(ev.value < 0 ? -1 : 1);
                     } else if (g_st.tab_idx == 0) {
                         if (g_st.osk_open) {
                             if (ev.code == ABS_HAT0X && ev.value < 0) g_st.osk_col = (g_st.osk_col + 9) % 10;
@@ -3072,6 +3328,8 @@ int main(int argc, char **argv) {
             }
         }
 
+        stick_tick(monotonic_ms());                  /* the analog sticks, held or pushed */
+
         const ThemeColors *th = &g_themes[g_st.theme_idx];
         fill_rect(fb, 0, 0, PANEL_W, PANEL_H, th->bg);
 
@@ -3161,7 +3419,9 @@ int main(int argc, char **argv) {
             int r = g_st.room_idx, ybot = 466;
             if (g_st.room_counts[r] == 0)
                 ctext(fb, F20, 20, 200, "No messages yet. Y to write.", th->muted, 0);
-            for (int i = g_st.room_counts[r] - 1; i >= 0; i--) {
+            int newest_shown = g_st.room_counts[r] - 1 - g_st.chat_scroll;
+            bool reached_top = true;
+            for (int i = newest_shown; i >= 0; i--) {
                 const char *nk = g_st.rooms[r][i].nick, *bd = g_st.rooms[r][i].body;
                 bool sys = g_st.rooms[r][i].is_sys;
                 bool act = (!sys && strcmp(nk, "*") == 0);
@@ -3213,12 +3473,25 @@ int main(int argc, char **argv) {
                 int bw = wmax + 20, bh = lines * 24 + 12;
                 if (bw > PANEL_W - 60) bw = PANEL_W - 60;
                 int by = ybot - bh;
-                if (by < 192) break;
+                if (by < 192) { reached_top = false; break; }
                 int bx = out ? PANEL_W - 12 - bw : 12;
                 stroke_rrect(fb, bx, by, bw, bh, 8, out ? th->ember : th->border, th->panel);
                 uint32_t fg = sys ? th->muted : act ? ACTION_C : dm ? DM_C : th->text;
                 for (int k = 0; k < lines; k++) ctext(fb, F20, bx + 10, by + 4 + k * 24, wl[k], fg, bw - 16);
                 ybot = by - 6;
+            }
+            g_st.chat_at_top = reached_top;
+            /* where the view is in the room's history (the sticks scroll it) */
+            if (!reached_top && g_st.room_counts[r] > 0) {
+                const char *up = "↑ older: stick";
+                fill_rrect(fb, PANEL_W - 22 - font_width(F16, up), 188, font_width(F16, up) + 12, 22, 6, th->panel2);
+                ctext(fb, F16, PANEL_W - 16 - font_width(F16, up), 190, up, th->muted, 0);
+            }
+            if (g_st.chat_scroll > 0) {
+                char dn[48];
+                snprintf(dn, sizeof(dn), "↓ %d newer", g_st.chat_scroll);
+                fill_rrect(fb, PANEL_W - 22 - font_width(F16, dn), 444, font_width(F16, dn) + 12, 22, 6, th->ember);
+                ctext(fb, F16, PANEL_W - 16 - font_width(F16, dn), 446, dn, th->bg, 0);
             }
 
             /* The draft (Y opens FireFly's keyboard) and its size. */
@@ -3233,7 +3506,7 @@ int main(int argc, char **argv) {
 
             /* Quick commands. */
             static const char *quick[6] = { "/whoami + /names", "/auth", "!find jardinage",
-                                            "!roll 2d6", "new room…", "say hello" };
+                                            "!roll 2d6", "new room…", "all commands…" };
             ctext(fb, F16, 14, 524, "QUICK", th->ember, 0);
             for (int c = 0; c < 6; c++) {
                 int cx = 12 + (c % 2) * 354, cy = 546 + (c / 2) * 42;
@@ -3258,8 +3531,15 @@ int main(int argc, char **argv) {
             if (count == 0)
                 ctext(fb, F20, 20, 170, board ? "No notices yet." : "No files shared yet.", th->muted, 0);
             int rh = board ? 76 : 62;
-            for (int i = 0; i < count && i < shown; i++) {
-                int y = 158 + i * rh;
+            /* a window on the list, following the cursor (more than fit: ↑/↓ more) */
+            int first = cursor - (shown - 1);
+            if (cursor >= count) first = count - shown;
+            if (first > count - shown) first = count - shown;
+            if (first < 0) first = 0;
+            if (first > 0) ctext(fb, F16, PANEL_W / 2 - 30, 134, "↑ more", th->muted, 0);
+            if (first + shown < count) ctext(fb, F16, PANEL_W / 2 - 30, 158 + shown * rh - 4, "↓ more", th->muted, 0);
+            for (int i = first; i < count && i < first + shown; i++) {
+                int y = 158 + (i - first) * rh;
                 bool sel = (i == cursor);
                 bool chk = board ? g_st.board[i].checked : g_st.files[i].checked;
                 if (sel) stroke_rrect(fb, 12, y, PANEL_W - 24, rh - 6, 8, th->ember, th->panel);
@@ -3481,6 +3761,52 @@ int main(int argc, char **argv) {
                 ctext(fb, F16, 14, 434 + i * 23, g_st.debug_logs[start + i], th->text, PANEL_W - 28);
         }
 
+        /* The command menu: every command the Stump knows, by group, over the chat. */
+        if (g_st.menu_open) {
+            int top = 128, bottom = 680, H = bottom - top - 44;
+            fill_rect(fb, 0, top, PANEL_W, bottom - top, th->bg);
+            char head[80];
+            snprintf(head, sizeof(head), "ALL COMMANDS  ·  %d", g_st.cmd_n);
+            ctext(fb, F16, 14, top + 6, head, th->ember, 0);
+            ctext(fb, F16, PANEL_W - 14 - font_width(F16, "• = its admin password"), top + 6, "• = its admin password",
+                  th->muted, 0);
+            /* the rows' places: a heading where the group changes, then the command */
+            enum { HH = 28, RH = 54 };
+            int y = 0, cur_top = 0, cur_bot = 0;
+            for (int i = 0; i < g_st.cmd_n; i++) {
+                if (i == 0 || strcmp(g_st.cmds[i].group, g_st.cmds[i - 1].group) != 0) y += HH;
+                if (i == g_st.menu_cursor) { cur_top = y - ((i == 0 || strcmp(g_st.cmds[i].group, g_st.cmds[i - 1].group) != 0) ? HH : 0); cur_bot = y + RH; }
+                y += RH;
+            }
+            if (cur_top < g_st.menu_offset) g_st.menu_offset = cur_top;
+            if (cur_bot > g_st.menu_offset + H) g_st.menu_offset = cur_bot - H;
+            if (g_st.menu_offset < 0) g_st.menu_offset = 0;
+            int y0 = top + 32 - g_st.menu_offset;
+            y = 0;
+            for (int i = 0; i < g_st.cmd_n; i++) {
+                const CmdItem *ci = &g_st.cmds[i];
+                if (i == 0 || strcmp(ci->group, g_st.cmds[i - 1].group) != 0) {
+                    int hy = y0 + y;
+                    if (hy >= top + 28 && hy + HH <= bottom - 8) {
+                        ctext(fb, F16, 14, hy + 6, ci->group, th->ember, PANEL_W - 28);
+                        fill_rect(fb, 14, hy + HH - 3, PANEL_W - 28, 1, th->border);
+                    }
+                    y += HH;
+                }
+                int ry = y0 + y;
+                if (ry >= top + 28 && ry + RH <= bottom - 8) {
+                    bool sel = (i == g_st.menu_cursor);
+                    if (sel) stroke_rrect(fb, 10, ry, PANEL_W - 20, RH - 4, 8, th->ember, th->panel);
+                    ctext(fb, F20, 22, ry + 3, ci->syntax, sel ? th->ember_bright : th->text, PANEL_W - 44);
+                    ctext(fb, F16, 22, ry + 28, ci->desc[0] ? ci->desc : (ci->args ? "A: write the rest" : "A: send it"),
+                          th->muted, PANEL_W - 44);
+                }
+                y += RH;
+            }
+            if (g_st.menu_offset > 0) ctext(fb, F16, PANEL_W / 2 - 30, top + 6, "↑ more", th->muted, 0);
+            if (g_st.menu_offset + H < y) ctext(fb, F16, PANEL_W / 2 - 30, bottom - 22, "↓ more", th->muted, 0);
+        }
+
         /* Busy: FireFly's toast, over the top of the panel. */
         if (is_ui_busy()) {
             const char *bmsg = g_st.busy_msg[0] ? g_st.busy_msg : "Working…";
@@ -3511,7 +3837,11 @@ int main(int argc, char **argv) {
         }
 
         /* ---- FireFly's hint bar (firefly/ui/app.py draw_hints) ---- */
-        if (g_st.confirm_open) {
+        if (g_st.menu_open) {
+            static const char *const k[5] = { "A", "↑↓", "←→", "stick", "B" };
+            static const char *const l[5] = { "send / write", "move", "group", "scroll", "close" };
+            draw_hint_bar(fb, th, k, l, 5);
+        } else if (g_st.confirm_open) {
             static const char *const ck[3] = { "←→", "A", "B" };
             static const char *const cl[3] = { "choose", "accept", "cancel" };
             draw_hint_bar(fb, th, ck, cl, 3);
@@ -3532,8 +3862,8 @@ int main(int argc, char **argv) {
             static const char *const l[6] = { "do", "back", "scan LAN", "cards", "move", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
         } else {
-            static const char *const k[6] = { "A", "Y", "X", "←→", "↑↓", "L/R" };
-            static const char *const l[6] = { "do", "keyboard", "/auth", "room", "deck", "tab" };
+            static const char *const k[6] = { "A", "Y", "←→", "↑↓", "stick", "L/R" };
+            static const char *const l[6] = { "do", "write", "room", "deck", "scroll", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
         }
 
