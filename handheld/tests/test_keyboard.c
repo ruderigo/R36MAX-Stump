@@ -96,7 +96,10 @@ int main(void) {
     memset(&g_st, 0, sizeof(g_st)); g_st.ipc_sock = -1;
     FILE *lf = fopen(LIVE_STATE_FILE, "w");
     fputs("ROOM|0|main|2|local|General|0\nROOM|1|lora-mesh|0|lora||0\nROOM|2|wifi-mesh|3|wifi||1\n"
-          "MSG|2|0|zoe|hello\nROOM|3|quiz|1||trivia night|0\n"
+          "MSG|2|0|zoe|hello\nROOM|3|quiz|1||trivia night|0\n", lf);
+    fputs("MSG|2|0|rod|", lf);                                    /* a 400-character message */
+    for (int i = 0; i < 39; i++) fputs("abcdefghi ", lf);
+    fputs("abcdefghij\n"
           "FORM|rooms|Rooms|owner\nFIELD|0||info|0|0|Each room reaches|||0||\n"
           "FIELD|1|room:quiz|choice|1|0|#quiz|local|0|local~Wi-Fi chain~LoRa|1 here\n"
           "FIELD|2|new_scope|choice|2|0|A new room reaches|local|0|this Stump~the chain~the LoRa|\n"
@@ -105,7 +108,9 @@ int main(void) {
     fclose(lf);
     poll_live_bridge();
     CHECK("four rooms, #wifi-mesh on screen", g_st.room_n == 4 && g_st.room_idx == 2 &&
-          strcmp(g_st.room_list[3].slug, "quiz") == 0 && g_st.room_counts[2] == 1);
+          strcmp(g_st.room_list[3].slug, "quiz") == 0 && g_st.room_counts[2] == 2);
+    CHECK("a 400-character message kept whole", strlen(g_st.rooms[2][1].body) == 400 &&
+          strcmp(g_st.rooms[2][1].body + 390, "abcdefghij") == 0);
     room_step(1);
     CHECK("R moves to #quiz", strcmp(g_st.view_room, "quiz") == 0);
     poll_live_bridge();                                      /* the feed still says wifi-mesh: L/R wins a while */

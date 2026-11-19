@@ -1,6 +1,6 @@
 /*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.6.0-b.87.
+ * (RK3326 / dArkOS), v2.6.1-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -706,7 +706,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.6.0-b.87"
+#define STUMP_ENGINE_VERSION "v2.6.1-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 10
 #define MAX_DBG_LINES 16
@@ -722,7 +722,7 @@ static void scan_transports(TransportStatus *ts) {
 
 typedef struct {
     char nick[18];
-    char body[46];
+    char body[1024];     /* the whole message: up to 400 characters (the Stump's MAX_MESSAGE_LEN) */
     bool is_sys;
 } ChatLine;
 
@@ -984,7 +984,7 @@ static void push_chat_local(int room, const char *nick, const char *body, bool i
         g_st.room_counts[room]++;
     }
     snprintf(g_st.rooms[room][idx].nick, sizeof(g_st.rooms[room][idx].nick), "%.17s", nick);
-    snprintf(g_st.rooms[room][idx].body, sizeof(g_st.rooms[room][idx].body), "%.45s", body);
+    snprintf(g_st.rooms[room][idx].body, sizeof(g_st.rooms[room][idx].body), "%.1023s", body);
     g_st.rooms[room][idx].is_sys = is_sys;
 }
 
@@ -1459,7 +1459,7 @@ static void poll_live_bridge(void) {
     int w_count = 0;
     int l_count = 0;
     int d_count = 0;
-    char line[256];
+    char line[2048];                         /* a whole message (400 characters), or a form row */
     while (fgets(line, sizeof(line), f)) {
         char *nl = strchr(line, '\n');
         if (nl) *nl = '\0';
@@ -1691,7 +1691,7 @@ static void poll_live_bridge(void) {
                         *p3++ = '\0';
                         int slot = r_counts[r_idx]++;
                         snprintf(g_st.rooms[r_idx][slot].nick, sizeof(g_st.rooms[r_idx][slot].nick), "%.17s", p2);
-                        snprintf(g_st.rooms[r_idx][slot].body, sizeof(g_st.rooms[r_idx][slot].body), "%.45s", p3);
+                        snprintf(g_st.rooms[r_idx][slot].body, sizeof(g_st.rooms[r_idx][slot].body), "%.1023s", p3);
                         g_st.rooms[r_idx][slot].is_sys = (is_sys != 0);
                     }
                 }
@@ -2324,7 +2324,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.6.0-b.87");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.6.1-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -3167,39 +3167,57 @@ int main(int argc, char **argv) {
                 bool act = (!sys && strcmp(nk, "*") == 0);
                 bool dm = (strncmp(nk, "DM ", 3) == 0);
                 bool out = (!sys && !act && !dm && strncmp(nk, "r36max", 6) == 0);
-                char txt[160];
+                char txt[1100];
                 if (sys) snprintf(txt, sizeof(txt), "%s", bd);
                 else if (act) snprintf(txt, sizeof(txt), "* %s", bd);
                 else if (dm) snprintf(txt, sizeof(txt), "[DM] %s: %s", nk + 3, bd);
                 else if (out) snprintf(txt, sizeof(txt), "%s", bd);
                 else snprintf(txt, sizeof(txt), "<%s> %s", nk, bd);
-                /* up to 2 lines of 45 characters (F20 is 12 px a character) */
-                int per = 45, n = utf8_count(txt);
-                char l1[160], l2[160] = "";
-                if (n <= per) {
-                    snprintf(l1, sizeof(l1), "%s", txt);
-                } else {
-                    const char *q = txt, *cut = NULL, *after = NULL;
-                    for (int k = 0; k < per && *q; k++) {
-                        const char *prev = q;
-                        if (utf8_next(&q) == ' ') { cut = prev; after = q; }
+                /* The whole message, wrapped at spaces in lines of 45 characters (F20 is
+                 * 12 px a character): up to 10 lines (the Stump's longest, 400
+                 * characters, fits), the last with "…" if there were ever more. */
+                enum { PER = 45, MAXL = 10 };
+                char wl[MAXL][200];
+                int lines = 0;
+                const char *q = txt;
+                while (*q && lines < MAXL) {
+                    const char *start = q, *cut = NULL, *after = NULL, *p = q;
+                    int k = 0;
+                    while (*p && k < PER) {
+                        const char *prev = p;
+                        if (utf8_next(&p) == ' ') { cut = prev; after = p; }
+                        k++;
                     }
-                    if (!cut) { cut = q; after = q; }
-                    size_t len = (size_t)(cut - txt);
-                    memcpy(l1, txt, len); l1[len] = '\0';
-                    snprintf(l2, sizeof(l2), "%s", after);
+                    if (!*p) { cut = p; after = p; }           /* the rest fits */
+                    else if (!cut) { cut = p; after = p; }     /* one long word: cut it */
+                    size_t len = (size_t)(cut - start);
+                    if (len >= sizeof(wl[0])) len = sizeof(wl[0]) - 1;
+                    memcpy(wl[lines], start, len);
+                    wl[lines][len] = '\0';
+                    lines++;
+                    q = after;
+                    while (*q == ' ') q++;
                 }
-                int lines = l2[0] ? 2 : 1;
-                int w1 = font_width(F20, l1), w2 = font_width(F20, l2);
-                int bw = (w1 > w2 ? w1 : w2) + 20, bh = lines * 24 + 12;
+                if (*q && lines == MAXL) {                     /* more than fits: say so */
+                    size_t L = strlen(wl[MAXL - 1]);
+                    while (L > 0 && utf8_count(wl[MAXL - 1]) > PER - 1) {
+                        while (L > 0 && (wl[MAXL - 1][L - 1] & 0xC0) == 0x80) L--;
+                        if (L > 0) L--;
+                        wl[MAXL - 1][L] = '\0';
+                    }
+                    snprintf(wl[MAXL - 1] + L, sizeof(wl[0]) - L, "…");
+                }
+                if (lines == 0) { wl[0][0] = '\0'; lines = 1; }
+                int wmax = 0;
+                for (int k = 0; k < lines; k++) { int w = font_width(F20, wl[k]); if (w > wmax) wmax = w; }
+                int bw = wmax + 20, bh = lines * 24 + 12;
                 if (bw > PANEL_W - 60) bw = PANEL_W - 60;
                 int by = ybot - bh;
                 if (by < 192) break;
                 int bx = out ? PANEL_W - 12 - bw : 12;
                 stroke_rrect(fb, bx, by, bw, bh, 8, out ? th->ember : th->border, th->panel);
                 uint32_t fg = sys ? th->muted : act ? ACTION_C : dm ? DM_C : th->text;
-                ctext(fb, F20, bx + 10, by + 4, l1, fg, bw - 16);
-                if (l2[0]) ctext(fb, F20, bx + 10, by + 28, l2, fg, bw - 16);
+                for (int k = 0; k < lines; k++) ctext(fb, F20, bx + 10, by + 4 + k * 24, wl[k], fg, bw - 16);
                 ybot = by - 6;
             }
 

@@ -7,6 +7,16 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.6.1-b.87
+
+- **Whole messages in the chat.** A line was cut after 44 characters and drawn
+  on 2 lines at most, sent or received, in every room: the feed passed the
+  cockpit only the start of it. Now the whole line comes through, up to the
+  Stump's own limit (400 characters), and its bubble wraps it at spaces on
+  as many lines as it takes (10 at most, which 400 characters fit).
+- Tests: a 400-character line reaches the cockpit whole (the feed's unit
+  test and the C test of the live file).
+
 ## v2.6.0-b.87
 
 Tested against SandBox_Stump_On **1.0.0-beta.87** (the feed with a real
