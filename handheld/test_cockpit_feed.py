@@ -338,6 +338,22 @@ class Commands(unittest.TestCase):
         feed._admin_delete("/admin/delete_post", "ts", ["123"], "NOTICE")
         self.assertEqual(posted, [("/admin/delete_post", "ts=123&admin_pass=op-pw")])
 
+    def test_locked_out_is_told_by_the_stumps_answers(self):
+        L = F.Feed.locked_out
+        self.assertTrue(L("hello", ["auth required for that -- send /auth to verify your identity"]))
+        self.assertTrue(L("/join quiz", ["cette salle exige une identit\u00e9 v\u00e9rifi\u00e9e \u2014 envoie /auth d'abord"]))
+        self.assertTrue(L("/whoami", ["not verified this session -- /auth to prove an identity"]))
+        self.assertFalse(L("/help", ["/auth   prove an identity"]))                    # its list of commands
+        self.assertFalse(L("/auth", ["AUTH-CHALLENGE 00ff"]))
+        self.assertFalse(L("hello", []))
+
+    def test_a_commands_answer_shown_in_the_room(self):
+        feed = self.feed()
+        feed.stump.port, feed.stump.room = 80, "wifi-mesh"
+        feed.stump.send = lambda line: ["verified as abcd  nick=r36max"] if line == "/whoami" else []
+        feed.handle("RRC|wifi-mesh|/whoami")
+        self.assertIn("MSG|2|1|0|*|verified as abcd  nick=r36max", feed.live_lines())
+
     def test_a_typed_password_it_wont_take(self):
         feed = self.stump_with_settings("AUTH_ADMIN_PASSWORD = 'keep-me'\n")
         for bad in ("abc", "two words", "pw\u2022x", ""):

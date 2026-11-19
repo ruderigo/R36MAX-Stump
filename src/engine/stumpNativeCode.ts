@@ -9,7 +9,7 @@ import { CodeFileArtifact } from './nativeEngineCode';
 
 export const STUMP_R36MAX_C_SOURCE = `/*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.7.1-b.87.
+ * (RK3326 / dArkOS), v2.7.2-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -715,7 +715,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.7.1-b.87"
+#define STUMP_ENGINE_VERSION "v2.7.2-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 60      /* a room's scrollback: all the Stump keeps (MAX_MESSAGES_PER_ROOM) */
 #define MAX_ITEMS 20          /* notices and files listed (scrolled) */
@@ -2557,7 +2557,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.1-b.87");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.2-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -3997,9 +3997,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.7.1-b.87"
+            return f.read().strip() or "2.7.2-b.87"
     except OSError:
-        return "2.7.1-b.87"
+        return "2.7.2-b.87"
 
 
 FEED_VERSION = _version()
@@ -4051,6 +4051,7 @@ DOCUMENTED = (
     ("Owner (/admin)", "/admin <password> plugin [on|off <name>]", "the plugins, and turning one off or on"),
 )
 
+AUTH_CHECK_S = 60.0   # how often the cockpit asks the Stump whether it's still verified (/whoami)
 POLL_S = 2.0          # the reference client's cadence (CLIENT_QUICKSTART "Polling cadence")
 INFO_S = 5.0
 NET_S = 4.0           # the Wi-Fi cards: often enough to notice one plugged in
@@ -4404,6 +4405,10 @@ class Feed:
         self.full_ssids = {}               # shown SSID -> the real one
         self.next_info = self.next_net = 0.0
         self.nick_set = False
+        # Verified with its own identity (/auth, as FireFly does): a Stump set
+        # to hybrid or closed lets only a verified identity write (closed: read).
+        self.verified = None               # the identity hash the Stump verified it as
+        self.next_auth = self.next_auth_check = 0.0
         self.ipc = None
 
     # -- status line on the cockpit --
@@ -4436,6 +4441,54 @@ class Feed:
                 d = d.get("files", []) if isinstance(d, dict) else []
             setattr(self, attr, d)
 
+    @staticmethod
+    def locked_out(sent, replies):
+        """The Stump's answer says this client isn't verified (it's set to
+        hybrid or closed, or it restarted and forgot): every such answer
+        points to /auth. Not /help's list or /auth's own answers."""
+        low = sent.strip().lower()
+        if low.startswith("/help") or low.startswith("/auth"):
+            return False
+        return any("/auth" in str(r) and not str(r).startswith("AUTH-") for r in replies or [])
+
+    def authenticate(self):
+        """/auth with the cockpit's own identity, as FireFly does: the Stump's
+        challenge signed by cockpit_auth.py (the Stump's own Reticulum code,
+        its Python) and sent back. The identity hash, or None."""
+        st = self.stump
+        here = os.path.dirname(os.path.abspath(__file__))
+        tool = os.path.join(here, "cockpit_auth.py")
+        py = os.path.join(STUMP_DIR, "venv", "bin", "python")
+        if not os.path.isfile(tool):
+            log("AUTH", "cockpit_auth.py isn't next to the feed: run the update again")
+            return None
+        nonce = next((m.group(1) for r in st.send("/auth") for m in [re.match(r"AUTH-CHALLENGE ([0-9a-f]+)", str(r))] if m),
+                     None)
+        if not nonce:
+            log("AUTH", "the Stump gave no challenge")
+            return None
+        try:
+            p = subprocess.run([py if os.path.isfile(py) else sys.executable, "-I", tool, "--stump", STUMP_DIR,
+                                "--key", os.environ.get("STUMP_COCKPIT_IDENTITY") or os.path.join(here, "cockpit_identity"),
+                                "sign"],
+                               input=nonce + "\\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, timeout=60)
+            pub, sig = p.stdout.split()
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            log("AUTH", "couldn't sign the challenge: %s" % ((p.stderr.strip().splitlines() or [str(e)])[-1]
+                                                              if "p" in locals() else e))
+            return None
+        said = st.send("/auth %s %s" % (pub, sig))
+        ok = next((str(r)[8:].strip() for r in said if str(r).startswith("AUTH-OK ")), None)
+        if ok:
+            if ok != self.verified:
+                log("AUTH", "verified as %s (the cockpit's own identity)" % ok)
+            self.verified = ok
+            self.nick_set = False                  # (a closed Stump refused the name before)
+        else:
+            log("AUTH", "not verified: %s" % " ".join(str(r) for r in said))
+        return ok
+
     def poll(self):
         st = self.stump
         if st.port is None or time.time() < st.next_poll:
@@ -4443,6 +4496,16 @@ class Feed:
         try:
             if not st.has_cookie():
                 st.visit()
+            now = time.time()
+            if self.verified and now >= self.next_auth_check:
+                # Still verified? (A Stump that restarted has forgotten.)
+                self.next_auth_check = now + AUTH_CHECK_S
+                if any("not verified" in str(r) for r in st.send("/whoami")):
+                    self.verified = None
+            if not self.verified and now >= self.next_auth:
+                self.next_auth = now + 60
+                if self.authenticate():
+                    self.next_auth_check = now + AUTH_CHECK_S
             if not self.nick_set:
                 d = st.get("/rrc/poll?room=main&since=0")
                 if str(d.get("nick", "")).startswith("guest-") and NICK:
@@ -4562,6 +4625,19 @@ class Feed:
             self.room_order.append(slug)
         self.want_room, st.next_poll, self.next_rooms = slug, 0, 0
         self.busy("#%s: you're in it" % slug, 3)
+
+    def answer(self, room, said):
+        """What the Stump answered a command typed or picked here: in the
+        room, as lines for us only (the web chat shows them the same way),
+        and on the status line."""
+        said = [str(x) for x in said or [] if str(x).strip()]
+        if not said:
+            return
+        lines = self.msgs.setdefault(room, [])
+        for x in said:
+            lines.append({"id": 0, "kind": "system", "nick": "*", "body": x})
+        del lines[:-KEEP_MSGS]
+        self.busy(said[0], 4)
 
     def heard(self, said):
         """What the Stump answered an owner's command: on the status line, and
@@ -4963,6 +5039,7 @@ class Feed:
         """The Stump picks up a new address on restart, as after /admin's
         settings: its own user service (provisioner --pc), else its Start file."""
         log("STUMP", "restarting (%s)" % why)
+        self.verified, self.next_auth = None, time.time() + 8     # it forgets: verified again once it's up
         ok, out = run(["systemctl", "--user", "restart", "stump"], timeout=30)
         if not ok:      # no user manager (dArkOS): install.sh's system service
             import getpass
@@ -5053,10 +5130,24 @@ class Feed:
                 if room != st.room:
                     st.send("/join " + room)
                     self.want_room = room
-                for r in st.send(self.fill_password(text)):
+                if text.lower() == "/auth":           # verify, as FireFly does (the challenge answered here)
+                    self.verified = None
+                    ok = self.authenticate()
+                    self.answer(room, ["\\u2713 verified as %s" % ok] if ok else
+                                ["\\u2717 not verified (see the cockpit's log)"])
+                    st.next_poll = 0
+                    return
+                said = st.send(self.fill_password(text))
+                if self.locked_out(text, said) and self.authenticate():
+                    if st.room != room:
+                        st.send("/join " + room)
+                    said = st.send(self.fill_password(text))      # once more, verified
+                for r in said:
                     log("CHAT", r)
-                    if PW_MARK in text:
-                        self.heard([r])            # an owner's command from the menu: its answer shown
+                if PW_MARK in text:
+                    self.heard(said)               # an owner's command from the menu: its answer under the form too
+                if text.startswith("/"):
+                    self.answer(st.room or room, said)
                 st.next_poll = 0
             elif op == "BOARD_ADD" and len(parts) >= 2:
                 s, t = st.post("/post", json.dumps({"title": parts[1], "body": "|".join(parts[2:])}),
@@ -5800,7 +5891,7 @@ class Limbs:
 
 export const STUMP_R36MAX_PORTS_SCRIPT = `#!/bin/bash
 # =============================================================================
-# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.7.1-b.87)
+# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.7.2-b.87)
 # EmulationStation Ports launcher: /roms/ports/LaBuche_Stump.sh
 #
 # The Stump itself is a stock Stump on a computer (SandBox_Stump_On,
@@ -5831,7 +5922,7 @@ APP_DIR="/roms/ports/stump_r36max"               # on the TF card: drop/, tf_bac
 STUMP_DIR="$USER_HOME/Stump"
 LOG="$APP_DIR/cockpit.log"
 mkdir -p "$APP_DIR/drop" "$APP_DIR/tf_backup" 2>/dev/null
-echo "=== R36MAX Stump cockpit v2.7.1-b.87, $(date) ===" > "$LOG"
+echo "=== R36MAX Stump cockpit v2.7.2-b.87, $(date) ===" > "$LOG"
 # For diagnosing a black screen: who we are, and whether we can open the display.
 { echo "user: $(id)"; ls -l /dev/dri/ /dev/fb0 /dev/tty1 2>&1; } >> "$LOG"
 
@@ -5906,7 +5997,7 @@ echo "=== cockpit closed $(date); the Stump stopped ===" >> "$LOG"
 
 export const STUMP_R36MAX_INSTALL_SH = `#!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.7.1-b.87)
+# install.sh — makes the R36MAX a Stump like any other (v2.7.2-b.87)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -6201,7 +6292,7 @@ ok "the Stump runs only while its Port is open (Ports -> LaBuche_Stump)"
 step "6/6 The cockpit (720x720 screen, gamepad, Ports launcher)"
 mkdir -p "$COCKPIT_DIR"
 cp -f "$HERE/cockpit_feed.py" "$HERE/limbs.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \\
-      "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$HERE/admin_password.py" "$COCKPIT_DIR/"
+      "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$HERE/admin_password.py" "$HERE/cockpit_auth.py" "$COCKPIT_DIR/"
 ok "FireFly's font (DejaVu Sans Mono) next to the engine"
 CFLAGS="-O2 -Wall -Wno-format-truncation"
 grep -qi "cortex-a35\\|rk3326" /proc/device-tree/compatible /proc/cpuinfo 2>/dev/null && CFLAGS="$CFLAGS -mcpu=cortex-a35"
@@ -6655,7 +6746,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'stump_r36max_c',
     filename: 'stump_r36max_engine.c',
-    title: 'Cockpit engine v2.7.1-b.87 (720x720, gamepad, QR)',
+    title: 'Cockpit engine v2.7.2-b.87 (720x720, gamepad, QR)',
     language: 'c',
     summary:
       "The handheld's screen and gamepad: five panels (chats, board, files, network, setup). Reads /dev/shm/stump_live.txt and sends command lines to cockpit_feed.py; never touches the Stump's files or the network. The v1.8.8 KMSDRM display fixes are kept.",
@@ -6682,7 +6773,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'labuche_stump_sh',
     filename: 'LaBuche_Stump.sh',
-    title: 'EmulationStation Ports launcher v2.7.1-b.87 (/roms/ports/LaBuche_Stump.sh)',
+    title: 'EmulationStation Ports launcher v2.7.2-b.87 (/roms/ports/LaBuche_Stump.sh)',
     language: 'bash',
     summary:
       'Opens the cockpit on the Stump that runs in the background from boot; SELECT+START returns to EmulationStation and the Stump keeps running. No firewall flush, no NetworkManager masking.',

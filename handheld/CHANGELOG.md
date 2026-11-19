@@ -7,6 +7,28 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.7.2-b.87
+
+- **The cockpit verifies itself, as FireFly does.** On a Stump set to
+  *hybrid* or *closed* (`/admin mode`), only a verified identity may write
+  (closed: read too), and the cockpit wasn't one: it was put back in #main
+  and everything it sent was refused. `/auth` only gave it a challenge it
+  never answered. Now the cockpit answers it with an identity of its own
+  (`cockpit_identity`, next to the cockpit, made the first time, for its
+  owner only, kept across updates), signed with the Stump's own Reticulum
+  code (`cockpit_auth.py`). It verifies as it connects, again if the Stump
+  restarts and forgets (checked every minute), and before resending a line
+  the Stump refused for that. `/auth` from the menu does it now and says
+  who it's verified as.
+- **A command's answer is shown.** What the Stump answers a `/command` sent
+  from the cockpit (`/whoami`, `/names`, `/rooms`, a refusal...) went only
+  to the log: it now appears in the room, as lines for you only, and on the
+  status line.
+- Tests: the Stump's "verify first" answers recognised; a command's answer
+  in the room; with a real Stump: verified at start (`/whoami`), closed
+  from the menu, the cockpit still reads and writes there while an
+  unverified visitor can't, then open again.
+
 ## v2.7.1-b.87
 
 - **Type the admin password on the handheld.** OWNER → *Set the admin

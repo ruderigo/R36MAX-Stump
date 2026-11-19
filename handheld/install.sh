@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.7.1-b.87)
+# install.sh — makes the R36MAX a Stump like any other (v2.7.2-b.87)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -295,7 +295,7 @@ ok "the Stump runs only while its Port is open (Ports -> LaBuche_Stump)"
 step "6/6 The cockpit (720x720 screen, gamepad, Ports launcher)"
 mkdir -p "$COCKPIT_DIR"
 cp -f "$HERE/cockpit_feed.py" "$HERE/limbs.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \
-      "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$HERE/admin_password.py" "$COCKPIT_DIR/"
+      "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$HERE/admin_password.py" "$HERE/cockpit_auth.py" "$COCKPIT_DIR/"
 ok "FireFly's font (DejaVu Sans Mono) next to the engine"
 CFLAGS="-O2 -Wall -Wno-format-truncation"
 grep -qi "cortex-a35\|rk3326" /proc/device-tree/compatible /proc/cpuinfo 2>/dev/null && CFLAGS="$CFLAGS -mcpu=cortex-a35"
