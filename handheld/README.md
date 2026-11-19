@@ -28,6 +28,7 @@ which sit **outside** the Stump and talk to it the way any app does:
 | `LaBuche_Stump.sh` | The Ports launcher: opens the cockpit; SELECT+START returns to EmulationStation |
 | `limbs.py` | The Wi-Fi cards and their jobs (EmulationStation's network, an AP, idle), for the feed |
 | `cockpit_feed.py` | The cockpit's client of the Stump (`/rrc/poll`, `/rrc/send`, `/post`, `/upload`, `/chain.json`…) and of NetworkManager for the hotspot |
+| `cockpit_auth.py` | The cockpit's own identity and its answer to `/auth` (hybrid and closed Stumps), with the Stump's own Reticulum code |
 | `stump_r36max_engine.c` | The cockpit (v1.8.8's, minus everything that went around the Stump) |
 | `stump_pygame_display.py` | The KMSDRM presenter from v1.8.8, unchanged |
 | `cockpit_font.bin`, `gen_font.py`, `FONT_LICENSE` | FireFly's font (DejaVu Sans Mono), pre-rendered for the engine |
@@ -112,6 +113,11 @@ that's been saved.
   in groups, its packs' included. ↑/↓ moves, ←/→ jumps a group, A uses it
   (sent at once, or the keyboard opens with it half-written). `•` stands for
   the admin password: the cockpit fills it in before sending.
+- **Hybrid or closed Stumps** (v2.7.2): the cockpit verifies itself with
+  `/auth`, as FireFly does, with an identity of its own
+  (`~/stump_r36max/cockpit_identity`, made the first time; keep it, it's who
+  the cockpit is), so it reads and writes whatever the Stump's mode.
+  A command's answer appears in the room (for you only).
 - **The admin password** is read from `~/Stump/config.py`
   (`AUTH_ADMIN_PASSWORD`, or `FSERVBOT_OP_PASSWORD` when that's blank), so
   a Stump installed without the provisioner has its owner tools too. None

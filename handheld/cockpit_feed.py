@@ -50,9 +50,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.7.1-b.87"
+            return f.read().strip() or "2.7.2-b.87"
     except OSError:
-        return "2.7.1-b.87"
+        return "2.7.2-b.87"
 
 
 FEED_VERSION = _version()
@@ -104,6 +104,7 @@ DOCUMENTED = (
     ("Owner (/admin)", "/admin <password> plugin [on|off <name>]", "the plugins, and turning one off or on"),
 )
 
+AUTH_CHECK_S = 60.0   # how often the cockpit asks the Stump whether it's still verified (/whoami)
 POLL_S = 2.0          # the reference client's cadence (CLIENT_QUICKSTART "Polling cadence")
 INFO_S = 5.0
 NET_S = 4.0           # the Wi-Fi cards: often enough to notice one plugged in
@@ -457,6 +458,10 @@ class Feed:
         self.full_ssids = {}               # shown SSID -> the real one
         self.next_info = self.next_net = 0.0
         self.nick_set = False
+        # Verified with its own identity (/auth, as FireFly does): a Stump set
+        # to hybrid or closed lets only a verified identity write (closed: read).
+        self.verified = None               # the identity hash the Stump verified it as
+        self.next_auth = self.next_auth_check = 0.0
         self.ipc = None
 
     # -- status line on the cockpit --
@@ -489,6 +494,54 @@ class Feed:
                 d = d.get("files", []) if isinstance(d, dict) else []
             setattr(self, attr, d)
 
+    @staticmethod
+    def locked_out(sent, replies):
+        """The Stump's answer says this client isn't verified (it's set to
+        hybrid or closed, or it restarted and forgot): every such answer
+        points to /auth. Not /help's list or /auth's own answers."""
+        low = sent.strip().lower()
+        if low.startswith("/help") or low.startswith("/auth"):
+            return False
+        return any("/auth" in str(r) and not str(r).startswith("AUTH-") for r in replies or [])
+
+    def authenticate(self):
+        """/auth with the cockpit's own identity, as FireFly does: the Stump's
+        challenge signed by cockpit_auth.py (the Stump's own Reticulum code,
+        its Python) and sent back. The identity hash, or None."""
+        st = self.stump
+        here = os.path.dirname(os.path.abspath(__file__))
+        tool = os.path.join(here, "cockpit_auth.py")
+        py = os.path.join(STUMP_DIR, "venv", "bin", "python")
+        if not os.path.isfile(tool):
+            log("AUTH", "cockpit_auth.py isn't next to the feed: run the update again")
+            return None
+        nonce = next((m.group(1) for r in st.send("/auth") for m in [re.match(r"AUTH-CHALLENGE ([0-9a-f]+)", str(r))] if m),
+                     None)
+        if not nonce:
+            log("AUTH", "the Stump gave no challenge")
+            return None
+        try:
+            p = subprocess.run([py if os.path.isfile(py) else sys.executable, "-I", tool, "--stump", STUMP_DIR,
+                                "--key", os.environ.get("STUMP_COCKPIT_IDENTITY") or os.path.join(here, "cockpit_identity"),
+                                "sign"],
+                               input=nonce + "\n", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, timeout=60)
+            pub, sig = p.stdout.split()
+        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+            log("AUTH", "couldn't sign the challenge: %s" % ((p.stderr.strip().splitlines() or [str(e)])[-1]
+                                                              if "p" in locals() else e))
+            return None
+        said = st.send("/auth %s %s" % (pub, sig))
+        ok = next((str(r)[8:].strip() for r in said if str(r).startswith("AUTH-OK ")), None)
+        if ok:
+            if ok != self.verified:
+                log("AUTH", "verified as %s (the cockpit's own identity)" % ok)
+            self.verified = ok
+            self.nick_set = False                  # (a closed Stump refused the name before)
+        else:
+            log("AUTH", "not verified: %s" % " ".join(str(r) for r in said))
+        return ok
+
     def poll(self):
         st = self.stump
         if st.port is None or time.time() < st.next_poll:
@@ -496,6 +549,16 @@ class Feed:
         try:
             if not st.has_cookie():
                 st.visit()
+            now = time.time()
+            if self.verified and now >= self.next_auth_check:
+                # Still verified? (A Stump that restarted has forgotten.)
+                self.next_auth_check = now + AUTH_CHECK_S
+                if any("not verified" in str(r) for r in st.send("/whoami")):
+                    self.verified = None
+            if not self.verified and now >= self.next_auth:
+                self.next_auth = now + 60
+                if self.authenticate():
+                    self.next_auth_check = now + AUTH_CHECK_S
             if not self.nick_set:
                 d = st.get("/rrc/poll?room=main&since=0")
                 if str(d.get("nick", "")).startswith("guest-") and NICK:
@@ -615,6 +678,19 @@ class Feed:
             self.room_order.append(slug)
         self.want_room, st.next_poll, self.next_rooms = slug, 0, 0
         self.busy("#%s: you're in it" % slug, 3)
+
+    def answer(self, room, said):
+        """What the Stump answered a command typed or picked here: in the
+        room, as lines for us only (the web chat shows them the same way),
+        and on the status line."""
+        said = [str(x) for x in said or [] if str(x).strip()]
+        if not said:
+            return
+        lines = self.msgs.setdefault(room, [])
+        for x in said:
+            lines.append({"id": 0, "kind": "system", "nick": "*", "body": x})
+        del lines[:-KEEP_MSGS]
+        self.busy(said[0], 4)
 
     def heard(self, said):
         """What the Stump answered an owner's command: on the status line, and
@@ -1016,6 +1092,7 @@ class Feed:
         """The Stump picks up a new address on restart, as after /admin's
         settings: its own user service (provisioner --pc), else its Start file."""
         log("STUMP", "restarting (%s)" % why)
+        self.verified, self.next_auth = None, time.time() + 8     # it forgets: verified again once it's up
         ok, out = run(["systemctl", "--user", "restart", "stump"], timeout=30)
         if not ok:      # no user manager (dArkOS): install.sh's system service
             import getpass
@@ -1106,10 +1183,24 @@ class Feed:
                 if room != st.room:
                     st.send("/join " + room)
                     self.want_room = room
-                for r in st.send(self.fill_password(text)):
+                if text.lower() == "/auth":           # verify, as FireFly does (the challenge answered here)
+                    self.verified = None
+                    ok = self.authenticate()
+                    self.answer(room, ["\u2713 verified as %s" % ok] if ok else
+                                ["\u2717 not verified (see the cockpit's log)"])
+                    st.next_poll = 0
+                    return
+                said = st.send(self.fill_password(text))
+                if self.locked_out(text, said) and self.authenticate():
+                    if st.room != room:
+                        st.send("/join " + room)
+                    said = st.send(self.fill_password(text))      # once more, verified
+                for r in said:
                     log("CHAT", r)
-                    if PW_MARK in text:
-                        self.heard([r])            # an owner's command from the menu: its answer shown
+                if PW_MARK in text:
+                    self.heard(said)               # an owner's command from the menu: its answer under the form too
+                if text.startswith("/"):
+                    self.answer(st.room or room, said)
                 st.next_poll = 0
             elif op == "BOARD_ADD" and len(parts) >= 2:
                 s, t = st.post("/post", json.dumps({"title": parts[1], "body": "|".join(parts[2:])}),

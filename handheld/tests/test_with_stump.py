@@ -94,7 +94,7 @@ def main():
         # ── the feed, as the launcher starts it ─────────────────────────
         env = dict(os.environ, STUMP_DIR=stump_dir, STUMP_R36MAX_DIR=app_dir, STUMP_LIVE_FILE=live,
                    STUMP_CMD_FILE=cmdf, STUMP_IPC_PORT=str(ipc), STUMP_HTTP_PORT=str(http),
-                   STUMP_COCKPIT_NICK="r36max")
+                   STUMP_COCKPIT_NICK="r36max", STUMP_COCKPIT_IDENTITY=os.path.join(work, "cockpit_identity"))
         procs.append(subprocess.Popen([sys.executable, "-I", os.path.join(HANDHELD, "cockpit_feed.py")], env=env,
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
         lines = lambda: open(live, encoding="utf-8").read().splitlines()
@@ -218,6 +218,27 @@ def main():
         send("RRC|wifi-mesh|/setchan \u2022 #jardin-club -local")
         check("a menu command with • gets the password here: #jardin-club is local again",
               wait(lambda: any(r[2] == "jardin-club" and r[4] == "local" for r in rooms()), 25), rooms())
+
+        # ── verified with its own identity (/auth), and a command's answer shown ──
+        replies = lambda: [l.split("|", 5)[5] for l in lines() if l.startswith("MSG|") and l.split("|")[2] == "1"]
+        send("RRC|wifi-mesh|/whoami")
+        check("the cockpit verified itself (/auth, as FireFly) and shows what /whoami answers",
+              wait(lambda: any(r.startswith("verified as ") for r in replies()), 25), replies()[-5:])
+        check("... with its own identity, kept for its owner only",
+              oct(os.stat(os.path.join(work, "cockpit_identity")).st_mode & 0o777) == "0o600")
+        send("RRC|wifi-mesh|/admin \u2022 mode mandatory")
+        check("the Stump closed from the menu (/admin • mode mandatory)",
+              wait(lambda: any("mandatory" in r for r in replies()), 20), replies()[-5:])
+        send("RRC|wifi-mesh|Toujours là, fermé")
+        check("closed, the cockpit still writes and reads #wifi-mesh",
+              wait(lambda: any(l.startswith("MSG|") and l.endswith("|r36max|Toujours là, fermé") for l in lines()), 25),
+              [l for l in lines() if l.startswith("MSG|")][-4:])
+        nobody = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(), urllib.request.ProxyHandler({}))
+        nobody.open(base + "/").read()
+        r = json.loads(nobody.open(urllib.request.Request(base + "/rrc/send", data="hello".encode(), method="POST")).read())
+        check("... while a visitor who isn't verified can't", "/auth" in " ".join(r.get("replies") or []), r)
+        send("RRC|wifi-mesh|/admin \u2022 mode open")
+        check("open again", wait(lambda: any("mode set to open" in r for r in replies()), 20), replies()[-5:])
 
         # ── the rest ─────────────────────────────────────────────────────
         send("DEBUG_EXPORT_TF")
