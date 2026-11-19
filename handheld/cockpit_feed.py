@@ -50,9 +50,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.6.0-b.87"
+            return f.read().strip() or "2.6.1-b.87"
     except OSError:
-        return "2.6.0-b.87"
+        return "2.6.1-b.87"
 
 
 FEED_VERSION = _version()
@@ -1141,7 +1141,7 @@ class Feed:
                 if m.get("kind") == "action":            # /me: "* rod waves", as FireFly shows it
                     nick, body = "*", "%s %s" % (m.get("nick") or "?", body or "")
                 out.append("MSG|%d|%d|%s|%s" % (i, 1 if sys_ else 0, clip(clean(screen_line(nick), 16), 17),
-                                                clip(clean(screen_line(body), 44), 45)))
+                                                clip(clean(screen_line(body), 400), 1023)))     # the whole of it (400: the Stump's longest)
         # The OWNER tab's form: FORM|id|title|back to; then its rows,
         # FIELD|i|key|kind|asks|max|label|value|choice|opt~opt~...|hint
         title, parent, rows = self.form_rows()

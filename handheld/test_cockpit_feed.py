@@ -92,6 +92,14 @@ class Live(unittest.TestCase):
         for l in lines:
             self.assertTrue(all(c in chars or c == "|" for c in l), l)   # only what the font can draw
 
+    def test_a_long_message_comes_whole(self):
+        """The Stump takes up to 400 characters a line: all of it reaches the cockpit."""
+        feed = F.Feed()
+        body = ("Rendez-vous samedi \u00e0 10 h au jardin, apportez des gants. " * 7)[:400]
+        feed.msgs["wifi-mesh"] = [{"id": 1, "kind": "msg", "nick": "zoe", "body": body}]
+        line = [l for l in feed.live_lines() if l.startswith("MSG|")][0]
+        self.assertEqual(line.split("|", 4)[4], body.strip())
+
     def test_ssids_shown_map_back_to_the_real_name(self):
         feed = F.Feed()
         feed.net["ssids"] = [{"active": True, "signal": 70, "sec": "WPA2", "ssid": "Caf\u00e9 \U0001F332 Guest|5G"}]
