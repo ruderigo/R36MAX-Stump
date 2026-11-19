@@ -9,7 +9,7 @@ import { CodeFileArtifact } from './nativeEngineCode';
 
 export const STUMP_R36MAX_C_SOURCE = `/*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.6.1-b.87.
+ * (RK3326 / dArkOS), v2.7.0-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -715,9 +715,11 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.6.1-b.87"
+#define STUMP_ENGINE_VERSION "v2.7.0-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
-#define MAX_LOG_LINES 10
+#define MAX_LOG_LINES 60      /* a room's scrollback: all the Stump keeps (MAX_MESSAGES_PER_ROOM) */
+#define MAX_ITEMS 20          /* notices and files listed (scrolled) */
+#define MAX_CMDS 120          /* the command menu's rows */
 #define MAX_DBG_LINES 16
 
 /* R36MAX Physical Gamepad Button Mapping:
@@ -730,6 +732,7 @@ static void scan_transports(TransportStatus *ts) {
 #define R36_BTN_B_CANCEL 304
 
 typedef struct {
+    int  id;             /* the Stump's message id (0: shown here before the Stump has it) */
     char nick[18];
     char body[1024];     /* the whole message: up to 400 characters (the Stump's MAX_MESSAGE_LEN) */
     bool is_sys;
@@ -758,6 +761,16 @@ typedef struct {
     char opts[10][30];
     char hint[66];
 } FormField;
+
+/* A command the Stump knows, from the feed's CMD| lines. */
+typedef struct {
+    char group[32];
+    char word[25];
+    char syntax[122];    /* how it's written; • is the admin password's place (the feed fills it) */
+    bool args;
+    bool pw;
+    char desc[162];
+} CmdItem;
 
 typedef struct {
     char id[28];
@@ -892,9 +905,21 @@ typedef struct {
     int             form_edit_max;
     char            form_edit_label[46];
     char            pending_cmd[400];        /* what a Yes sends (confirm_type 4) */
-    BoardItem       board[8];
+    int             chat_scroll;             /* messages hidden below (0: the newest at the bottom) */
+    bool            chat_at_top;             /* the oldest kept is on screen: nothing further up */
+    int             chat_newest_id;          /* the newest message id seen in the room on screen */
+    char            chat_scroll_room[33];
+    CmdItem         cmds[MAX_CMDS];          /* every command the Stump knows (the feed's CMD lines) */
+    int             cmd_n;
+    bool            menu_open;               /* the command menu, over the chat */
+    int             menu_cursor;
+    int             menu_offset;             /* its scroll, in pixels */
+    int             stick_x, stick_y;        /* the analog sticks, as one direction each (-1, 0, 1) */
+    int             stick_ax[8];             /* each stick axis's direction (ABS_X, Y, RX, RY...) */
+    uint64_t        stick_next_ms;           /* when a held stick repeats */
+    BoardItem       board[MAX_ITEMS];
     int             board_count;
-    ShelfItem       files[8];
+    ShelfItem       files[MAX_ITEMS];
     int             file_count;
     int             used_kb;
     int             ceil_kb;
@@ -992,6 +1017,7 @@ static void push_chat_local(int room, const char *nick, const char *body, bool i
     } else {
         g_st.room_counts[room]++;
     }
+    g_st.rooms[room][idx].id = 0;
     snprintf(g_st.rooms[room][idx].nick, sizeof(g_st.rooms[room][idx].nick), "%.17s", nick);
     snprintf(g_st.rooms[room][idx].body, sizeof(g_st.rooms[room][idx].body), "%.1023s", body);
     g_st.rooms[room][idx].is_sys = is_sys;
@@ -1192,6 +1218,7 @@ static void send_typed_chat(void) {
     send_bridge_cmd(cmd);
     broadcast_udp_beacon("CHAT", g_st.input_buf);
     push_chat_local(r, "r36max", g_st.input_buf, false);
+    g_st.chat_scroll = 0;                            /* back to the newest: what was just said */
     g_st.input_len = 0;
     g_st.input_buf[0] = '\\0';
     set_ui_busy("Sending…", 1000);
@@ -1434,6 +1461,170 @@ static void form_back(void) {
     }
 }
 
+static void cmp_move(int dx, int dy);
+
+/* ---- The command menu (every command the Stump knows, from the feed) ---- */
+static void menu_open(void) {
+    if (g_st.cmd_n <= 0) { set_ui_busy("Asking the Stump for its commands…", 1600); trigger_chime(480, 30); return; }
+    g_st.menu_open = true;
+    if (g_st.menu_cursor < 0 || g_st.menu_cursor >= g_st.cmd_n) g_st.menu_cursor = 0;
+    trigger_chime(740, 40);
+}
+
+static void menu_move(int d) {
+    if (g_st.cmd_n <= 0) return;
+    g_st.menu_cursor = ((g_st.menu_cursor + d) % g_st.cmd_n + g_st.cmd_n) % g_st.cmd_n;
+    trigger_chime(500, 15);
+}
+
+/* ←/→: the first command of the previous or next group. */
+static int menu_group_start(int i) {
+    while (i > 0 && strcmp(g_st.cmds[i - 1].group, g_st.cmds[i].group) == 0) i--;
+    return i;
+}
+
+static void menu_group(int d) {
+    int n = g_st.cmd_n, c = g_st.menu_cursor;
+    if (n <= 0) return;
+    if (d > 0) {
+        int i = c;
+        while (i < n && strcmp(g_st.cmds[i].group, g_st.cmds[c].group) == 0) i++;
+        g_st.menu_cursor = i < n ? i : 0;
+    } else {
+        int s0 = menu_group_start(c);
+        g_st.menu_cursor = menu_group_start(s0 > 0 ? s0 - 1 : n - 1);
+    }
+    trigger_chime(540, 20);
+}
+
+/* A on a command: one with nothing to add is sent now; the others open the
+ * keyboard with it written up to its first argument (• where the admin
+ * password goes: the feed puts it in, the cockpit never has it). */
+static void menu_activate(void) {
+    if (g_st.menu_cursor < 0 || g_st.menu_cursor >= g_st.cmd_n) return;
+    const CmdItem *ci = &g_st.cmds[g_st.menu_cursor];
+    g_st.menu_open = false;
+    if (!ci->args) {
+        char cmd[400];
+        snprintf(cmd, sizeof(cmd), "RRC|%s|%s", room_slug(g_st.room_idx), ci->word);
+        send_bridge_cmd(cmd);
+        push_chat_local(g_st.room_idx, "r36max", ci->word, false);
+        g_st.chat_scroll = 0;
+        set_ui_busy("Sending…", 1000);
+        trigger_chime(840, 55);
+        return;
+    }
+    char pre[200] = "";
+    const char *p = ci->syntax;
+    while (*p) {
+        const char *q = strchr(p, ' ');
+        size_t len = q ? (size_t)(q - p) : strlen(p);
+        if (len == 0) { p++; continue; }
+        bool alt = false;                            /* "a¦b": one of several (the feed's | ) */
+        for (size_t k = 0; k + 1 < len; k++) if ((unsigned char)p[k] == 0xC2 && (unsigned char)p[k + 1] == 0xA6) alt = true;
+        if (p[0] == '<' || p[0] == '[' || p[0] == '#' || p[0] == '-' || alt || memchr(p, '|', len) || memchr(p, ':', len))
+            break;                                   /* its first argument: written by hand */
+        if (strlen(pre) + len + 2 >= sizeof(pre)) break;
+        strncat(pre, p, len);
+        strcat(pre, " ");
+        if (!q) break;
+        p = q + 1;
+    }
+    snprintf(g_st.input_buf, sizeof(g_st.input_buf), "%s", pre);
+    g_st.input_len = (int)strlen(g_st.input_buf);
+    g_st.osk_target = 0;
+    g_st.osk_open = true;
+    trigger_chime(740, 45);
+}
+
+/* ---- Scrolling the chat (the sticks): older up, newer down ---- */
+static void chat_scroll_by(int d) {
+    int n = g_st.room_counts[g_st.room_idx];
+    if (d < 0) {                                     /* up: older, unless the oldest is already shown */
+        if (g_st.chat_at_top || g_st.chat_scroll >= n - 1) { trigger_chime(300, 20); return; }
+        g_st.chat_scroll++;
+    } else {
+        if (g_st.chat_scroll <= 0) return;
+        g_st.chat_scroll--;
+    }
+    trigger_chime(500, 10);
+}
+
+/* One step of a stick (either one): what ↑↓ or ←→ scrolls or moves on this tab. */
+static void stick_step(int dx, int dy) {
+    if (g_st.osk_open) { cmp_move(dx, dy); return; }
+    if (g_st.confirm_open) { if (dx) { g_st.confirm_choice = dx > 0 ? 1 : 0; trigger_chime(520, 20); } return; }
+    if (g_st.menu_open) { if (dy) menu_move(dy); else menu_group(dx); return; }
+    switch (g_st.tab_idx) {
+    case 0:
+        if (dy) chat_scroll_by(dy);
+        else room_step(dx);
+        break;
+    case 1: {
+        int rows = g_st.board_count + 1;
+        if (dy) { g_st.board_cursor = (g_st.board_cursor + dy + rows) % rows; trigger_chime(500, 15); }
+        break; }
+    case 2: {
+        int rows = g_st.file_count + 1;
+        if (dy) { g_st.file_cursor = (g_st.file_cursor + dy + rows) % rows; trigger_chime(500, 15); }
+        break; }
+    case 3: {
+        int rows = g_st.limb_count + 1;
+        if (dy) { g_st.wifi_cursor = (g_st.wifi_cursor + dy + rows) % rows; trigger_chime(520, 15); }
+        break; }
+    case 4:
+        if (dy < 0 && g_st.debug_scroll > 0) g_st.debug_scroll--;
+        else if (dy > 0 && g_st.debug_scroll + 1 < g_st.debug_log_count) g_st.debug_scroll++;
+        break;
+    case 5:
+        if (dy) form_move(dy);
+        else form_pick_dir(dx);
+        break;
+    }
+}
+
+/* The sticks' axes (ABS_X/Y left, ABS_RX/RY right), as directions: past
+ * half-way it's held, back under a third it's let go. A step at once, then
+ * after 350 ms one every 110 ms while held (stick_tick, each frame). */
+typedef struct { int min, max; bool ok; } AxisRange;
+static AxisRange g_axes[16][8];
+
+static void stick_probe(int e, int fd) {
+    static const int codes[4] = { ABS_X, ABS_Y, ABS_RX, ABS_RY };
+    for (int k = 0; k < 4; k++) {
+        struct input_absinfo ai;
+        g_axes[e][codes[k]].ok = (ioctl(fd, EVIOCGABS(codes[k]), &ai) == 0 && ai.maximum > ai.minimum + 20);
+        if (g_axes[e][codes[k]].ok) { g_axes[e][codes[k]].min = ai.minimum; g_axes[e][codes[k]].max = ai.maximum; }
+    }
+}
+
+static bool stick_event(int e, int code, int value) {
+    if (code != ABS_X && code != ABS_Y && code != ABS_RX && code != ABS_RY) return false;
+    if (e < 0 || e >= 16 || !g_axes[e][code].ok) return true;          /* (an axis that isn't a stick: ignored) */
+    int mn = g_axes[e][code].min, mx = g_axes[e][code].max;
+    double half = (mx - mn) / 2.0, v = (value - (mn + half)) / half;   /* -1 .. 1 */
+    int cur = g_st.stick_ax[code];
+    int d = cur;
+    if (v > 0.5) d = 1; else if (v < -0.5) d = -1; else if (v > -0.33 && v < 0.33) d = 0;
+    g_st.stick_ax[code] = d;
+    return true;
+}
+
+static void stick_tick(uint64_t now) {
+    int dy = g_st.stick_ax[ABS_Y] ? g_st.stick_ax[ABS_Y] : g_st.stick_ax[ABS_RY];
+    int dx = g_st.stick_ax[ABS_X] ? g_st.stick_ax[ABS_X] : g_st.stick_ax[ABS_RX];
+    if (dy) dx = 0;                                  /* one direction at a time: up/down first */
+    if (!dx && !dy) { g_st.stick_x = g_st.stick_y = 0; return; }
+    if (dx != g_st.stick_x || dy != g_st.stick_y) {
+        g_st.stick_x = dx; g_st.stick_y = dy;
+        stick_step(dx, dy);
+        g_st.stick_next_ms = now + 350;
+    } else if (now >= g_st.stick_next_ms) {
+        stick_step(dx, dy);
+        g_st.stick_next_ms = now + 110;
+    }
+}
+
 static void poll_live_bridge(void) {
     if (g_st.suppress_poll_frames > 0) return;
     FILE *f = fopen(LIVE_STATE_FILE, "r");
@@ -1442,16 +1633,16 @@ static void poll_live_bridge(void) {
         return;
     }
     /* Preserve existing checked [X] states by ID / filename across live refreshes */
-    char checked_board_ids[8][28];
+    char checked_board_ids[MAX_ITEMS][28];
     int checked_board_n = 0;
-    for (int i = 0; i < g_st.board_count && i < 8; i++) {
+    for (int i = 0; i < g_st.board_count && i < MAX_ITEMS; i++) {
         if (g_st.board[i].checked && g_st.board[i].id[0]) {
             snprintf(checked_board_ids[checked_board_n++], 28, "%s", g_st.board[i].id);
         }
     }
-    char checked_file_names[8][36];
+    char checked_file_names[MAX_ITEMS][36];
     int checked_file_n = 0;
-    for (int i = 0; i < g_st.file_count && i < 8; i++) {
+    for (int i = 0; i < g_st.file_count && i < MAX_ITEMS; i++) {
         if (g_st.files[i].checked && g_st.files[i].name[0]) {
             snprintf(checked_file_names[checked_file_n++], 36, "%s", g_st.files[i].name);
         }
@@ -1459,7 +1650,7 @@ static void poll_live_bridge(void) {
 
     int r_counts[MAX_ROOMS] = {0};
     int rm_count = 0, feed_view = -1;
-    int fl_count = 0;
+    int fl_count = 0, c_count = 0;
     char new_form[16] = "";
     char keep_view[33];
     snprintf(keep_view, sizeof(keep_view), "%s", g_st.view_room[0] ? g_st.view_room : room_slug(g_st.room_idx));
@@ -1653,6 +1844,18 @@ static void poll_live_bridge(void) {
                 if (f[5] && atoi(f[5]) == 1) feed_view = rm_count;
                 rm_count++;
             }
+        } else if (strncmp(line, "CMD|", 4) == 0 && c_count < MAX_CMDS) {
+            /* CMD|i|group|word|syntax|args|password|what it does */
+            char *f[7];
+            if (split_bar(line + 4, f, 7) >= 5) {
+                CmdItem *ci = &g_st.cmds[c_count++];
+                snprintf(ci->group, sizeof(ci->group), "%.31s", f[1]);
+                snprintf(ci->word, sizeof(ci->word), "%.24s", f[2]);
+                snprintf(ci->syntax, sizeof(ci->syntax), "%.121s", f[3]);
+                ci->args = atoi(f[4]) != 0;
+                ci->pw = f[5] && atoi(f[5]) != 0;
+                snprintf(ci->desc, sizeof(ci->desc), "%.161s", f[6] ? f[6] : "");
+            }
         } else if (strncmp(line, "FORM|", 5) == 0) {
             /* FORM|id|title|back to */
             char *f[3];
@@ -1691,21 +1894,25 @@ static void poll_live_bridge(void) {
             int r_idx = atoi(line + 4);
             char *p1 = strchr(line + 4, '|');
             if (p1 && r_idx >= 0 && r_idx < MAX_ROOMS && r_counts[r_idx] < MAX_LOG_LINES) {
+                /* MSG|room|system|id|nick|body */
                 int is_sys = atoi(p1 + 1);
-                char *p2 = strchr(p1 + 1, '|');
+                char *pid = strchr(p1 + 1, '|');
+                char *p2 = pid ? strchr(pid + 1, '|') : NULL;
+                int mid = pid ? atoi(pid + 1) : 0;
                 if (p2) {
                     *p2++ = '\\0';
                     char *p3 = strchr(p2, '|');
                     if (p3) {
                         *p3++ = '\\0';
                         int slot = r_counts[r_idx]++;
+                        g_st.rooms[r_idx][slot].id = mid;
                         snprintf(g_st.rooms[r_idx][slot].nick, sizeof(g_st.rooms[r_idx][slot].nick), "%.17s", p2);
                         snprintf(g_st.rooms[r_idx][slot].body, sizeof(g_st.rooms[r_idx][slot].body), "%.1023s", p3);
                         g_st.rooms[r_idx][slot].is_sys = (is_sys != 0);
                     }
                 }
             }
-        } else if (strncmp(line, "BOARD|", 6) == 0 && b_count < 8) {
+        } else if (strncmp(line, "BOARD|", 6) == 0 && b_count < MAX_ITEMS) {
             char *p1 = line + 6;
             char *p2 = strchr(p1, '|');
             if (p2) {
@@ -1727,7 +1934,7 @@ static void poll_live_bridge(void) {
                     b_count++;
                 }
             }
-        } else if (strncmp(line, "FILE|", 5) == 0 && f_count < 8) {
+        } else if (strncmp(line, "FILE|", 5) == 0 && f_count < MAX_ITEMS) {
             char *p1 = line + 5;
             char *p2 = strchr(p1, '|');
             if (p2) {
@@ -1766,6 +1973,25 @@ static void poll_live_bridge(void) {
         if (feed_view >= 0 && (at < 0 || (quiet && feed_view != at))) at = feed_view;
         g_st.room_idx = at >= 0 ? at : 0;
         snprintf(g_st.view_room, sizeof(g_st.view_room), "%s", room_slug(g_st.room_idx));
+    }
+    if (c_count > 0) {
+        g_st.cmd_n = c_count;
+        if (g_st.menu_cursor >= c_count) g_st.menu_cursor = c_count - 1;
+    }
+    {
+        /* Scrolled back in the room on screen: new messages arriving keep the
+         * view where it is (the offset grows by them); another room: the newest. */
+        int r = g_st.room_idx, newest = 0, fresh = 0;
+        for (int i = 0; i < g_st.room_counts[r]; i++) if (g_st.rooms[r][i].id > newest) newest = g_st.rooms[r][i].id;
+        if (strcmp(g_st.chat_scroll_room, room_slug(r)) != 0) {
+            snprintf(g_st.chat_scroll_room, sizeof(g_st.chat_scroll_room), "%s", room_slug(r));
+            g_st.chat_scroll = 0;
+        } else if (g_st.chat_scroll > 0 && newest > g_st.chat_newest_id) {
+            for (int i = 0; i < g_st.room_counts[r]; i++) if (g_st.rooms[r][i].id > g_st.chat_newest_id) fresh++;
+            g_st.chat_scroll += fresh;
+        }
+        if (newest > 0) g_st.chat_newest_id = newest;
+        if (g_st.chat_scroll > g_st.room_counts[r] - 1) g_st.chat_scroll = g_st.room_counts[r] > 0 ? g_st.room_counts[r] - 1 : 0;
     }
     if (new_form[0]) {
         if (strcmp(new_form, g_st.form_id) != 0) {
@@ -1881,11 +2107,9 @@ static void execute_rrc_deck_action(void) {
         g_st.input_buf[0] = '\\0';
         trigger_chime(740, 45);
     } else {
-        broadcast_udp_beacon("CHAT", "Hello from R36MAX handheld operator!");
-        snprintf(cmd, sizeof(cmd), "RRC|%s|Hello from R36MAX handheld operator!", rslug);
-        send_bridge_cmd(cmd);
-        push_chat_local(r, "r36max", "Hello from R36MAX handheld operator!", false);
-        trigger_chime(784, 50);
+        /* Every command the Stump knows, its packs' too: a menu */
+        set_ui_busy("", 0);
+        menu_open();
     }
 }
 
@@ -2333,7 +2557,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.6.1-b.87");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.0-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -2447,6 +2671,7 @@ int main(int argc, char **argv) {
         char p[64];
         snprintf(p, sizeof(p), "/dev/input/event%d", i);
         ev_fds[i] = open(p, O_RDONLY | O_NONBLOCK);
+        if (ev_fds[i] >= 0) stick_probe(i, ev_fds[i]);
     }
 
     pthread_t audio_tid = 0;
@@ -2478,6 +2703,11 @@ int main(int argc, char **argv) {
             snprintf(g_st.confirm_label, sizeof(g_st.confirm_label), "%s", g_st.confirm_type == 3
                      ? "AP on Blueway High Power: leaves HomeNet" : "2 notices: March\\u00e9 samedi, Potluck Sunday");
         }
+        if (getenv("STUMP_COCKPIT_MENU") && frames == 0) {    /* screenshots: the command menu, a row chosen */
+            g_st.menu_open = true;
+            g_st.menu_cursor = atoi(getenv("STUMP_COCKPIT_MENU"));
+        }
+        if (getenv("STUMP_COCKPIT_SCROLL") && frames == 0) g_st.chat_scroll = atoi(getenv("STUMP_COCKPIT_SCROLL"));
         if (getenv("STUMP_COCKPIT_OSK") && frames == 0) {     /* screenshots in tests: open it at start */
             g_st.osk_open = true; cmp_reset(); g_cmp.was_open = true;
             g_cmp.page = atoi(getenv("STUMP_COCKPIT_OSK")) % 3;
@@ -2510,6 +2740,7 @@ int main(int argc, char **argv) {
                     char p[64];
                     snprintf(p, sizeof(p), "/dev/input/event%d", i);
                     ev_fds[i] = open(p, O_RDONLY | O_NONBLOCK);
+                    if (ev_fds[i] >= 0) stick_probe(i, ev_fds[i]);
                 }
             }
         }
@@ -2520,6 +2751,9 @@ int main(int argc, char **argv) {
             if (ev_fds[e] < 0) continue;
             while (read(ev_fds[e], &ev, sizeof(ev)) == sizeof(ev)) {
                 uint64_t now_ms = monotonic_ms();
+                /* The analog sticks: their own state, read each frame (stick_tick); their
+                 * constant small moves never reach the D-pad's debounce below. */
+                if (ev.type == EV_ABS && stick_event(e, ev.code, ev.value)) continue;
                 if (ev.type == EV_KEY) {
                     bool pressed = (ev.value == 1);
                     bool key_press_or_rep = (ev.value == 1 || ev.value == 2);
@@ -2605,6 +2839,25 @@ int main(int argc, char **argv) {
                             }
                             g_st.confirm_open = false;
                             continue;
+                        }
+                        continue;
+                    }
+
+                    /* The command menu, while open, takes the D-pad, A, B (and a keyboard's arrows). */
+                    if (g_st.menu_open && key_press_or_rep) {
+                        if (ev.code == BTN_DPAD_UP || ev.code == 544 || ev.code == KEY_UP) menu_move(-1);
+                        else if (ev.code == BTN_DPAD_DOWN || ev.code == 545 || ev.code == KEY_DOWN) menu_move(1);
+                        else if (ev.code == BTN_DPAD_LEFT || ev.code == 546 || ev.code == KEY_LEFT) menu_group(-1);
+                        else if (ev.code == BTN_DPAD_RIGHT || ev.code == 547 || ev.code == KEY_RIGHT) menu_group(1);
+                        else if (!pressed) continue;
+                        else if (ev.code == R36_BTN_A_ACCEPT || ev.code == KEY_ENTER || ev.code == KEY_KPENTER ||
+                                 ev.code == BTN_START || ev.code == 315) menu_activate();
+                        else if (ev.code == R36_BTN_B_CANCEL || ev.code == KEY_ESC || ev.code == 307 || ev.code == 308) {
+                            g_st.menu_open = false;
+                            trigger_chime(480, 30);
+                        } else if (ev.code == BTN_TL || ev.code == 310 || ev.code == BTN_TR || ev.code == 311) {
+                            g_st.menu_open = false;           /* a tab change closes it */
+                            g_st.tab_idx = (g_st.tab_idx + ((ev.code == BTN_TL || ev.code == 310) ? 5 : 1)) % 6;
                         }
                         continue;
                     }
@@ -2985,6 +3238,9 @@ int main(int argc, char **argv) {
                     if (g_st.confirm_open) {
                         if (ev.code == ABS_HAT0X && ev.value < 0) { g_st.confirm_choice = 0; trigger_chime(520, 20); }
                         if (ev.code == ABS_HAT0X && ev.value > 0) { g_st.confirm_choice = 1; trigger_chime(520, 20); }
+                    } else if (g_st.menu_open) {
+                        if (ev.code == ABS_HAT0Y) menu_move(ev.value < 0 ? -1 : 1);
+                        if (ev.code == ABS_HAT0X) menu_group(ev.value < 0 ? -1 : 1);
                     } else if (g_st.tab_idx == 0) {
                         if (g_st.osk_open) {
                             if (ev.code == ABS_HAT0X && ev.value < 0) g_st.osk_col = (g_st.osk_col + 9) % 10;
@@ -3081,6 +3337,8 @@ int main(int argc, char **argv) {
             }
         }
 
+        stick_tick(monotonic_ms());                  /* the analog sticks, held or pushed */
+
         const ThemeColors *th = &g_themes[g_st.theme_idx];
         fill_rect(fb, 0, 0, PANEL_W, PANEL_H, th->bg);
 
@@ -3170,7 +3428,9 @@ int main(int argc, char **argv) {
             int r = g_st.room_idx, ybot = 466;
             if (g_st.room_counts[r] == 0)
                 ctext(fb, F20, 20, 200, "No messages yet. Y to write.", th->muted, 0);
-            for (int i = g_st.room_counts[r] - 1; i >= 0; i--) {
+            int newest_shown = g_st.room_counts[r] - 1 - g_st.chat_scroll;
+            bool reached_top = true;
+            for (int i = newest_shown; i >= 0; i--) {
                 const char *nk = g_st.rooms[r][i].nick, *bd = g_st.rooms[r][i].body;
                 bool sys = g_st.rooms[r][i].is_sys;
                 bool act = (!sys && strcmp(nk, "*") == 0);
@@ -3222,12 +3482,25 @@ int main(int argc, char **argv) {
                 int bw = wmax + 20, bh = lines * 24 + 12;
                 if (bw > PANEL_W - 60) bw = PANEL_W - 60;
                 int by = ybot - bh;
-                if (by < 192) break;
+                if (by < 192) { reached_top = false; break; }
                 int bx = out ? PANEL_W - 12 - bw : 12;
                 stroke_rrect(fb, bx, by, bw, bh, 8, out ? th->ember : th->border, th->panel);
                 uint32_t fg = sys ? th->muted : act ? ACTION_C : dm ? DM_C : th->text;
                 for (int k = 0; k < lines; k++) ctext(fb, F20, bx + 10, by + 4 + k * 24, wl[k], fg, bw - 16);
                 ybot = by - 6;
+            }
+            g_st.chat_at_top = reached_top;
+            /* where the view is in the room's history (the sticks scroll it) */
+            if (!reached_top && g_st.room_counts[r] > 0) {
+                const char *up = "↑ older: stick";
+                fill_rrect(fb, PANEL_W - 22 - font_width(F16, up), 188, font_width(F16, up) + 12, 22, 6, th->panel2);
+                ctext(fb, F16, PANEL_W - 16 - font_width(F16, up), 190, up, th->muted, 0);
+            }
+            if (g_st.chat_scroll > 0) {
+                char dn[48];
+                snprintf(dn, sizeof(dn), "↓ %d newer", g_st.chat_scroll);
+                fill_rrect(fb, PANEL_W - 22 - font_width(F16, dn), 444, font_width(F16, dn) + 12, 22, 6, th->ember);
+                ctext(fb, F16, PANEL_W - 16 - font_width(F16, dn), 446, dn, th->bg, 0);
             }
 
             /* The draft (Y opens FireFly's keyboard) and its size. */
@@ -3242,7 +3515,7 @@ int main(int argc, char **argv) {
 
             /* Quick commands. */
             static const char *quick[6] = { "/whoami + /names", "/auth", "!find jardinage",
-                                            "!roll 2d6", "new room…", "say hello" };
+                                            "!roll 2d6", "new room…", "all commands…" };
             ctext(fb, F16, 14, 524, "QUICK", th->ember, 0);
             for (int c = 0; c < 6; c++) {
                 int cx = 12 + (c % 2) * 354, cy = 546 + (c / 2) * 42;
@@ -3267,8 +3540,15 @@ int main(int argc, char **argv) {
             if (count == 0)
                 ctext(fb, F20, 20, 170, board ? "No notices yet." : "No files shared yet.", th->muted, 0);
             int rh = board ? 76 : 62;
-            for (int i = 0; i < count && i < shown; i++) {
-                int y = 158 + i * rh;
+            /* a window on the list, following the cursor (more than fit: ↑/↓ more) */
+            int first = cursor - (shown - 1);
+            if (cursor >= count) first = count - shown;
+            if (first > count - shown) first = count - shown;
+            if (first < 0) first = 0;
+            if (first > 0) ctext(fb, F16, PANEL_W / 2 - 30, 134, "↑ more", th->muted, 0);
+            if (first + shown < count) ctext(fb, F16, PANEL_W / 2 - 30, 158 + shown * rh - 4, "↓ more", th->muted, 0);
+            for (int i = first; i < count && i < first + shown; i++) {
+                int y = 158 + (i - first) * rh;
                 bool sel = (i == cursor);
                 bool chk = board ? g_st.board[i].checked : g_st.files[i].checked;
                 if (sel) stroke_rrect(fb, 12, y, PANEL_W - 24, rh - 6, 8, th->ember, th->panel);
@@ -3490,6 +3770,52 @@ int main(int argc, char **argv) {
                 ctext(fb, F16, 14, 434 + i * 23, g_st.debug_logs[start + i], th->text, PANEL_W - 28);
         }
 
+        /* The command menu: every command the Stump knows, by group, over the chat. */
+        if (g_st.menu_open) {
+            int top = 128, bottom = 680, H = bottom - top - 44;
+            fill_rect(fb, 0, top, PANEL_W, bottom - top, th->bg);
+            char head[80];
+            snprintf(head, sizeof(head), "ALL COMMANDS  ·  %d", g_st.cmd_n);
+            ctext(fb, F16, 14, top + 6, head, th->ember, 0);
+            ctext(fb, F16, PANEL_W - 14 - font_width(F16, "• = its admin password"), top + 6, "• = its admin password",
+                  th->muted, 0);
+            /* the rows' places: a heading where the group changes, then the command */
+            enum { HH = 28, RH = 54 };
+            int y = 0, cur_top = 0, cur_bot = 0;
+            for (int i = 0; i < g_st.cmd_n; i++) {
+                if (i == 0 || strcmp(g_st.cmds[i].group, g_st.cmds[i - 1].group) != 0) y += HH;
+                if (i == g_st.menu_cursor) { cur_top = y - ((i == 0 || strcmp(g_st.cmds[i].group, g_st.cmds[i - 1].group) != 0) ? HH : 0); cur_bot = y + RH; }
+                y += RH;
+            }
+            if (cur_top < g_st.menu_offset) g_st.menu_offset = cur_top;
+            if (cur_bot > g_st.menu_offset + H) g_st.menu_offset = cur_bot - H;
+            if (g_st.menu_offset < 0) g_st.menu_offset = 0;
+            int y0 = top + 32 - g_st.menu_offset;
+            y = 0;
+            for (int i = 0; i < g_st.cmd_n; i++) {
+                const CmdItem *ci = &g_st.cmds[i];
+                if (i == 0 || strcmp(ci->group, g_st.cmds[i - 1].group) != 0) {
+                    int hy = y0 + y;
+                    if (hy >= top + 28 && hy + HH <= bottom - 8) {
+                        ctext(fb, F16, 14, hy + 6, ci->group, th->ember, PANEL_W - 28);
+                        fill_rect(fb, 14, hy + HH - 3, PANEL_W - 28, 1, th->border);
+                    }
+                    y += HH;
+                }
+                int ry = y0 + y;
+                if (ry >= top + 28 && ry + RH <= bottom - 8) {
+                    bool sel = (i == g_st.menu_cursor);
+                    if (sel) stroke_rrect(fb, 10, ry, PANEL_W - 20, RH - 4, 8, th->ember, th->panel);
+                    ctext(fb, F20, 22, ry + 3, ci->syntax, sel ? th->ember_bright : th->text, PANEL_W - 44);
+                    ctext(fb, F16, 22, ry + 28, ci->desc[0] ? ci->desc : (ci->args ? "A: write the rest" : "A: send it"),
+                          th->muted, PANEL_W - 44);
+                }
+                y += RH;
+            }
+            if (g_st.menu_offset > 0) ctext(fb, F16, PANEL_W / 2 - 30, top + 6, "↑ more", th->muted, 0);
+            if (g_st.menu_offset + H < y) ctext(fb, F16, PANEL_W / 2 - 30, bottom - 22, "↓ more", th->muted, 0);
+        }
+
         /* Busy: FireFly's toast, over the top of the panel. */
         if (is_ui_busy()) {
             const char *bmsg = g_st.busy_msg[0] ? g_st.busy_msg : "Working…";
@@ -3520,7 +3846,11 @@ int main(int argc, char **argv) {
         }
 
         /* ---- FireFly's hint bar (firefly/ui/app.py draw_hints) ---- */
-        if (g_st.confirm_open) {
+        if (g_st.menu_open) {
+            static const char *const k[5] = { "A", "↑↓", "←→", "stick", "B" };
+            static const char *const l[5] = { "send / write", "move", "group", "scroll", "close" };
+            draw_hint_bar(fb, th, k, l, 5);
+        } else if (g_st.confirm_open) {
             static const char *const ck[3] = { "←→", "A", "B" };
             static const char *const cl[3] = { "choose", "accept", "cancel" };
             draw_hint_bar(fb, th, ck, cl, 3);
@@ -3541,8 +3871,8 @@ int main(int argc, char **argv) {
             static const char *const l[6] = { "do", "back", "scan LAN", "cards", "move", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
         } else {
-            static const char *const k[6] = { "A", "Y", "X", "←→", "↑↓", "L/R" };
-            static const char *const l[6] = { "do", "keyboard", "/auth", "room", "deck", "tab" };
+            static const char *const k[6] = { "A", "Y", "←→", "↑↓", "stick", "L/R" };
+            static const char *const l[6] = { "do", "write", "room", "deck", "scroll", "tab" };
             draw_hint_bar(fb, th, k, l, 6);
         }
 
@@ -3667,9 +3997,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.6.1-b.87"
+            return f.read().strip() or "2.7.0-b.87"
     except OSError:
-        return "2.6.1-b.87"
+        return "2.7.0-b.87"
 
 
 FEED_VERSION = _version()
@@ -3688,6 +4018,9 @@ LIMBS_FILE = os.environ.get("STUMP_LIMBS_FILE", os.path.join(APP_DIR, "limbs.jso
 
 ROOMS = ("main", "lora-mesh", "wifi-mesh")      # the Stump's built-in rooms: always first, in this order
 MAX_ROOMS = 16                                  # what the cockpit shows (the Stump's others: /rooms)
+KEEP_MSGS = 60                                  # a room's scrollback in the cockpit (all the Stump keeps: 60)
+KEEP_ITEMS = 20                                 # notices and files listed (the cockpit scrolls them)
+MAX_CMDS = 120                                  # the command menu's rows
 ROOMS_S = 8.0                                   # the room list (/rooms, /setchan) asked again
 MOD_ACTS = ("op", "deop", "mod", "demod", "kick", "mute", "unmute", "ban", "unban")
 SCOPES = ("local", "wifi", "lora")
@@ -3698,6 +4031,25 @@ ROOM_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
 ROOMS_LINE = re.compile(r"^#(\\S+) \\u00b7(\\d+)(?:  (.*))?$")      # /rooms: "#quiz ·2  its topic  [Wi-Fi]"
 SETCHAN_LINE = re.compile(r"^#(\\S+)  (local|wifi|lora)$")          # /setchan <pw>: "#quiz  wifi"
 CHANREQ_LINE = re.compile(r"^(\\d+)\\. #(\\S+)  (.*?)  \\(")          # /chanreq <pw>: "1. #jardin  Oak  (3 min)"
+
+# A command's admin password, in the Stump's words (fr, en, es): the menu puts • there, the feed the password.
+PW_ARG = re.compile(r"<(mot de passe(?: admin)?|admin password|password|pw|contrase\\u00f1a(?: admin)?)>", re.I)
+PW_MARK = "\\u2022"
+CMDS_S = 120.0                                    # the command menu asked again
+# The commands that can't be asked for without a password, from docs/COMMANDS.md.
+DOCUMENTED = (
+    ("Identity", "/whoami", "are you verified, and as whom"),
+    ("Identity", "/auth", "prove an identity (an app answers the challenge)"),
+    ("Identity", "/invite <nick> [room]", "bring someone into a hybrid room you're in"),
+    ("Identity", "/lora", "who may use #lora-mesh from the web"),
+    ("Rooms (owner)", "/create <password> #room -local|-wifi|-lora", "a new room: this Stump, the chain or the LoRa"),
+    ("Owner (/admin)", "/admin <password> mode <open|hybrid|mandatory>", "who may enter this Stump"),
+    ("Owner (/admin)", "/admin <password> room <name> <open|minted|hybrid>", "a room's tier"),
+    ("Owner (/admin)", "/admin <password> meshroom", "#lora-mesh's status"),
+    ("Owner (/admin)", "/admin <password> reset-access", "back to config.py's mode, no room tiers"),
+    ("Owner (/admin)", "/admin <password> revoke <hexhash>", "forget a verified identity"),
+    ("Owner (/admin)", "/admin <password> plugin [on|off <name>]", "the plugins, and turning one off or on"),
+)
 
 POLL_S = 2.0          # the reference client's cadence (CLIENT_QUICKSTART "Polling cadence")
 INFO_S = 5.0
@@ -4032,6 +4384,9 @@ class Feed:
         self.mod_where = "room"
         self.setup = None                  # the Stump's /admin/setup form, as a browser reads it
         self.requests = []                 # LoRa rooms other Stumps offer (/chanreq)
+        self.catalog = []                 # every command it knows (the cockpit's menu)
+        self.show_pw_until = 0.0
+        self.next_cmds = 0.0
         self.node = None
         self.hw = {}
         self.chain = {"enabled": False}
@@ -4115,7 +4470,7 @@ class Feed:
                 st.since = max(st.since, mid)
                 if all(int(x.get("id") or 0) != mid for x in self.msgs.setdefault(room, [])):
                     self.msgs[room].append(m)
-                    del self.msgs[room][:-10]
+                    del self.msgs[room][:-KEEP_MSGS]
                 if m.get("kind") == "dm":
                     log("DM", "%s: %s" % (m.get("nick"), m.get("body")))
             self.users[room] = len(d.get("users") or [])
@@ -4142,7 +4497,11 @@ class Feed:
 
     # -- every room the Stump has --
     def admin_pw(self):
-        return str(read_config().get("AUTH_ADMIN_PASSWORD") or "")
+        """The password /admin takes, as the Stump checks it (stumpid's
+        check_admin_password): AUTH_ADMIN_PASSWORD, or when that's blank the
+        fserv bot operator's, the one the computer wizard asks for."""
+        cfg = read_config()
+        return str(cfg.get("AUTH_ADMIN_PASSWORD") or cfg.get("FSERVBOT_OP_PASSWORD") or "")
 
     def refresh_rooms(self):
         """Its rooms, as /rooms lists them (people, topic) and /setchan (each
@@ -4214,6 +4573,136 @@ class Feed:
             self.busy(said[0], 4)
         self.replies = (self.replies + said)[-6:]
 
+    # -- every command the Stump knows: the cockpit's command menu --
+    def refresh_commands(self):
+        """Every command this Stump answers, read from it without posting a
+        line anywhere: /help (the chat's, and its packs' with help), /help mods,
+        /setchan and /chanreq (their usage), /fshelp and /fslist (the file bot
+        and its !words), /plugins.json (every pack's commands, those without
+        help too); and the ones that can't be asked for without a password
+        (/create, /admin's), from the command reference (docs/COMMANDS.md)."""
+        st = self.stump
+        if st.port is None:
+            return
+        cmds, seen = [], set()
+
+        def add(group, syntax, desc="", word=None):
+            syntax = " ".join(str(syntax).split())
+            word = word or syntax.split(" ")[0]
+            if not re.match(r"^[/!][\\w.-]+$", word):
+                return
+            key = (word, syntax)
+            if key in seen:
+                return
+            seen.add(key)
+            pw = bool(PW_ARG.search(syntax))
+            if pw:                                  # the admin password: filled in by the feed (•)
+                syntax = PW_ARG.sub(PW_MARK, syntax, count=1)
+            cmds.append({"group": group, "word": word, "syntax": syntax, "desc": " ".join(str(desc).split()),
+                         "args": " " in syntax, "pw": pw})
+
+        def help_line(group, line):
+            line = str(line).strip()
+            if line[:1] not in "/!":
+                return                                  # (the key to the symbols, a heading)
+            if " : " in line:                           # "/kick <#room> <nick> : out of the room"
+                syn, desc = line.split(" : ", 1)
+            elif re.search(r"\\s{2,}", line):            # "/rooms            list the rooms"
+                syn, desc = re.split(r"\\s{2,}", line, 1)
+            else:                                       # "/msg <who> <text> a private message"
+                toks, k = line.split(" "), 1
+                while k < len(toks) and re.match(r"^([<\\[#|-].*|.*[>\\]]|::)$", toks[k]):
+                    k += 1
+                syn, desc = " ".join(toks[:k]), " ".join(toks[k:])
+            syn = syn.split(" (")[0]                     # "/setchan <pw> ... (or /setchan <pw>: ...)"
+            if desc.endswith(")") and "(" not in desc:
+                desc = desc[:-1]
+            words = syn.split()
+            if all(w.startswith("!") for w in words):   # "!fserv !help   the file bot"
+                for w in words:
+                    add("File bot: its words", w, desc)
+                return
+            add(group, syn, desc)
+        try:
+            for line in st.send("/help"):
+                help_line("Chat", line)
+            for line in st.send("/help mods"):
+                help_line("Moderation", line)
+            for c in ("/setchan", "/chanreq"):
+                for line in st.send(c):
+                    help_line("Rooms (owner)", line)
+            for line in st.send("/fshelp"):
+                help_line("File bot", line)
+            for line in st.send("/fslist"):
+                for w in re.findall(r"(?<![\\w])([!][\\w-]+)", str(line)):
+                    add("File bot: its words", w, "")
+        except Exception as e:
+            log("CMDS", "asking the Stump: %s" % e)
+        for group, syntax, desc in DOCUMENTED:
+            add(group, syntax, desc)
+        try:
+            pj = st.get("/plugins.json")
+            for p in pj.get("plugins") or []:
+                for w in p.get("commands") or []:
+                    if not any(c["word"] == "/" + w for c in cmds):
+                        add("Pack: %s %s" % (p.get("name"), p.get("version") or ""), "/" + w, "")
+        except Exception as e:
+            log("CMDS", "/plugins.json: %s" % e)
+        # the packs' commands, each under its pack's name (those /help described too)
+        try:
+            owner = {"/" + w: "Pack: %s %s" % (p.get("name"), p.get("version") or "")
+                     for p in (pj.get("plugins") or []) for w in (p.get("commands") or [])
+                     if p.get("name") not in ("fservbot", "stumpid")}
+            for c in cmds:
+                if c["word"] in owner:
+                    c["group"] = owner[c["word"]]
+        except Exception:
+            pass
+        order = ["Chat", "Identity", "Moderation", "Rooms (owner)", "Owner (/admin)", "File bot", "File bot: its words"]
+        cmds.sort(key=lambda c: (order.index(c["group"]) if c["group"] in order else len(order), c["group"]))
+        if cmds:
+            self.catalog = cmds
+
+    def make_password(self):
+        """A Stump with no admin password at all (neither AUTH_ADMIN_PASSWORD
+        nor the fserv operator's): one made here, written with the Stump's own
+        settings.write_config (admin_password.py, config.py.bak kept), then the
+        Stump restarted to take it. Only the owner's handheld does this: it's
+        their Stump's file."""
+        import secrets
+        words = "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(12))
+        pw = "-".join(words[i:i + 4] for i in range(0, 12, 4))
+        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_password.py")
+        py = os.path.join(STUMP_DIR, "venv", "bin", "python")
+        if not os.path.isfile(tool):
+            self.busy("admin_password.py isn't next to the feed: run install.sh again", 5)
+            return
+        try:
+            p = subprocess.run([py if os.path.isfile(py) else sys.executable, "-I", tool, "--stump", STUMP_DIR, "set"],
+                               input=pw + "\\n", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.busy("Couldn't set it: %s" % e, 5)
+            return
+        if self.admin_pw() != pw:
+            self.busy("Couldn't set it: %s" % (p.stdout.strip().splitlines() or ["?"])[-1], 5)
+            return
+        log("OWNER", "an admin password was made and set (Show the admin password to see it)")
+        self.show_pw_until = time.time() + 30
+        self.busy("Admin password set: the Stump restarts to take it", 6)
+        self.restart_stump("its new admin password")
+
+    def fill_password(self, text):
+        """A command from the menu with the admin password's place (•) filled,
+        here on the handheld (the cockpit never has the password)."""
+        if PW_MARK not in text or not text.startswith("/"):
+            return text
+        pw = self.admin_pw()
+        toks = text.split(" ")
+        if len(toks) > 1 and toks[1] == PW_MARK and pw:
+            toks[1] = pw
+        return " ".join(toks)
+
     # -- the OWNER tab: the Stump's owner on their own handheld --
     def open_form(self, fid):
         if fid not in ("owner", "setup", "rooms", "people"):
@@ -4244,6 +4733,9 @@ class Feed:
 
     def form_set(self, fid, key, value):
         st, pw = self.stump, self.admin_pw()
+        if fid == "owner" and key == "makepw" and not pw:
+            self.make_password()
+            return
         if not pw:
             self.busy("No admin password on this Stump", 3)
             return
@@ -4252,7 +4744,9 @@ class Feed:
         except ValueError:
             n = -1
         if fid == "owner":
-            if key == "announce":
+            if key == "showpw":
+                self.show_pw_until = time.time() + 30
+            elif key == "announce":
                 s, page = self.admin_page("/admin/announce")
                 self.busy(page_notice(page) or ("Announce: HTTP %s" % s), 4)
             elif key == "restart":
@@ -4308,8 +4802,11 @@ class Feed:
         room = self.stump.room or self.want_room
         pw = self.admin_pw()
         if not pw:
-            return "Owner tools", "", [row("", "info", "No admin password on this Stump yet",
-                                           hint="set one: provisioner.py --pc ~/Stump --reconfigure")]
+            return "Owner tools", "", [
+                row("", "info", "No admin password on this Stump yet",
+                    hint="/admin, its rooms and its people need one"),
+                row("makepw", "action", "Make one now", ask=1,
+                    hint="the cockpit fills it in for you; shown here when you need it on a phone")]
         if self.form == "setup":
             rows, seen = [], set()
             for c in self.setup or []:
@@ -4374,6 +4871,9 @@ class Feed:
             row("rooms", "open", "Rooms", hint="%d rooms  \\u00b7  their reach, new rooms, LoRa offers" % n),
             row("people", "open", "People in #" + room, hint="%d other%s here  \\u00b7  op, mod, kick, mute, ban"
                 % (here, "" if here == 1 else "s")),
+            row("showpw", "action", "Show the admin password", ask=1,
+                hint=("%s  (for /admin on a phone; hidden again in 30 s)" % pw) if time.time() < self.show_pw_until
+                else "you never type it here: the cockpit fills it in"),
             row("announce", "action", "Announce now", ask=True, hint="its address and beacon, at once"),
             row("restart", "action", "Restart the Stump", ask=True, hint="settings that wait for a restart"),
             row("", "info", "The rest: /admin on a phone",
@@ -4523,8 +5023,10 @@ class Feed:
                 if room != st.room:
                     st.send("/join " + room)
                     self.want_room = room
-                for r in st.send(text):
+                for r in st.send(self.fill_password(text)):
                     log("CHAT", r)
+                    if PW_MARK in text:
+                        self.heard([r])            # an owner's command from the menu: its answer shown
                 st.next_poll = 0
             elif op == "BOARD_ADD" and len(parts) >= 2:
                 s, t = st.post("/post", json.dumps({"title": parts[1], "body": "|".join(parts[2:])}),
@@ -4749,7 +5251,7 @@ class Feed:
                                                    1 if room == view else 0))
             if room != view:
                 continue
-            for m in self.msgs.get(room, [])[-10:]:
+            for m in self.msgs.get(room, [])[-KEEP_MSGS:]:
                 sys_ = m.get("kind") == "system"
                 nick = "*" if sys_ else (m.get("nick") or "?")
                 if m.get("kind") == "dm":
@@ -4757,8 +5259,16 @@ class Feed:
                 body = m.get("body")
                 if m.get("kind") == "action":            # /me: "* rod waves", as FireFly shows it
                     nick, body = "*", "%s %s" % (m.get("nick") or "?", body or "")
-                out.append("MSG|%d|%d|%s|%s" % (i, 1 if sys_ else 0, clip(clean(screen_line(nick), 16), 17),
+                out.append("MSG|%d|%d|%d|%s|%s" % (i, 1 if sys_ else 0, int(m.get("id") or 0),
+                                                   clip(clean(screen_line(nick), 16), 17),
                                                 clip(clean(screen_line(body), 400), 1023)))     # the whole of it (400: the Stump's longest)
+        # The command menu: CMD|i|group|word|syntax|args|password|what it does
+        for i, c in enumerate(self.catalog[:MAX_CMDS]):
+            out.append("CMD|%d|%s|%s|%s|%d|%d|%s" % (
+                i, clip(clean(screen_line(c["group"]), 30), 31), clean(c["word"], 24),
+                clip(clean(screen_line(c["syntax"].replace("|", "\\u00a6")), 90), 121),   # (| is the separator)
+                1 if c["args"] else 0, 1 if c["pw"] else 0,
+                clip(clean(screen_line(c["desc"]), 110), 161)))
         # The OWNER tab's form: FORM|id|title|back to; then its rows,
         # FIELD|i|key|kind|asks|max|label|value|choice|opt~opt~...|hint
         title, parent, rows = self.form_rows()
@@ -4769,7 +5279,7 @@ class Feed:
                 i, clean(r["key"], 40), r["kind"], int(r["ask"] or 0), int(r["max"] or 0),
                 clip(clean(screen_line(r["label"]), 44), 45), clip(clean(screen_line(r["value"]), 120), 121),
                 int(r["sel"]), opts, clip(clean(screen_line(r["hint"]), 64), 65)))
-        for p in self.board[:8]:
+        for p in self.board[:KEEP_ITEMS]:
             out.append("BOARD|%s|%s|%s|%s" % (clean(p.get("id") or "", 24), clip(clean(screen_line(p.get("sig")), 14), 15),
                                               clip(clean(screen_line(p.get("title")), 44), 45),
                                               clip(clean(screen_line(p.get("body")), 48), 49)))
@@ -4778,7 +5288,7 @@ class Feed:
         files = sorted(self.files, key=lambda f: -(f.get("mtime") or 0))
         for f in files:
             used += int(f.get("size") or 0)
-        for f in files[:8]:
+        for f in files[:KEEP_ITEMS]:
             shown = clip(clean(screen_line(f.get("name")), 35), 35).replace(",", "_")
             self.full_names[shown] = f.get("name")
             cat = {"document": "DOC", "image": "IMG", "music": "AUDIO", "video": "VIDEO"}.get(f.get("cat"), "FILE")
@@ -4849,6 +5359,12 @@ class Feed:
                 except Exception as e:
                     log("CHAT", "rooms: %s" % e)
                 self.next_rooms = time.time() + ROOMS_S
+            if now >= self.next_cmds and self.stump.port is not None:
+                try:
+                    self.refresh_commands()
+                except Exception as e:
+                    log("CMDS", "%s" % e)
+                self.next_cmds = time.time() + (CMDS_S if self.catalog else 15.0)
             self.write_live()
             if once:
                 return
@@ -5254,7 +5770,7 @@ class Limbs:
 
 export const STUMP_R36MAX_PORTS_SCRIPT = `#!/bin/bash
 # =============================================================================
-# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.6.1-b.87)
+# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.7.0-b.87)
 # EmulationStation Ports launcher: /roms/ports/LaBuche_Stump.sh
 #
 # The Stump itself is a stock Stump on a computer (SandBox_Stump_On,
@@ -5285,7 +5801,7 @@ APP_DIR="/roms/ports/stump_r36max"               # on the TF card: drop/, tf_bac
 STUMP_DIR="$USER_HOME/Stump"
 LOG="$APP_DIR/cockpit.log"
 mkdir -p "$APP_DIR/drop" "$APP_DIR/tf_backup" 2>/dev/null
-echo "=== R36MAX Stump cockpit v2.6.1-b.87, $(date) ===" > "$LOG"
+echo "=== R36MAX Stump cockpit v2.7.0-b.87, $(date) ===" > "$LOG"
 # For diagnosing a black screen: who we are, and whether we can open the display.
 { echo "user: $(id)"; ls -l /dev/dri/ /dev/fb0 /dev/tty1 2>&1; } >> "$LOG"
 
@@ -5360,7 +5876,7 @@ echo "=== cockpit closed $(date); the Stump stopped ===" >> "$LOG"
 
 export const STUMP_R36MAX_INSTALL_SH = `#!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.6.1-b.87)
+# install.sh — makes the R36MAX a Stump like any other (v2.7.0-b.87)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -5655,7 +6171,7 @@ ok "the Stump runs only while its Port is open (Ports -> LaBuche_Stump)"
 step "6/6 The cockpit (720x720 screen, gamepad, Ports launcher)"
 mkdir -p "$COCKPIT_DIR"
 cp -f "$HERE/cockpit_feed.py" "$HERE/limbs.py" "$HERE/stump_pygame_display.py" "$HERE/stump_r36max_engine.c" \\
-      "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$COCKPIT_DIR/"
+      "$HERE/cockpit_font.bin" "$HERE/FONT_LICENSE" "$HERE/admin_password.py" "$COCKPIT_DIR/"
 ok "FireFly's font (DejaVu Sans Mono) next to the engine"
 CFLAGS="-O2 -Wall -Wno-format-truncation"
 grep -qi "cortex-a35\\|rk3326" /proc/device-tree/compatible /proc/cpuinfo 2>/dev/null && CFLAGS="$CFLAGS -mcpu=cortex-a35"
@@ -6109,7 +6625,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'stump_r36max_c',
     filename: 'stump_r36max_engine.c',
-    title: 'Cockpit engine v2.6.1-b.87 (720x720, gamepad, QR)',
+    title: 'Cockpit engine v2.7.0-b.87 (720x720, gamepad, QR)',
     language: 'c',
     summary:
       "The handheld's screen and gamepad: five panels (chats, board, files, network, setup). Reads /dev/shm/stump_live.txt and sends command lines to cockpit_feed.py; never touches the Stump's files or the network. The v1.8.8 KMSDRM display fixes are kept.",
@@ -6136,7 +6652,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'labuche_stump_sh',
     filename: 'LaBuche_Stump.sh',
-    title: 'EmulationStation Ports launcher v2.6.1-b.87 (/roms/ports/LaBuche_Stump.sh)',
+    title: 'EmulationStation Ports launcher v2.7.0-b.87 (/roms/ports/LaBuche_Stump.sh)',
     language: 'bash',
     summary:
       'Opens the cockpit on the Stump that runs in the background from boot; SELECT+START returns to EmulationStation and the Stump keeps running. No firewall flush, no NetworkManager masking.',

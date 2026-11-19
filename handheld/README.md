@@ -105,6 +105,18 @@ that's been saved.
   and the line under them says how far the room reaches (this Stump, the
   chain's Wi-Fi, the LoRa) and its topic. *new room…* in the quick commands
   makes one on this Stump (`/join`) and opens it.
+- **The sticks** (v2.7.0) scroll the chat (up: older, down: newer, through
+  the 60 lines the Stump keeps per room) and move through the lists on the
+  other tabs, as the D-pad does.
+- **All commands…** (chat deck, v2.7.0): every command this Stump answers,
+  in groups, its packs' included. ↑/↓ moves, ←/→ jumps a group, A uses it
+  (sent at once, or the keyboard opens with it half-written). `•` stands for
+  the admin password: the cockpit fills it in before sending.
+- **The admin password** is read from `~/Stump/config.py`
+  (`AUTH_ADMIN_PASSWORD`, or `FSERVBOT_OP_PASSWORD` when that's blank), so
+  a Stump installed without the provisioner has its owner tools too. None
+  yet: OWNER → *Make one now*. To use it from a phone: OWNER → *Show the
+  admin password* (30 seconds).
 - **OWNER tab** (v2.6.0): the Stump's owner on their own handheld, with the
   admin password from `~/Stump/config.py` (it never leaves the handheld):
   - *Stump settings*: the same form as `/admin`'s, read from the Stump's own

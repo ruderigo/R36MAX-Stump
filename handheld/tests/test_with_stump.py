@@ -116,7 +116,7 @@ def main():
         check("a chat line reaches the Stump exactly (case, accents, arrow)",
               wait(lambda: "Bonjour ! Été à Montréal → LaBuche_Cabin" in said(), 20), said())
         check("... and comes back in the live file as it was sent",
-              wait(lambda: any(l.startswith("MSG|2|0|r36max|Bonjour ! Été à Montréal") for l in lines()), 20),
+              wait(lambda: any(l.startswith("MSG|2|0|") and "|r36max|Bonjour ! Été à Montréal" in l for l in lines()), 20),
               [l for l in lines() if l.startswith("MSG|2")])
 
         # ── billboard: post, back up, delete ────────────────────────────
@@ -204,6 +204,18 @@ def main():
                                            "unban"].index("kick") + 1))
         zroom = lambda: json.loads(zoe.open(base + "/rrc/poll?room=potluck&since=0").read()).get("room")
         check("a kick, with the admin password: zoe is out of #potluck", wait(lambda: zroom() == "main", 20), zroom())
+
+        # ── the command menu: every command it knows; • filled in here ──
+        cmd_lines = lambda: [l.split("|") for l in lines() if l.startswith("CMD|")]
+        check("the command menu lists the Stump's commands (chat, moderation, file bot, its packs)",
+              wait(lambda: {"/join", "/kick", "/fslist", "/whoami", "/setchan"} <= {c[3] for c in cmd_lines()}, 40),
+              sorted({c[3] for c in cmd_lines()}))
+        check("... with the admin password's place shown as •, never the password",
+              any(c[3] == "/setchan" and "\u2022" in c[4] for c in cmd_lines())
+              and not any("test-admin-pw" in "|".join(c) for c in cmd_lines()))
+        send("RRC|wifi-mesh|/setchan \u2022 #jardin-club -local")
+        check("a menu command with • gets the password here: #jardin-club is local again",
+              wait(lambda: any(r[2] == "jardin-club" and r[4] == "local" for r in rooms()), 25), rooms())
 
         # ── the rest ─────────────────────────────────────────────────────
         send("DEBUG_EXPORT_TF")

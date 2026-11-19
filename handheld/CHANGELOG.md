@@ -7,6 +7,41 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.7.0-b.87
+
+- **The sticks scroll.** The chat had no way back to what was said before:
+  now either stick scrolls it (up: older, down: newer), through everything
+  the Stump keeps for the room (60 lines). "↑ older" and "↓ N newer" show
+  there is more; new messages keep a scrolled view where it is; sending
+  brings it back to the newest. On the other tabs the sticks do what the
+  D-pad does (the billboard, the files, NETWORK, the log, OWNER's forms, the
+  keyboard, the menu). A first step at once, then repeats while held.
+- **Lists show everything.** The billboard drew 4 of its notices and the files
+  5, and the cursor went on to ones not on screen: both now scroll with the
+  cursor, with "↑/↓ more" marks, and keep 20 each.
+- **All commands…** on the chat deck (where *say hello* was): every command this
+  Stump answers, in groups — chat, moderation, owner, the file bot's `!`
+  words, and each pack's own commands under its name — read from `/help`,
+  `/help mods`, `/setchan`, `/chanreq`, `/fshelp`, `/fslist`, the command
+  reference and `/plugins.json` (so commands `/help` leaves out are there
+  too). ↑/↓ moves, ←/→ jumps a group, A uses it: one with nothing to add is
+  sent at once, the others open the keyboard with the command written up to
+  its first argument.
+- **Owner commands without typing the password.** Where a command takes the
+  admin password, the menu writes `•`; the cockpit fills in the Stump's own
+  password from `~/Stump/config.py` before sending (the cockpit's screen
+  never has it). It takes the admin password, or the file bot operator's
+  when that one is blank, as the Stump itself does: a Stump installed
+  without the provisioner now gets its owner tools.
+- **No admin password yet?** OWNER → *Make one now*: a random one is written
+  with the Stump's own `admin_password.py` (its `config.py.bak` kept) and the
+  Stump restarts with it. OWNER → *Show the admin password* shows it for 30
+  seconds, for the Stump's `/admin` page from a phone.
+- Tests: the command catalog from the Stump's real replies, `•` filled in,
+  the password fallback and *Make one now*; the menu, scrolling and the
+  sticks in the C test; with a real Stump: its commands listed (never the
+  password) and a `/setchan •` from the menu carried out.
+
 ## v2.6.1-b.87
 
 - **Whole messages in the chat.** A line was cut after 44 characters and drawn

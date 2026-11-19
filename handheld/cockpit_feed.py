@@ -50,9 +50,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.6.1-b.87"
+            return f.read().strip() or "2.7.0-b.87"
     except OSError:
-        return "2.6.1-b.87"
+        return "2.7.0-b.87"
 
 
 FEED_VERSION = _version()
@@ -71,6 +71,9 @@ LIMBS_FILE = os.environ.get("STUMP_LIMBS_FILE", os.path.join(APP_DIR, "limbs.jso
 
 ROOMS = ("main", "lora-mesh", "wifi-mesh")      # the Stump's built-in rooms: always first, in this order
 MAX_ROOMS = 16                                  # what the cockpit shows (the Stump's others: /rooms)
+KEEP_MSGS = 60                                  # a room's scrollback in the cockpit (all the Stump keeps: 60)
+KEEP_ITEMS = 20                                 # notices and files listed (the cockpit scrolls them)
+MAX_CMDS = 120                                  # the command menu's rows
 ROOMS_S = 8.0                                   # the room list (/rooms, /setchan) asked again
 MOD_ACTS = ("op", "deop", "mod", "demod", "kick", "mute", "unmute", "ban", "unban")
 SCOPES = ("local", "wifi", "lora")
@@ -81,6 +84,25 @@ ROOM_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
 ROOMS_LINE = re.compile(r"^#(\S+) \u00b7(\d+)(?:  (.*))?$")      # /rooms: "#quiz ·2  its topic  [Wi-Fi]"
 SETCHAN_LINE = re.compile(r"^#(\S+)  (local|wifi|lora)$")          # /setchan <pw>: "#quiz  wifi"
 CHANREQ_LINE = re.compile(r"^(\d+)\. #(\S+)  (.*?)  \(")          # /chanreq <pw>: "1. #jardin  Oak  (3 min)"
+
+# A command's admin password, in the Stump's words (fr, en, es): the menu puts • there, the feed the password.
+PW_ARG = re.compile(r"<(mot de passe(?: admin)?|admin password|password|pw|contrase\u00f1a(?: admin)?)>", re.I)
+PW_MARK = "\u2022"
+CMDS_S = 120.0                                    # the command menu asked again
+# The commands that can't be asked for without a password, from docs/COMMANDS.md.
+DOCUMENTED = (
+    ("Identity", "/whoami", "are you verified, and as whom"),
+    ("Identity", "/auth", "prove an identity (an app answers the challenge)"),
+    ("Identity", "/invite <nick> [room]", "bring someone into a hybrid room you're in"),
+    ("Identity", "/lora", "who may use #lora-mesh from the web"),
+    ("Rooms (owner)", "/create <password> #room -local|-wifi|-lora", "a new room: this Stump, the chain or the LoRa"),
+    ("Owner (/admin)", "/admin <password> mode <open|hybrid|mandatory>", "who may enter this Stump"),
+    ("Owner (/admin)", "/admin <password> room <name> <open|minted|hybrid>", "a room's tier"),
+    ("Owner (/admin)", "/admin <password> meshroom", "#lora-mesh's status"),
+    ("Owner (/admin)", "/admin <password> reset-access", "back to config.py's mode, no room tiers"),
+    ("Owner (/admin)", "/admin <password> revoke <hexhash>", "forget a verified identity"),
+    ("Owner (/admin)", "/admin <password> plugin [on|off <name>]", "the plugins, and turning one off or on"),
+)
 
 POLL_S = 2.0          # the reference client's cadence (CLIENT_QUICKSTART "Polling cadence")
 INFO_S = 5.0
@@ -415,6 +437,9 @@ class Feed:
         self.mod_where = "room"
         self.setup = None                  # the Stump's /admin/setup form, as a browser reads it
         self.requests = []                 # LoRa rooms other Stumps offer (/chanreq)
+        self.catalog = []                 # every command it knows (the cockpit's menu)
+        self.show_pw_until = 0.0
+        self.next_cmds = 0.0
         self.node = None
         self.hw = {}
         self.chain = {"enabled": False}
@@ -498,7 +523,7 @@ class Feed:
                 st.since = max(st.since, mid)
                 if all(int(x.get("id") or 0) != mid for x in self.msgs.setdefault(room, [])):
                     self.msgs[room].append(m)
-                    del self.msgs[room][:-10]
+                    del self.msgs[room][:-KEEP_MSGS]
                 if m.get("kind") == "dm":
                     log("DM", "%s: %s" % (m.get("nick"), m.get("body")))
             self.users[room] = len(d.get("users") or [])
@@ -525,7 +550,11 @@ class Feed:
 
     # -- every room the Stump has --
     def admin_pw(self):
-        return str(read_config().get("AUTH_ADMIN_PASSWORD") or "")
+        """The password /admin takes, as the Stump checks it (stumpid's
+        check_admin_password): AUTH_ADMIN_PASSWORD, or when that's blank the
+        fserv bot operator's, the one the computer wizard asks for."""
+        cfg = read_config()
+        return str(cfg.get("AUTH_ADMIN_PASSWORD") or cfg.get("FSERVBOT_OP_PASSWORD") or "")
 
     def refresh_rooms(self):
         """Its rooms, as /rooms lists them (people, topic) and /setchan (each
@@ -597,6 +626,136 @@ class Feed:
             self.busy(said[0], 4)
         self.replies = (self.replies + said)[-6:]
 
+    # -- every command the Stump knows: the cockpit's command menu --
+    def refresh_commands(self):
+        """Every command this Stump answers, read from it without posting a
+        line anywhere: /help (the chat's, and its packs' with help), /help mods,
+        /setchan and /chanreq (their usage), /fshelp and /fslist (the file bot
+        and its !words), /plugins.json (every pack's commands, those without
+        help too); and the ones that can't be asked for without a password
+        (/create, /admin's), from the command reference (docs/COMMANDS.md)."""
+        st = self.stump
+        if st.port is None:
+            return
+        cmds, seen = [], set()
+
+        def add(group, syntax, desc="", word=None):
+            syntax = " ".join(str(syntax).split())
+            word = word or syntax.split(" ")[0]
+            if not re.match(r"^[/!][\w.-]+$", word):
+                return
+            key = (word, syntax)
+            if key in seen:
+                return
+            seen.add(key)
+            pw = bool(PW_ARG.search(syntax))
+            if pw:                                  # the admin password: filled in by the feed (•)
+                syntax = PW_ARG.sub(PW_MARK, syntax, count=1)
+            cmds.append({"group": group, "word": word, "syntax": syntax, "desc": " ".join(str(desc).split()),
+                         "args": " " in syntax, "pw": pw})
+
+        def help_line(group, line):
+            line = str(line).strip()
+            if line[:1] not in "/!":
+                return                                  # (the key to the symbols, a heading)
+            if " : " in line:                           # "/kick <#room> <nick> : out of the room"
+                syn, desc = line.split(" : ", 1)
+            elif re.search(r"\s{2,}", line):            # "/rooms            list the rooms"
+                syn, desc = re.split(r"\s{2,}", line, 1)
+            else:                                       # "/msg <who> <text> a private message"
+                toks, k = line.split(" "), 1
+                while k < len(toks) and re.match(r"^([<\[#|-].*|.*[>\]]|::)$", toks[k]):
+                    k += 1
+                syn, desc = " ".join(toks[:k]), " ".join(toks[k:])
+            syn = syn.split(" (")[0]                     # "/setchan <pw> ... (or /setchan <pw>: ...)"
+            if desc.endswith(")") and "(" not in desc:
+                desc = desc[:-1]
+            words = syn.split()
+            if all(w.startswith("!") for w in words):   # "!fserv !help   the file bot"
+                for w in words:
+                    add("File bot: its words", w, desc)
+                return
+            add(group, syn, desc)
+        try:
+            for line in st.send("/help"):
+                help_line("Chat", line)
+            for line in st.send("/help mods"):
+                help_line("Moderation", line)
+            for c in ("/setchan", "/chanreq"):
+                for line in st.send(c):
+                    help_line("Rooms (owner)", line)
+            for line in st.send("/fshelp"):
+                help_line("File bot", line)
+            for line in st.send("/fslist"):
+                for w in re.findall(r"(?<![\w])([!][\w-]+)", str(line)):
+                    add("File bot: its words", w, "")
+        except Exception as e:
+            log("CMDS", "asking the Stump: %s" % e)
+        for group, syntax, desc in DOCUMENTED:
+            add(group, syntax, desc)
+        try:
+            pj = st.get("/plugins.json")
+            for p in pj.get("plugins") or []:
+                for w in p.get("commands") or []:
+                    if not any(c["word"] == "/" + w for c in cmds):
+                        add("Pack: %s %s" % (p.get("name"), p.get("version") or ""), "/" + w, "")
+        except Exception as e:
+            log("CMDS", "/plugins.json: %s" % e)
+        # the packs' commands, each under its pack's name (those /help described too)
+        try:
+            owner = {"/" + w: "Pack: %s %s" % (p.get("name"), p.get("version") or "")
+                     for p in (pj.get("plugins") or []) for w in (p.get("commands") or [])
+                     if p.get("name") not in ("fservbot", "stumpid")}
+            for c in cmds:
+                if c["word"] in owner:
+                    c["group"] = owner[c["word"]]
+        except Exception:
+            pass
+        order = ["Chat", "Identity", "Moderation", "Rooms (owner)", "Owner (/admin)", "File bot", "File bot: its words"]
+        cmds.sort(key=lambda c: (order.index(c["group"]) if c["group"] in order else len(order), c["group"]))
+        if cmds:
+            self.catalog = cmds
+
+    def make_password(self):
+        """A Stump with no admin password at all (neither AUTH_ADMIN_PASSWORD
+        nor the fserv operator's): one made here, written with the Stump's own
+        settings.write_config (admin_password.py, config.py.bak kept), then the
+        Stump restarted to take it. Only the owner's handheld does this: it's
+        their Stump's file."""
+        import secrets
+        words = "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(12))
+        pw = "-".join(words[i:i + 4] for i in range(0, 12, 4))
+        tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_password.py")
+        py = os.path.join(STUMP_DIR, "venv", "bin", "python")
+        if not os.path.isfile(tool):
+            self.busy("admin_password.py isn't next to the feed: run install.sh again", 5)
+            return
+        try:
+            p = subprocess.run([py if os.path.isfile(py) else sys.executable, "-I", tool, "--stump", STUMP_DIR, "set"],
+                               input=pw + "\n", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                               universal_newlines=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.busy("Couldn't set it: %s" % e, 5)
+            return
+        if self.admin_pw() != pw:
+            self.busy("Couldn't set it: %s" % (p.stdout.strip().splitlines() or ["?"])[-1], 5)
+            return
+        log("OWNER", "an admin password was made and set (Show the admin password to see it)")
+        self.show_pw_until = time.time() + 30
+        self.busy("Admin password set: the Stump restarts to take it", 6)
+        self.restart_stump("its new admin password")
+
+    def fill_password(self, text):
+        """A command from the menu with the admin password's place (•) filled,
+        here on the handheld (the cockpit never has the password)."""
+        if PW_MARK not in text or not text.startswith("/"):
+            return text
+        pw = self.admin_pw()
+        toks = text.split(" ")
+        if len(toks) > 1 and toks[1] == PW_MARK and pw:
+            toks[1] = pw
+        return " ".join(toks)
+
     # -- the OWNER tab: the Stump's owner on their own handheld --
     def open_form(self, fid):
         if fid not in ("owner", "setup", "rooms", "people"):
@@ -627,6 +786,9 @@ class Feed:
 
     def form_set(self, fid, key, value):
         st, pw = self.stump, self.admin_pw()
+        if fid == "owner" and key == "makepw" and not pw:
+            self.make_password()
+            return
         if not pw:
             self.busy("No admin password on this Stump", 3)
             return
@@ -635,7 +797,9 @@ class Feed:
         except ValueError:
             n = -1
         if fid == "owner":
-            if key == "announce":
+            if key == "showpw":
+                self.show_pw_until = time.time() + 30
+            elif key == "announce":
                 s, page = self.admin_page("/admin/announce")
                 self.busy(page_notice(page) or ("Announce: HTTP %s" % s), 4)
             elif key == "restart":
@@ -691,8 +855,11 @@ class Feed:
         room = self.stump.room or self.want_room
         pw = self.admin_pw()
         if not pw:
-            return "Owner tools", "", [row("", "info", "No admin password on this Stump yet",
-                                           hint="set one: provisioner.py --pc ~/Stump --reconfigure")]
+            return "Owner tools", "", [
+                row("", "info", "No admin password on this Stump yet",
+                    hint="/admin, its rooms and its people need one"),
+                row("makepw", "action", "Make one now", ask=1,
+                    hint="the cockpit fills it in for you; shown here when you need it on a phone")]
         if self.form == "setup":
             rows, seen = [], set()
             for c in self.setup or []:
@@ -757,6 +924,9 @@ class Feed:
             row("rooms", "open", "Rooms", hint="%d rooms  \u00b7  their reach, new rooms, LoRa offers" % n),
             row("people", "open", "People in #" + room, hint="%d other%s here  \u00b7  op, mod, kick, mute, ban"
                 % (here, "" if here == 1 else "s")),
+            row("showpw", "action", "Show the admin password", ask=1,
+                hint=("%s  (for /admin on a phone; hidden again in 30 s)" % pw) if time.time() < self.show_pw_until
+                else "you never type it here: the cockpit fills it in"),
             row("announce", "action", "Announce now", ask=True, hint="its address and beacon, at once"),
             row("restart", "action", "Restart the Stump", ask=True, hint="settings that wait for a restart"),
             row("", "info", "The rest: /admin on a phone",
@@ -906,8 +1076,10 @@ class Feed:
                 if room != st.room:
                     st.send("/join " + room)
                     self.want_room = room
-                for r in st.send(text):
+                for r in st.send(self.fill_password(text)):
                     log("CHAT", r)
+                    if PW_MARK in text:
+                        self.heard([r])            # an owner's command from the menu: its answer shown
                 st.next_poll = 0
             elif op == "BOARD_ADD" and len(parts) >= 2:
                 s, t = st.post("/post", json.dumps({"title": parts[1], "body": "|".join(parts[2:])}),
@@ -1132,7 +1304,7 @@ class Feed:
                                                    1 if room == view else 0))
             if room != view:
                 continue
-            for m in self.msgs.get(room, [])[-10:]:
+            for m in self.msgs.get(room, [])[-KEEP_MSGS:]:
                 sys_ = m.get("kind") == "system"
                 nick = "*" if sys_ else (m.get("nick") or "?")
                 if m.get("kind") == "dm":
@@ -1140,8 +1312,16 @@ class Feed:
                 body = m.get("body")
                 if m.get("kind") == "action":            # /me: "* rod waves", as FireFly shows it
                     nick, body = "*", "%s %s" % (m.get("nick") or "?", body or "")
-                out.append("MSG|%d|%d|%s|%s" % (i, 1 if sys_ else 0, clip(clean(screen_line(nick), 16), 17),
+                out.append("MSG|%d|%d|%d|%s|%s" % (i, 1 if sys_ else 0, int(m.get("id") or 0),
+                                                   clip(clean(screen_line(nick), 16), 17),
                                                 clip(clean(screen_line(body), 400), 1023)))     # the whole of it (400: the Stump's longest)
+        # The command menu: CMD|i|group|word|syntax|args|password|what it does
+        for i, c in enumerate(self.catalog[:MAX_CMDS]):
+            out.append("CMD|%d|%s|%s|%s|%d|%d|%s" % (
+                i, clip(clean(screen_line(c["group"]), 30), 31), clean(c["word"], 24),
+                clip(clean(screen_line(c["syntax"].replace("|", "\u00a6")), 90), 121),   # (| is the separator)
+                1 if c["args"] else 0, 1 if c["pw"] else 0,
+                clip(clean(screen_line(c["desc"]), 110), 161)))
         # The OWNER tab's form: FORM|id|title|back to; then its rows,
         # FIELD|i|key|kind|asks|max|label|value|choice|opt~opt~...|hint
         title, parent, rows = self.form_rows()
@@ -1152,7 +1332,7 @@ class Feed:
                 i, clean(r["key"], 40), r["kind"], int(r["ask"] or 0), int(r["max"] or 0),
                 clip(clean(screen_line(r["label"]), 44), 45), clip(clean(screen_line(r["value"]), 120), 121),
                 int(r["sel"]), opts, clip(clean(screen_line(r["hint"]), 64), 65)))
-        for p in self.board[:8]:
+        for p in self.board[:KEEP_ITEMS]:
             out.append("BOARD|%s|%s|%s|%s" % (clean(p.get("id") or "", 24), clip(clean(screen_line(p.get("sig")), 14), 15),
                                               clip(clean(screen_line(p.get("title")), 44), 45),
                                               clip(clean(screen_line(p.get("body")), 48), 49)))
@@ -1161,7 +1341,7 @@ class Feed:
         files = sorted(self.files, key=lambda f: -(f.get("mtime") or 0))
         for f in files:
             used += int(f.get("size") or 0)
-        for f in files[:8]:
+        for f in files[:KEEP_ITEMS]:
             shown = clip(clean(screen_line(f.get("name")), 35), 35).replace(",", "_")
             self.full_names[shown] = f.get("name")
             cat = {"document": "DOC", "image": "IMG", "music": "AUDIO", "video": "VIDEO"}.get(f.get("cat"), "FILE")
@@ -1232,6 +1412,12 @@ class Feed:
                 except Exception as e:
                     log("CHAT", "rooms: %s" % e)
                 self.next_rooms = time.time() + ROOMS_S
+            if now >= self.next_cmds and self.stump.port is not None:
+                try:
+                    self.refresh_commands()
+                except Exception as e:
+                    log("CMDS", "%s" % e)
+                self.next_cmds = time.time() + (CMDS_S if self.catalog else 15.0)
             self.write_live()
             if once:
                 return

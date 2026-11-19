@@ -84,8 +84,8 @@ class Live(unittest.TestCase):
         self.assertEqual(len(chain), 9)
         self.assertEqual(chain[1:4], ["1", "2", "1"])
         self.assertNotIn("secret", chain[4])                       # the secret itself is never shown
-        self.assertIn("MSG|2|1|*|\u2713 rod", lines)
-        self.assertIn("MSG|2|0|rod@LaBuche3|hi / there", lines)
+        self.assertIn("MSG|2|1|1|*|\u2713 rod", lines)                 # room, system, its id, nick, text
+        self.assertIn("MSG|2|0|2|rod@LaBuche3|hi / there", lines)
         self.assertEqual(get("FILE")[0], "FILE|a_ b.txt|2|DOC")
         self.assertEqual(feed.full_names["a_ b.txt"], "a, b.txt")  # deletes reach the real name
         chars = F.font_chars()
@@ -98,7 +98,7 @@ class Live(unittest.TestCase):
         body = ("Rendez-vous samedi \u00e0 10 h au jardin, apportez des gants. " * 7)[:400]
         feed.msgs["wifi-mesh"] = [{"id": 1, "kind": "msg", "nick": "zoe", "body": body}]
         line = [l for l in feed.live_lines() if l.startswith("MSG|")][0]
-        self.assertEqual(line.split("|", 4)[4], body.strip())
+        self.assertEqual(line.split("|", 5)[5], body.strip())
 
     def test_ssids_shown_map_back_to_the_real_name(self):
         feed = F.Feed()
@@ -158,11 +158,15 @@ class AdminForms(unittest.TestCase):
         self.assertEqual((lang["options"], lang["sel"], lang["label"]), (["Français", "English"], 1, "Language"))
         self.assertEqual(rows[0]["max"], 20)
 
-    def test_no_admin_password_no_owner_tools(self):
+    def test_no_admin_password_one_can_be_made_here(self):
         feed = F.Feed()
         feed.admin_pw = lambda: ""
         title, _, rows = feed.form_rows()
-        self.assertEqual([r["kind"] for r in rows], ["info"])
+        self.assertEqual([(r["kind"], r["key"]) for r in rows], [("info", ""), ("action", "makepw")])
+        made = []
+        feed.make_password = lambda: made.append(1) or "made"
+        feed.form_set("owner", "makepw", "")
+        self.assertEqual(made, [1])
 
 
 class Rooms(unittest.TestCase):
@@ -221,6 +225,82 @@ class Rooms(unittest.TestCase):
         self.assertTrue(any(l.startswith("FORM|rooms|Rooms|owner") for l in lines))
         for l in [l for l in lines if l.startswith("FIELD|")]:
             self.assertEqual(len(l.split("|")), 11, l)
+
+
+class Scrollback(unittest.TestCase):
+    def test_the_rooms_history_and_long_lists(self):
+        feed = F.Feed()
+        feed.msgs["wifi-mesh"] = [{"id": i, "kind": "msg", "nick": "zoe", "body": "line %d" % i} for i in range(1, 61)]
+        feed.board = [{"id": str(i), "title": "n%d" % i, "body": "", "sig": "x"} for i in range(30)]
+        feed.files = [{"name": "f%d" % i, "size": 10, "cat": "document", "mtime": i} for i in range(30)]
+        lines = feed.live_lines()
+        msgs = [l for l in lines if l.startswith("MSG|")]
+        self.assertEqual(len(msgs), 60)                                   # all the Stump keeps
+        self.assertEqual(msgs[0], "MSG|2|0|1|zoe|line 1")
+        self.assertEqual(len([l for l in lines if l.startswith("BOARD|")]), 20)
+        self.assertEqual(len([l for l in lines if l.startswith("FILE|")]), 20)
+
+
+class Commands(unittest.TestCase):
+    def feed(self, cfg="AUTH_ADMIN_PASSWORD = ''\nFSERVBOT_OP_PASSWORD = 'op-pw'\n"):
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "config.py"), "w") as f:
+            f.write(cfg)
+        self.addCleanup(setattr, F, "STUMP_DIR", F.STUMP_DIR)
+        F.STUMP_DIR = d
+        feed = F.Feed()
+        feed.stump.port = 80
+        return feed
+
+    def test_admin_password_as_the_stump_checks_it(self):
+        self.assertEqual(self.feed().admin_pw(), "op-pw")                 # blank /admin's: the fserv operator's
+        self.assertEqual(self.feed("AUTH_ADMIN_PASSWORD = 'adm'\nFSERVBOT_OP_PASSWORD = 'op'\n").admin_pw(), "adm")
+        self.assertEqual(self.feed("NODE_NAME = 'x'\n").admin_pw(), "")
+
+    def test_every_command_it_knows(self):
+        feed = self.feed()
+        answers = {
+            "/help": ["/nick <name>       change your name", "/msg <who> <text> a private message only they see",
+                      "/post <title> | <text> a new notice", "/clear            clear your own view",
+                      "!fserv !help     the file bot  (/fshelp to set it up)",
+                      "\u2713 joined \u00b7 \u2717 left", "/roll <dice>   roll dice"],
+            "/help mods": ["/op <admin password> <#room|-stump> <nick> : makes an op", "/unban <#room|-stump> <nick>"],
+            "/setchan": ["/setchan <password> #room -local|-wifi|-lora (or /setchan <password> : the rooms and their reach)"],
+            "/chanreq": ["/chanreq <password> : LoRa rooms other Stumps offer"],
+            "/fshelp": ["fserv bot -- channel triggers start with '!'", "/fsadd <pw> <trigger> :: <response>   add one",
+                        "/fslist                               show active triggers"],
+            "/fslist": ["active: !about, !files, !find"]}
+        feed.stump.send = lambda line: answers.get(line, [])
+        feed.stump.get = lambda path: {"plugins": [{"name": "simple", "version": "1.0", "commands": ["roll", "8ball"]},
+                                                   {"name": "stumpid", "version": "1.1", "commands": ["whoami"]}]}
+        feed.refresh_commands()
+        got = {c["syntax"]: c for c in feed.catalog}
+        self.assertIn("/msg <who> <text>", got)
+        self.assertEqual(got["/msg <who> <text>"]["desc"], "a private message only they see")
+        self.assertEqual(got["/post <title> | <text>"]["args"], True)
+        self.assertEqual(got["/clear"]["args"], False)
+        self.assertEqual(got["/op \u2022 <#room|-stump> <nick>"]["pw"], True)        # • where the password goes
+        self.assertIn("/setchan \u2022 #room -local|-wifi|-lora", got)
+        self.assertIn("/fsadd \u2022 <trigger> :: <response>", got)
+        self.assertEqual({c["word"] for c in feed.catalog if c["group"] == "File bot: its words"},
+                         {"!fserv", "!help", "!about", "!files", "!find"})
+        self.assertEqual(got["/roll <dice>"]["group"], "Pack: simple 1.0")           # a pack's, under its name
+        self.assertEqual(got["/8ball"]["group"], "Pack: simple 1.0")                 # no help: still listed
+        self.assertIn("/create \u2022 #room -local|-wifi|-lora", got)                 # from the command reference
+        lines = [l for l in feed.live_lines() if l.startswith("CMD|")]
+        self.assertTrue(all(len(l.split("|")) == 8 for l in lines), lines[:3])
+        self.assertTrue(any("<#room\u00a6-stump>" in l for l in lines))           # | shown as ¦
+
+    def test_the_password_is_filled_in_here(self):
+        feed = self.feed()
+        self.assertEqual(feed.fill_password("/setchan \u2022 #quiz -wifi"), "/setchan op-pw #quiz -wifi")
+        self.assertEqual(feed.fill_password("hello \u2022 there"), "hello \u2022 there")    # not a command
+        self.assertEqual(feed.fill_password("/msg zoe \u2022"), "/msg zoe \u2022")          # not its place
+
+    def test_no_password_one_can_be_made(self):
+        feed = self.feed("NODE_NAME = 'x'\n")
+        _, _, rows = feed.form_rows()
+        self.assertEqual([r["key"] for r in rows], ["", "makepw"])
 
 
 if __name__ == "__main__":
