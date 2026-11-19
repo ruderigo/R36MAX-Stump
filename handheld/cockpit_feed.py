@@ -50,9 +50,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.7.0-b.87"
+            return f.read().strip() or "2.7.1-b.87"
     except OSError:
-        return "2.7.0-b.87"
+        return "2.7.1-b.87"
 
 
 FEED_VERSION = _version()
@@ -661,7 +661,7 @@ class Feed:
             if " : " in line:                           # "/kick <#room> <nick> : out of the room"
                 syn, desc = line.split(" : ", 1)
             elif re.search(r"\s{2,}", line):            # "/rooms            list the rooms"
-                syn, desc = re.split(r"\s{2,}", line, 1)
+                syn, desc = re.split(r"\s{2,}", line, maxsplit=1)
             else:                                       # "/msg <who> <text> a private message"
                 toks, k = line.split(" "), 1
                 while k < len(toks) and re.match(r"^([<\[#|-].*|.*[>\]]|::)$", toks[k]):
@@ -717,33 +717,56 @@ class Feed:
             self.catalog = cmds
 
     def make_password(self):
-        """A Stump with no admin password at all (neither AUTH_ADMIN_PASSWORD
-        nor the fserv operator's): one made here, written with the Stump's own
-        settings.write_config (admin_password.py, config.py.bak kept), then the
-        Stump restarted to take it. Only the owner's handheld does this: it's
-        their Stump's file."""
+        """A Stump with no admin password at all: one made here (12 letters
+        and digits), written by set_password."""
         import secrets
         words = "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(12))
-        pw = "-".join(words[i:i + 4] for i in range(0, 12, 4))
+        self.set_password("-".join(words[i:i + 4] for i in range(0, 12, 4)), made=True)
+
+    @staticmethod
+    def password_problem(pw):
+        """Why a typed admin password can't be used, or "". The chat's owner
+        commands take it as one word (/setchan <password> #room...)."""
+        if len(pw) < 4:
+            return "At least 4 characters"
+        if any(c.isspace() for c in pw):
+            return "No spaces: the chat's owner commands take it as one word"
+        if PW_MARK in pw or "|" in pw:
+            return "No \u2022 and no vertical bar in it"
+        return ""
+
+    def set_password(self, pw, made=False):
+        """The owner's handheld sets its Stump's admin password (typed, or
+        made here): AUTH_ADMIN_PASSWORD, written with the Stump's own
+        settings.write_config (admin_password.py, config.py.bak kept), then
+        the Stump restarted to take it. Never logged."""
+        why = self.password_problem(pw)
+        if why:
+            self.busy(why, 4)
+            return False
         tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_password.py")
         py = os.path.join(STUMP_DIR, "venv", "bin", "python")
         if not os.path.isfile(tool):
             self.busy("admin_password.py isn't next to the feed: run install.sh again", 5)
-            return
+            return False
+        had = bool(self.admin_pw())
         try:
             p = subprocess.run([py if os.path.isfile(py) else sys.executable, "-I", tool, "--stump", STUMP_DIR, "set"],
                                input=pw + "\n", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                universal_newlines=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired) as e:
             self.busy("Couldn't set it: %s" % e, 5)
-            return
+            return False
         if self.admin_pw() != pw:
             self.busy("Couldn't set it: %s" % (p.stdout.strip().splitlines() or ["?"])[-1], 5)
-            return
-        log("OWNER", "an admin password was made and set (Show the admin password to see it)")
-        self.show_pw_until = time.time() + 30
-        self.busy("Admin password set: the Stump restarts to take it", 6)
+            return False
+        log("OWNER", "the admin password was %s here%s" % ("changed" if had else "set",
+                                                          " (Show the admin password to see it)" if made else ""))
+        if made:
+            self.show_pw_until = time.time() + 30
+        self.busy("Admin password %s: the Stump restarts to take it" % ("changed" if had else "set"), 6)
         self.restart_stump("its new admin password")
+        return True
 
     def fill_password(self, text):
         """A command from the menu with the admin password's place (•) filled,
@@ -788,6 +811,9 @@ class Feed:
         st, pw = self.stump, self.admin_pw()
         if fid == "owner" and key == "makepw" and not pw:
             self.make_password()
+            return
+        if fid == "owner" and key == "setpw":         # typed on the handheld: set, or changed
+            self.set_password(value)
             return
         if not pw:
             self.busy("No admin password on this Stump", 3)
@@ -858,7 +884,9 @@ class Feed:
             return "Owner tools", "", [
                 row("", "info", "No admin password on this Stump yet",
                     hint="/admin, its rooms and its people need one"),
-                row("makepw", "action", "Make one now", ask=1,
+                row("setpw", "text", "Set the admin password", mx=64,
+                    hint="type your own: 4 characters or more, no spaces"),
+                row("makepw", "action", "Make one for me", ask=1,
                     hint="the cockpit fills it in for you; shown here when you need it on a phone")]
         if self.form == "setup":
             rows, seen = [], set()
@@ -927,6 +955,8 @@ class Feed:
             row("showpw", "action", "Show the admin password", ask=1,
                 hint=("%s  (for /admin on a phone; hidden again in 30 s)" % pw) if time.time() < self.show_pw_until
                 else "you never type it here: the cockpit fills it in"),
+            row("setpw", "text", "Change the admin password", mx=64,
+                hint="type the new one: 4 characters or more, no spaces"),
             row("announce", "action", "Announce now", ask=True, hint="its address and beacon, at once"),
             row("restart", "action", "Restart the Stump", ask=True, hint="settings that wait for a restart"),
             row("", "info", "The rest: /admin on a phone",
@@ -1170,11 +1200,11 @@ class Feed:
     def _admin_delete(self, path, field, items, what):
         """The Stump's own /admin delete, with its admin password (this is the
         owner's handheld; the password stays on localhost)."""
-        pw = read_config().get("AUTH_ADMIN_PASSWORD") or ""
+        pw = self.admin_pw()                       # /admin's, or the fserv operator's, as the Stump checks
         if not items:
             return
         if not pw:
-            self.busy("Set an admin password (/admin) to delete from here", 4)
+            self.busy("No admin password yet: OWNER \u2192 Set the admin password", 4)
             return
         body = "&".join("%s=%s" % (field, urllib.parse.quote(i, safe="")) for i in items)
         body += "&admin_pass=" + urllib.parse.quote(pw, safe="")

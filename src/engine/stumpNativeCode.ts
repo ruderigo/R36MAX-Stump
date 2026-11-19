@@ -9,7 +9,7 @@ import { CodeFileArtifact } from './nativeEngineCode';
 
 export const STUMP_R36MAX_C_SOURCE = `/*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.7.0-b.87.
+ * (RK3326 / dArkOS), v2.7.1-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -715,7 +715,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.7.0-b.87"
+#define STUMP_ENGINE_VERSION "v2.7.1-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 60      /* a room's scrollback: all the Stump keeps (MAX_MESSAGES_PER_ROOM) */
 #define MAX_ITEMS 20          /* notices and files listed (scrolled) */
@@ -2557,7 +2557,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.0-b.87");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.1-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -3997,9 +3997,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.7.0-b.87"
+            return f.read().strip() or "2.7.1-b.87"
     except OSError:
-        return "2.7.0-b.87"
+        return "2.7.1-b.87"
 
 
 FEED_VERSION = _version()
@@ -4608,7 +4608,7 @@ class Feed:
             if " : " in line:                           # "/kick <#room> <nick> : out of the room"
                 syn, desc = line.split(" : ", 1)
             elif re.search(r"\\s{2,}", line):            # "/rooms            list the rooms"
-                syn, desc = re.split(r"\\s{2,}", line, 1)
+                syn, desc = re.split(r"\\s{2,}", line, maxsplit=1)
             else:                                       # "/msg <who> <text> a private message"
                 toks, k = line.split(" "), 1
                 while k < len(toks) and re.match(r"^([<\\[#|-].*|.*[>\\]]|::)$", toks[k]):
@@ -4664,33 +4664,56 @@ class Feed:
             self.catalog = cmds
 
     def make_password(self):
-        """A Stump with no admin password at all (neither AUTH_ADMIN_PASSWORD
-        nor the fserv operator's): one made here, written with the Stump's own
-        settings.write_config (admin_password.py, config.py.bak kept), then the
-        Stump restarted to take it. Only the owner's handheld does this: it's
-        their Stump's file."""
+        """A Stump with no admin password at all: one made here (12 letters
+        and digits), written by set_password."""
         import secrets
         words = "".join(secrets.choice("abcdefghjkmnpqrstuvwxyz23456789") for _ in range(12))
-        pw = "-".join(words[i:i + 4] for i in range(0, 12, 4))
+        self.set_password("-".join(words[i:i + 4] for i in range(0, 12, 4)), made=True)
+
+    @staticmethod
+    def password_problem(pw):
+        """Why a typed admin password can't be used, or "". The chat's owner
+        commands take it as one word (/setchan <password> #room...)."""
+        if len(pw) < 4:
+            return "At least 4 characters"
+        if any(c.isspace() for c in pw):
+            return "No spaces: the chat's owner commands take it as one word"
+        if PW_MARK in pw or "|" in pw:
+            return "No \\u2022 and no vertical bar in it"
+        return ""
+
+    def set_password(self, pw, made=False):
+        """The owner's handheld sets its Stump's admin password (typed, or
+        made here): AUTH_ADMIN_PASSWORD, written with the Stump's own
+        settings.write_config (admin_password.py, config.py.bak kept), then
+        the Stump restarted to take it. Never logged."""
+        why = self.password_problem(pw)
+        if why:
+            self.busy(why, 4)
+            return False
         tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_password.py")
         py = os.path.join(STUMP_DIR, "venv", "bin", "python")
         if not os.path.isfile(tool):
             self.busy("admin_password.py isn't next to the feed: run install.sh again", 5)
-            return
+            return False
+        had = bool(self.admin_pw())
         try:
             p = subprocess.run([py if os.path.isfile(py) else sys.executable, "-I", tool, "--stump", STUMP_DIR, "set"],
                                input=pw + "\\n", stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                universal_newlines=True, timeout=30)
         except (OSError, subprocess.TimeoutExpired) as e:
             self.busy("Couldn't set it: %s" % e, 5)
-            return
+            return False
         if self.admin_pw() != pw:
             self.busy("Couldn't set it: %s" % (p.stdout.strip().splitlines() or ["?"])[-1], 5)
-            return
-        log("OWNER", "an admin password was made and set (Show the admin password to see it)")
-        self.show_pw_until = time.time() + 30
-        self.busy("Admin password set: the Stump restarts to take it", 6)
+            return False
+        log("OWNER", "the admin password was %s here%s" % ("changed" if had else "set",
+                                                          " (Show the admin password to see it)" if made else ""))
+        if made:
+            self.show_pw_until = time.time() + 30
+        self.busy("Admin password %s: the Stump restarts to take it" % ("changed" if had else "set"), 6)
         self.restart_stump("its new admin password")
+        return True
 
     def fill_password(self, text):
         """A command from the menu with the admin password's place (•) filled,
@@ -4735,6 +4758,9 @@ class Feed:
         st, pw = self.stump, self.admin_pw()
         if fid == "owner" and key == "makepw" and not pw:
             self.make_password()
+            return
+        if fid == "owner" and key == "setpw":         # typed on the handheld: set, or changed
+            self.set_password(value)
             return
         if not pw:
             self.busy("No admin password on this Stump", 3)
@@ -4805,7 +4831,9 @@ class Feed:
             return "Owner tools", "", [
                 row("", "info", "No admin password on this Stump yet",
                     hint="/admin, its rooms and its people need one"),
-                row("makepw", "action", "Make one now", ask=1,
+                row("setpw", "text", "Set the admin password", mx=64,
+                    hint="type your own: 4 characters or more, no spaces"),
+                row("makepw", "action", "Make one for me", ask=1,
                     hint="the cockpit fills it in for you; shown here when you need it on a phone")]
         if self.form == "setup":
             rows, seen = [], set()
@@ -4874,6 +4902,8 @@ class Feed:
             row("showpw", "action", "Show the admin password", ask=1,
                 hint=("%s  (for /admin on a phone; hidden again in 30 s)" % pw) if time.time() < self.show_pw_until
                 else "you never type it here: the cockpit fills it in"),
+            row("setpw", "text", "Change the admin password", mx=64,
+                hint="type the new one: 4 characters or more, no spaces"),
             row("announce", "action", "Announce now", ask=True, hint="its address and beacon, at once"),
             row("restart", "action", "Restart the Stump", ask=True, hint="settings that wait for a restart"),
             row("", "info", "The rest: /admin on a phone",
@@ -5117,11 +5147,11 @@ class Feed:
     def _admin_delete(self, path, field, items, what):
         """The Stump's own /admin delete, with its admin password (this is the
         owner's handheld; the password stays on localhost)."""
-        pw = read_config().get("AUTH_ADMIN_PASSWORD") or ""
+        pw = self.admin_pw()                       # /admin's, or the fserv operator's, as the Stump checks
         if not items:
             return
         if not pw:
-            self.busy("Set an admin password (/admin) to delete from here", 4)
+            self.busy("No admin password yet: OWNER \\u2192 Set the admin password", 4)
             return
         body = "&".join("%s=%s" % (field, urllib.parse.quote(i, safe="")) for i in items)
         body += "&admin_pass=" + urllib.parse.quote(pw, safe="")
@@ -5770,7 +5800,7 @@ class Limbs:
 
 export const STUMP_R36MAX_PORTS_SCRIPT = `#!/bin/bash
 # =============================================================================
-# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.7.0-b.87)
+# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.7.1-b.87)
 # EmulationStation Ports launcher: /roms/ports/LaBuche_Stump.sh
 #
 # The Stump itself is a stock Stump on a computer (SandBox_Stump_On,
@@ -5801,7 +5831,7 @@ APP_DIR="/roms/ports/stump_r36max"               # on the TF card: drop/, tf_bac
 STUMP_DIR="$USER_HOME/Stump"
 LOG="$APP_DIR/cockpit.log"
 mkdir -p "$APP_DIR/drop" "$APP_DIR/tf_backup" 2>/dev/null
-echo "=== R36MAX Stump cockpit v2.7.0-b.87, $(date) ===" > "$LOG"
+echo "=== R36MAX Stump cockpit v2.7.1-b.87, $(date) ===" > "$LOG"
 # For diagnosing a black screen: who we are, and whether we can open the display.
 { echo "user: $(id)"; ls -l /dev/dri/ /dev/fb0 /dev/tty1 2>&1; } >> "$LOG"
 
@@ -5876,7 +5906,7 @@ echo "=== cockpit closed $(date); the Stump stopped ===" >> "$LOG"
 
 export const STUMP_R36MAX_INSTALL_SH = `#!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.7.0-b.87)
+# install.sh — makes the R36MAX a Stump like any other (v2.7.1-b.87)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -6625,7 +6655,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'stump_r36max_c',
     filename: 'stump_r36max_engine.c',
-    title: 'Cockpit engine v2.7.0-b.87 (720x720, gamepad, QR)',
+    title: 'Cockpit engine v2.7.1-b.87 (720x720, gamepad, QR)',
     language: 'c',
     summary:
       "The handheld's screen and gamepad: five panels (chats, board, files, network, setup). Reads /dev/shm/stump_live.txt and sends command lines to cockpit_feed.py; never touches the Stump's files or the network. The v1.8.8 KMSDRM display fixes are kept.",
@@ -6652,7 +6682,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'labuche_stump_sh',
     filename: 'LaBuche_Stump.sh',
-    title: 'EmulationStation Ports launcher v2.7.0-b.87 (/roms/ports/LaBuche_Stump.sh)',
+    title: 'EmulationStation Ports launcher v2.7.1-b.87 (/roms/ports/LaBuche_Stump.sh)',
     language: 'bash',
     summary:
       'Opens the cockpit on the Stump that runs in the background from boot; SELECT+START returns to EmulationStation and the Stump keeps running. No firewall flush, no NetworkManager masking.',

@@ -162,7 +162,7 @@ class AdminForms(unittest.TestCase):
         feed = F.Feed()
         feed.admin_pw = lambda: ""
         title, _, rows = feed.form_rows()
-        self.assertEqual([(r["kind"], r["key"]) for r in rows], [("info", ""), ("action", "makepw")])
+        self.assertEqual([(r["kind"], r["key"]) for r in rows], [("info", ""), ("text", "setpw"), ("action", "makepw")])
         made = []
         feed.make_password = lambda: made.append(1) or "made"
         feed.form_set("owner", "makepw", "")
@@ -297,10 +297,56 @@ class Commands(unittest.TestCase):
         self.assertEqual(feed.fill_password("hello \u2022 there"), "hello \u2022 there")    # not a command
         self.assertEqual(feed.fill_password("/msg zoe \u2022"), "/msg zoe \u2022")          # not its place
 
-    def test_no_password_one_can_be_made(self):
+    def test_no_password_one_can_be_typed_or_made(self):
         feed = self.feed("NODE_NAME = 'x'\n")
         _, _, rows = feed.form_rows()
-        self.assertEqual([r["key"] for r in rows], ["", "makepw"])
+        self.assertEqual([r["key"] for r in rows], ["", "setpw", "makepw"])
+        self.assertEqual(rows[1]["value"], "")                                    # never shown on the row
+
+    def stump_with_settings(self, cfg):
+        """A scratch Stump folder: its config.py and a settings.write_config as the Stump's."""
+        feed = self.feed(cfg)
+        with open(os.path.join(F.STUMP_DIR, "settings.py"), "w") as f:
+            f.write("def write_config(values, path):\n"
+                    "    lines = [l for l in open(path).read().splitlines() if l.split(' =')[0] not in values]\n"
+                    "    lines += ['%s = %r' % kv for kv in values.items()]\n"
+                    "    open(path, 'w').write('\\n'.join(lines) + '\\n')\n"
+                    "    return True\n")
+        feed.restarts = []
+        feed.restart_stump = feed.restarts.append
+        return feed
+
+    def test_typed_on_the_handheld_set_then_changed(self):
+        feed = self.stump_with_settings("NODE_NAME = 'x'\n")
+        feed.form_set("owner", "setpw", "jardin-2026")
+        self.assertEqual(feed.admin_pw(), "jardin-2026")
+        self.assertTrue(os.path.isfile(os.path.join(F.STUMP_DIR, "config.py.bak")))
+        self.assertEqual(len(feed.restarts), 1)                                   # the Stump restarts to take it
+        _, _, rows = feed.form_rows()
+        self.assertIn("setpw", [r["key"] for r in rows])                          # now: change it
+        self.assertEqual([r["label"] for r in rows if r["key"] == "setpw"], ["Change the admin password"])
+        feed.form_set("owner", "setpw", "potager|99")                             # (| refused)
+        self.assertEqual(feed.admin_pw(), "jardin-2026")
+        feed.form_set("owner", "setpw", "potager99")
+        self.assertEqual(feed.admin_pw(), "potager99")
+        self.assertEqual(len(feed.restarts), 2)
+
+    def test_deletes_use_the_password_the_stump_takes(self):
+        feed = self.feed()                                # /admin's blank, the fserv operator's set
+        posted = []
+        feed.stump.post = lambda path, body, *a, **k: posted.append((path, body)) or (200, "")
+        feed._admin_delete("/admin/delete_post", "ts", ["123"], "NOTICE")
+        self.assertEqual(posted, [("/admin/delete_post", "ts=123&admin_pass=op-pw")])
+
+    def test_a_typed_password_it_wont_take(self):
+        feed = self.stump_with_settings("AUTH_ADMIN_PASSWORD = 'keep-me'\n")
+        for bad in ("abc", "two words", "pw\u2022x", ""):
+            with self.subTest(bad):
+                self.assertTrue(feed.password_problem(bad))
+                feed.form_set("owner", "setpw", bad)
+                self.assertEqual(feed.admin_pw(), "keep-me")
+        self.assertEqual(feed.restarts, [])
+        self.assertEqual(feed.password_problem("caf\u00e9-1"), "")                  # accents are fine
 
 
 if __name__ == "__main__":

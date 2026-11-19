@@ -115,8 +115,9 @@ that's been saved.
 - **The admin password** is read from `~/Stump/config.py`
   (`AUTH_ADMIN_PASSWORD`, or `FSERVBOT_OP_PASSWORD` when that's blank), so
   a Stump installed without the provisioner has its owner tools too. None
-  yet: OWNER → *Make one now*. To use it from a phone: OWNER → *Show the
-  admin password* (30 seconds).
+  yet: OWNER → *Set the admin password* (type your own) or *Make one for
+  me*; OWNER → *Change the admin password* types a new one (v2.7.1). To use
+  it from a phone: OWNER → *Show the admin password* (30 seconds).
 - **OWNER tab** (v2.6.0): the Stump's owner on their own handheld, with the
   admin password from `~/Stump/config.py` (it never leaves the handheld):
   - *Stump settings*: the same form as `/admin`'s, read from the Stump's own
