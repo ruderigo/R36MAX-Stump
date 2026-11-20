@@ -9,7 +9,7 @@ import { CodeFileArtifact } from './nativeEngineCode';
 
 export const STUMP_R36MAX_C_SOURCE = `/*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.7.2-b.87.
+ * (RK3326 / dArkOS), v2.7.3-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -715,7 +715,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.7.2-b.87"
+#define STUMP_ENGINE_VERSION "v2.7.3-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 60      /* a room's scrollback: all the Stump keeps (MAX_MESSAGES_PER_ROOM) */
 #define MAX_ITEMS 20          /* notices and files listed (scrolled) */
@@ -2026,22 +2026,80 @@ static void broadcast_udp_beacon(const char *type, const char *msg) {
 static void poll_udp_mesh(void) {
 }
 
+/* The chimes follow a USB sound device (USB-C headphones, a DAC) when one is
+ * plugged in, and the built-in card otherwise, as Ember does (its PR #4): on
+ * an R36MAX whose speaker is silent they were playing to nobody. Chosen again
+ * for every chime, so plugging or unplugging needs no watcher; STUMP_OUT (an
+ * ALSA device, e.g. plughw:0,0) fixes the output. */
+#define OUT_BUILTIN "plughw:0,0"
+
+/* First USB-Audio card with a playback PCM (Ember's find_usb_pcm). A USB MIDI
+ * keyboard is a USB-Audio card too but has no PCM, so it's skipped. */
+static int find_usb_playback(char *pcmname, size_t pn) {
+    int card = -1;
+    while (snd_card_next(&card) == 0 && card >= 0) {
+        char hw[16]; snprintf(hw, sizeof hw, "hw:%d", card);
+        snd_ctl_t *ctl;
+        if (snd_ctl_open(&ctl, hw, 0) < 0) continue;
+        snd_ctl_card_info_t *info; snd_ctl_card_info_alloca(&info);
+        if (snd_ctl_card_info(ctl, info) == 0 && strcmp(snd_ctl_card_info_get_driver(info), "USB-Audio") == 0) {
+            int dev = -1;
+            while (snd_ctl_pcm_next_device(ctl, &dev) == 0 && dev >= 0) {
+                snd_pcm_info_t *pi; snd_pcm_info_alloca(&pi);
+                snd_pcm_info_set_device(pi, dev);
+                snd_pcm_info_set_subdevice(pi, 0);
+                snd_pcm_info_set_stream(pi, SND_PCM_STREAM_PLAYBACK);
+                if (snd_ctl_pcm_info(ctl, pi) >= 0) {
+                    snprintf(pcmname, pn, "plughw:%d,%d", card, dev);
+                    snd_ctl_close(ctl);
+                    return 1;
+                }
+            }
+        }
+        snd_ctl_close(ctl);
+    }
+    return 0;
+}
+
+static void pick_chime_output(char *dev, size_t dn) {
+    const char *forced = getenv("STUMP_OUT");
+    if (forced && forced[0]) snprintf(dev, dn, "%s", forced);
+    else if (!find_usb_playback(dev, dn)) snprintf(dev, dn, "%s", OUT_BUILTIN);
+}
+
+static snd_pcm_t *open_chime_output(const char *dev) {
+    snd_pcm_t *pcm = NULL;
+    if (snd_pcm_open(&pcm, dev, SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) < 0) return NULL;
+    snd_pcm_nonblock(pcm, 0);
+    if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SR, 1, 80000) < 0 &&
+        snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SR, 1, 120000) < 0) {
+        snd_pcm_close(pcm);                       /* (a USB device that refuses the short buffer gets a longer one) */
+        return NULL;
+    }
+    return pcm;
+}
+
 static void *alsa_chime_thread(void *arg) {
     (void)arg;
     snd_pcm_t *pcm = NULL;
-    if (snd_pcm_open(&pcm, "plughw:0,0", SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK) == 0) {
-        snd_pcm_nonblock(pcm, 0);
-        if (snd_pcm_set_params(pcm, SND_PCM_FORMAT_S16_LE, SND_PCM_ACCESS_RW_INTERLEAVED, 2, SR, 1, 80000) < 0) {
-            snd_pcm_close(pcm);
-            pcm = NULL;
-        }
-    }
+    char cur[64] = "";
     int16_t buf[ALSA_PERIOD * 2];
     uint32_t phase = 0;
     while (g_st.running) {
         int freq = g_st.chime_freq;
         int ms = g_st.chime_ms;
         if (freq > 0 && ms > 0) {
+            char want[64];
+            pick_chime_output(want, sizeof want);
+            if (!pcm || strcmp(want, cur) != 0) {         /* headphones plugged in, or gone: move */
+                if (pcm) snd_pcm_close(pcm);
+                pcm = open_chime_output(want);
+                if (!pcm && strcmp(want, OUT_BUILTIN) != 0) {
+                    snprintf(want, sizeof want, "%s", OUT_BUILTIN);
+                    pcm = open_chime_output(want);
+                }
+                snprintf(cur, sizeof cur, "%s", pcm ? want : "");
+            }
             int periods = (ms * SR) / (1000 * ALSA_PERIOD) + 1;
             for (int p = 0; p < periods && g_st.running; p++) {
                 uint32_t ps = SR / (uint32_t)freq;
@@ -2054,7 +2112,11 @@ static void *alsa_chime_thread(void *arg) {
                 }
                 if (pcm) {
                     snd_pcm_sframes_t f = snd_pcm_writei(pcm, buf, ALSA_PERIOD);
-                    if (f < 0) snd_pcm_recover(pcm, (int)f, 1);
+                    if (f < 0 && snd_pcm_recover(pcm, (int)f, 1) < 0) {
+                        snd_pcm_close(pcm);               /* unplugged mid-chime: the next one reopens */
+                        pcm = NULL;
+                        cur[0] = 0;
+                    }
                 } else {
                     usleep(11000);
                 }
@@ -2557,7 +2619,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.2-b.87");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.3-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -3997,9 +4059,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.7.2-b.87"
+            return f.read().strip() or "2.7.3-b.87"
     except OSError:
-        return "2.7.2-b.87"
+        return "2.7.3-b.87"
 
 
 FEED_VERSION = _version()
@@ -5891,7 +5953,7 @@ class Limbs:
 
 export const STUMP_R36MAX_PORTS_SCRIPT = `#!/bin/bash
 # =============================================================================
-# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.7.2-b.87)
+# LaBuche_Stump.sh — the R36MAX Stump cockpit (v2.7.3-b.87)
 # EmulationStation Ports launcher: /roms/ports/LaBuche_Stump.sh
 #
 # The Stump itself is a stock Stump on a computer (SandBox_Stump_On,
@@ -5922,7 +5984,7 @@ APP_DIR="/roms/ports/stump_r36max"               # on the TF card: drop/, tf_bac
 STUMP_DIR="$USER_HOME/Stump"
 LOG="$APP_DIR/cockpit.log"
 mkdir -p "$APP_DIR/drop" "$APP_DIR/tf_backup" 2>/dev/null
-echo "=== R36MAX Stump cockpit v2.7.2-b.87, $(date) ===" > "$LOG"
+echo "=== R36MAX Stump cockpit v2.7.3-b.87, $(date) ===" > "$LOG"
 # For diagnosing a black screen: who we are, and whether we can open the display.
 { echo "user: $(id)"; ls -l /dev/dri/ /dev/fb0 /dev/tty1 2>&1; } >> "$LOG"
 
@@ -5997,7 +6059,7 @@ echo "=== cockpit closed $(date); the Stump stopped ===" >> "$LOG"
 
 export const STUMP_R36MAX_INSTALL_SH = `#!/bin/bash
 # =============================================================================
-# install.sh — makes the R36MAX a Stump like any other (v2.7.2-b.87)
+# install.sh — makes the R36MAX a Stump like any other (v2.7.3-b.87)
 #
 # Run ON THE HANDHELD, as ark, with internet (once, for packages):
 #   git clone https://github.com/ruderigo/R36MAX-Stump ~/R36MAX-Stump
@@ -6746,7 +6808,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'stump_r36max_c',
     filename: 'stump_r36max_engine.c',
-    title: 'Cockpit engine v2.7.2-b.87 (720x720, gamepad, QR)',
+    title: 'Cockpit engine v2.7.3-b.87 (720x720, gamepad, QR)',
     language: 'c',
     summary:
       "The handheld's screen and gamepad: five panels (chats, board, files, network, setup). Reads /dev/shm/stump_live.txt and sends command lines to cockpit_feed.py; never touches the Stump's files or the network. The v1.8.8 KMSDRM display fixes are kept.",
@@ -6773,7 +6835,7 @@ export const STUMP_CODE_ARTIFACTS: CodeFileArtifact[] = [
   {
     id: 'labuche_stump_sh',
     filename: 'LaBuche_Stump.sh',
-    title: 'EmulationStation Ports launcher v2.7.2-b.87 (/roms/ports/LaBuche_Stump.sh)',
+    title: 'EmulationStation Ports launcher v2.7.3-b.87 (/roms/ports/LaBuche_Stump.sh)',
     language: 'bash',
     summary:
       'Opens the cockpit on the Stump that runs in the background from boot; SELECT+START returns to EmulationStation and the Stump keeps running. No firewall flush, no NetworkManager masking.',

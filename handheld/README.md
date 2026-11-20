@@ -113,6 +113,9 @@ that's been saved.
   in groups, its packs' included. ↑/↓ moves, ←/→ jumps a group, A uses it
   (sent at once, or the keyboard opens with it half-written). `•` stands for
   the admin password: the cockpit fills it in before sending.
+- **Sound** (v2.7.3): the chimes play on USB-C headphones (or any USB sound
+  device) when one is plugged in, otherwise the built-in speaker, as Ember
+  does. `STUMP_OUT=plughw:0,0` in `LaBuche_Stump.sh`'s environment fixes it.
 - **Hybrid or closed Stumps** (v2.7.2): the cockpit verifies itself with
   `/auth`, as FireFly does, with an identity of its own
   (`~/stump_r36max/cockpit_identity`, made the first time; keep it, it's who

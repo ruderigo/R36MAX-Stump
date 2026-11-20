@@ -254,6 +254,21 @@ int main(void) {
     CHECK("with the menu open it moves the menu", g_st.menu_cursor == 1);
     g_st.menu_open = false;
 
+    /* 17. The chimes' output, as Ember's: STUMP_OUT, else a USB sound device,
+     *     else the built-in card (no sound card here: the built-in one). */
+    {
+        char dev[64];
+        unsetenv("STUMP_OUT");
+        pick_chime_output(dev, sizeof dev);
+        CHECK("no USB sound device: the chimes play on the built-in card", strcmp(dev, "plughw:0,0") == 0);
+        setenv("STUMP_OUT", "plughw:3,0", 1);
+        pick_chime_output(dev, sizeof dev);
+        CHECK("STUMP_OUT fixes the chimes' output", strcmp(dev, "plughw:3,0") == 0);
+        unsetenv("STUMP_OUT");
+        char usb[64] = "";
+        CHECK("no USB card found where there is none", find_usb_playback(usb, sizeof usb) == 0 && usb[0] == 0);
+    }
+
     unlink(CMD_QUEUE_FILE);
     unlink(LIVE_STATE_FILE);
 
