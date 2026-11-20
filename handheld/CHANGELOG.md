@@ -7,6 +7,20 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.7.3-b.87
+
+- **The chimes play on USB-C headphones**, as Ember does (its PR #4). The
+  cockpit opened the built-in card (`plughw:0,0`) once at start, so on an
+  R36MAX whose speaker is silent its chimes played to nobody. Now each
+  chime goes to the first USB sound device with a playback output (a USB
+  MIDI keyboard has none and is skipped), otherwise the built-in card;
+  it's chosen again for every chime, so plugging or unplugging needs
+  nothing else, and a device unplugged mid-chime is reopened for the next.
+  A USB device that refuses the short buffer gets a longer one.
+  `STUMP_OUT` (any ALSA device, e.g. `plughw:0,0`) fixes the output.
+- Tests: the choice (built-in with no USB device, `STUMP_OUT`) in the C test.
+  Finding a real USB device needs a handheld.
+
 ## v2.7.2-b.87
 
 - **The cockpit verifies itself, as FireFly does.** On a Stump set to
