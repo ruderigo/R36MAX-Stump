@@ -9,3 +9,4 @@ coverage/
 __pycache__/
 *.pyc
 handheld/cockpit_identity
+handheld/cockpit_settings.json

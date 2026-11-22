@@ -94,7 +94,8 @@ def main():
         # ── the feed, as the launcher starts it ─────────────────────────
         env = dict(os.environ, STUMP_DIR=stump_dir, STUMP_R36MAX_DIR=app_dir, STUMP_LIVE_FILE=live,
                    STUMP_CMD_FILE=cmdf, STUMP_IPC_PORT=str(ipc), STUMP_HTTP_PORT=str(http),
-                   STUMP_COCKPIT_NICK="r36max", STUMP_COCKPIT_IDENTITY=os.path.join(work, "cockpit_identity"))
+                   STUMP_COCKPIT_NICK="r36max", STUMP_COCKPIT_IDENTITY=os.path.join(work, "cockpit_identity"),
+                   STUMP_COCKPIT_SETTINGS=os.path.join(work, "cockpit_settings.json"))
         procs.append(subprocess.Popen([sys.executable, "-I", os.path.join(HANDHELD, "cockpit_feed.py")], env=env,
                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True))
         lines = lambda: open(live, encoding="utf-8").read().splitlines()
@@ -239,6 +240,17 @@ def main():
         check("... while a visitor who isn't verified can't", "/auth" in " ".join(r.get("replies") or []), r)
         send("RRC|wifi-mesh|/admin \u2022 mode open")
         check("open again", wait(lambda: any("mode set to open" in r for r in replies()), 20), replies()[-5:])
+
+        # ── the message chime: a DM to the cockpit, not a room's line or its own ──
+        sound = lambda: int(next((l.split("|")[2] for l in lines() if l.startswith("SOUND|")), "-1"))
+        before = sound()
+        send("RRC|wifi-mesh|chime test from the cockpit itself")
+        browser.open(urllib.request.Request(base + "/rrc/send", data="a room line, not a DM".encode(), method="POST")).read()
+        time.sleep(6)
+        check("its own line and a room's line: no chime (Message chime: DMs)", sound() == before, (before, sound()))
+        browser.open(urllib.request.Request(base + "/rrc/send", data="/msg r36max un petit mot".encode(), method="POST")).read()
+        check("a DM to the cockpit: the message chime (SOUND count up)", wait(lambda: sound() == before + 1, 20),
+              (before, sound()))
 
         # ── the rest ─────────────────────────────────────────────────────
         send("DEBUG_EXPORT_TF")
