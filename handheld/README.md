@@ -205,6 +205,9 @@ files):
 
 **Turning them off.** On the OWNER tab (no admin password needed):
 
+![The OWNER tab: this handheld's sound, Button chimes and Message chime](../docs/owner-sound.png)
+
+
 - *Button chimes*: on (default) or off. Every sound in the table but the
   message chime.
 - *Message chime*: DMs (default), everything, or off. Picking DMs or
