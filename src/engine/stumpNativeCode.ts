@@ -2804,6 +2804,7 @@ int main(int argc, char **argv) {
             g_st.menu_cursor = atoi(getenv("STUMP_COCKPIT_MENU"));
         }
         if (getenv("STUMP_COCKPIT_SCROLL") && frames == 0) g_st.chat_scroll = atoi(getenv("STUMP_COCKPIT_SCROLL"));
+        if (getenv("STUMP_COCKPIT_FORM_ROW") && frames == 0) g_st.form_cursor = atoi(getenv("STUMP_COCKPIT_FORM_ROW"));  /* screenshots */
         if (getenv("STUMP_COCKPIT_OSK") && frames == 0) {     /* screenshots in tests: open it at start */
             g_st.osk_open = true; cmp_reset(); g_cmp.was_open = true;
             g_cmp.page = atoi(getenv("STUMP_COCKPIT_OSK")) % 3;
