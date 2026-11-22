@@ -113,9 +113,9 @@ that's been saved.
   in groups, its packs' included. ↑/↓ moves, ←/→ jumps a group, A uses it
   (sent at once, or the keyboard opens with it half-written). `•` stands for
   the admin password: the cockpit fills it in before sending.
-- **Sound** (v2.7.3): the chimes play on USB-C headphones (or any USB sound
-  device) when one is plugged in, otherwise the built-in speaker, as Ember
-  does. `STUMP_OUT=plughw:0,0` in `LaBuche_Stump.sh`'s environment fixes it.
+- **Sound** (v2.7.3, v2.7.4): button chimes and a message chime, on USB-C
+  headphones when plugged in; both can be turned off on OWNER. See
+  [Sound](#sound).
 - **Hybrid or closed Stumps** (v2.7.2): the cockpit verifies itself with
   `/auth`, as FireFly does, with an identity of its own
   (`~/stump_r36max/cockpit_identity`, made the first time; keep it, it's who
@@ -174,6 +174,50 @@ that's been saved.
   half-hourly beacon: the chain works, it just looks broken. The CAM (LaBuche3) needs it too.
 - Logs: `~/Stump/stump.log` (the Stump), `/roms/ports/stump_r36max/cockpit.log` (the cockpit).
 - By hand, outside the cockpit (over SSH): `~/Stump/start-stump.sh` / `~/Stump/stop-stump.sh`.
+
+## Sound
+
+Everything the cockpit plays, and when. (The Stump itself plays nothing:
+the stock computer Stump has no sound.)
+
+**Where it plays.** On a USB sound device when one is plugged in (USB-C
+headphones, a headset, a DAC), otherwise the handheld's built-in speaker,
+as Ember does. It's chosen again for every chime, so plugging or
+unplugging needs nothing else; a device unplugged in the middle of a chime
+is reopened for the next. `STUMP_OUT=plughw:0,0` (any ALSA device) in
+`LaBuche_Stump.sh`'s environment fixes it. Volume is the handheld's own.
+
+**What it plays.** Short square-wave tones, made by the engine (no sound
+files):
+
+| Sound | Tone | When |
+|---|---|---|
+| **Message chime** | two notes going up, E6 then A6 (1319, 1760 Hz), 0.18 s | A message arrives that OWNER → *Message chime* wants: by default a private message (DM) to the cockpit; with *everything*, any line from someone else in the room on screen |
+| Move | one tick, 500–540 Hz, 10–25 ms | Moving through a list, the keyboard, a form, the command menu, rooms, or scrolling the chat |
+| The end | low tick, 300 Hz, 20 ms | Scrolling past the oldest line there is |
+| Choose | 580 Hz, 25 ms | A choice changes: a Wi-Fi card's job, a notice or file ticked |
+| Open | 620–740 Hz, 35–45 ms | Opening the command menu, a form, the NETWORK tab, the keyboard for a secret; a card remembered (740) or not (520) |
+| Ask first | 660 Hz, 40–50 ms | A yes/no question opens before something that changes the Stump or a card; a quick-deck command sent; the QR code switched |
+| Send, apply | 840 Hz, 55–65 ms | Sending a message or a command, applying a setting, the chain's settings saved |
+| Done | 880 Hz, 65–85 ms | A Wi-Fi card's job confirmed, a NETWORK action carried out |
+| Back, hint | 420–480 Hz, 25–35 ms | Back out of a form or the menu, cancel, delete a character; or a hint on what to do first ("←/→ to pick, then A"), or the menu asked for before the Stump sent its commands |
+| Can't | 340 Hz, 40 ms | Something that can't be done here (a card that can't run an access point) |
+
+**Turning them off.** On the OWNER tab (no admin password needed):
+
+![The OWNER tab: this handheld's sound, Button chimes and Message chime](../docs/owner-sound.png)
+
+
+- *Button chimes*: on (default) or off. Every sound in the table but the
+  message chime.
+- *Message chime*: DMs (default), everything, or off. Picking DMs or
+  everything plays it once so you can hear it.
+
+Both are kept in `~/stump_r36max/cockpit_settings.json` for the next start.
+
+**Never.** No chime for your own lines, for the scrollback that arrives
+when you join a room, for the DMs that were waiting when the cockpit
+started, or for joins and leaves. Several messages at once give one chime.
 
 ## The look and the keyboard (FireFly's)
 

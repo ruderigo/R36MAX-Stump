@@ -162,7 +162,8 @@ class AdminForms(unittest.TestCase):
         feed = F.Feed()
         feed.admin_pw = lambda: ""
         title, _, rows = feed.form_rows()
-        self.assertEqual([(r["kind"], r["key"]) for r in rows], [("info", ""), ("text", "setpw"), ("action", "makepw")])
+        self.assertEqual([(r["kind"], r["key"]) for r in rows][:3], [("info", ""), ("text", "setpw"), ("action", "makepw")])
+        self.assertEqual([r["key"] for r in rows][-2:], ["chimes", "msgchime"])           # sound: no password needed
         made = []
         feed.make_password = lambda: made.append(1) or "made"
         feed.form_set("owner", "makepw", "")
@@ -300,7 +301,7 @@ class Commands(unittest.TestCase):
     def test_no_password_one_can_be_typed_or_made(self):
         feed = self.feed("NODE_NAME = 'x'\n")
         _, _, rows = feed.form_rows()
-        self.assertEqual([r["key"] for r in rows], ["", "setpw", "makepw"])
+        self.assertEqual([r["key"] for r in rows], ["", "setpw", "makepw", "", "chimes", "msgchime"])
         self.assertEqual(rows[1]["value"], "")                                    # never shown on the row
 
     def stump_with_settings(self, cfg):
@@ -363,6 +364,48 @@ class Commands(unittest.TestCase):
                 self.assertEqual(feed.admin_pw(), "keep-me")
         self.assertEqual(feed.restarts, [])
         self.assertEqual(feed.password_problem("caf\u00e9-1"), "")                  # accents are fine
+
+
+class Sound(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(setattr, F, "SETTINGS", F.SETTINGS)
+        F.SETTINGS = os.path.join(d, "cockpit_settings.json")
+
+    def test_defaults_and_the_live_line(self):
+        feed = F.Feed()
+        self.assertEqual(feed.sound, {"chimes": True, "msg": "dms"})
+        self.assertIn("SOUND|1|0", feed.live_lines())
+
+    def test_which_messages_chime(self):
+        feed = F.Feed()
+        self.assertTrue(feed.message_arrived("dm"))               # DMs: a private message chimes
+        self.assertFalse(feed.message_arrived("msg"))             # ... a room's line doesn't
+        feed.sound["msg"] = "all"
+        self.assertTrue(feed.message_arrived("msg") and feed.message_arrived("action"))
+        self.assertFalse(feed.message_arrived("system"))          # joins and leaves never
+        feed.sound["msg"] = "off"
+        self.assertFalse(feed.message_arrived("dm"))
+        self.assertEqual(feed.chime_seq, 3)
+        self.assertIn("SOUND|1|3", feed.live_lines())
+
+    def test_set_on_owner_without_a_password_and_kept(self):
+        feed = F.Feed()
+        feed.admin_pw = lambda: ""
+        feed.form_set("owner", "chimes", "1")                     # off
+        feed.form_set("owner", "msgchime", "1")                   # everything: and one to hear it
+        self.assertEqual(feed.sound, {"chimes": False, "msg": "all"})
+        self.assertEqual(feed.chime_seq, 1)
+        self.assertIn("SOUND|0|1", feed.live_lines())
+        again = F.Feed()
+        self.assertEqual(again.sound, {"chimes": False, "msg": "all"})    # kept for the next start
+        rows = {r["key"]: r for r in again.form_rows()[2]}
+        self.assertEqual((rows["chimes"]["sel"], rows["msgchime"]["sel"]), (1, 1))
+
+    def test_a_broken_settings_file_is_the_defaults(self):
+        with open(F.SETTINGS, "w") as f:
+            f.write("{nope")
+        self.assertEqual(F.Feed().sound, {"chimes": True, "msg": "dms"})
 
 
 if __name__ == "__main__":

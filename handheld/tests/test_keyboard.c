@@ -269,6 +269,27 @@ int main(void) {
         CHECK("no USB card found where there is none", find_usb_playback(usb, sizeof usb) == 0 && usb[0] == 0);
     }
 
+    /* 18. Sound: the feed's SOUND| line. The first one read never chimes (what
+     *     was there before); a higher count plays the message chime, two notes;
+     *     Button chimes off silences the buttons, not the message chime. */
+    {
+        memset(&g_st, 0, sizeof(g_st)); g_st.ipc_sock = -1;
+        lf = fopen(LIVE_STATE_FILE, "w"); fputs("SOUND|1|4\n", lf); fclose(lf);
+        poll_live_bridge();
+        CHECK("the first SOUND line read: no chime for what came before", g_st.chime_ms == 0 && g_st.chime_seq_seen == 4);
+        lf = fopen(LIVE_STATE_FILE, "w"); fputs("SOUND|1|5\n", lf); fclose(lf);
+        g_st.suppress_poll_frames = 0; poll_live_bridge();
+        CHECK("a message that deserves it: the message chime", g_st.chime_freq == 1319 && g_st.chime_next_freq == 1760);
+        g_st.chime_ms = 0; g_st.chime_next_freq = 0;
+        lf = fopen(LIVE_STATE_FILE, "w"); fputs("SOUND|0|5\n", lf); fclose(lf);
+        g_st.suppress_poll_frames = 0; poll_live_bridge();
+        trigger_chime(500, 20);
+        CHECK("Button chimes off: a button makes no sound", g_st.chimes_off && g_st.chime_ms == 0);
+        lf = fopen(LIVE_STATE_FILE, "w"); fputs("SOUND|0|6\n", lf); fclose(lf);
+        g_st.suppress_poll_frames = 0; poll_live_bridge();
+        CHECK("... the message chime still plays", g_st.chime_freq == 1319 && g_st.chime_ms == 70);
+    }
+
     unlink(CMD_QUEUE_FILE);
     unlink(LIVE_STATE_FILE);
 

@@ -7,6 +7,31 @@ Pushing the tag runs the tests and publishes a GitHub release with
 `R36MAX-Stump-handheld-<VERSION>.tar.gz`, its `SHA256SUMS`, and the section
 below as its notes.
 
+## v2.7.4-b.87
+
+- **A message chime.** The cockpit made no sound when a message arrived.
+  Now two notes going up (E6 then A6, 0.18 s), distinct from every button
+  chime, when a private message (DM) to the cockpit arrives; OWNER →
+  *Message chime*: DMs (the default), everything (any line from someone
+  else in the room on screen), or off; picking one plays it. Never for its
+  own lines, the scrollback when it joins a room, the DMs waiting when it
+  started, or joins and leaves; several at once give one chime. The feed
+  decides (it knows what's new, what's a DM, and the cockpit's name) and
+  says so in a `SOUND|<button chimes>|<count>` line; the engine chimes when
+  the count goes up.
+- **Button chimes can be turned off:** OWNER → *Button chimes*. Both
+  settings need no admin password and are kept in
+  `~/stump_r36max/cockpit_settings.json`.
+- **Docs.** A new [QUICKSTART.md](../QUICKSTART.md): install, open it, the
+  tabs, the buttons, the sounds, the admin password, help. The handheld
+  README has a **Sound** section listing every chime, its tone and what
+  makes it. The root README's controls table had fallen behind (no sticks,
+  no OWNER tab, no command menu): brought up to date, with a Sound part.
+- Tests: the settings, which messages chime and the live line (feed); the
+  first SOUND line never chimes, a higher count plays both notes, button
+  chimes off leaves the message chime (C); with a real Stump: its own line
+  and a room's line don't chime, a DM to it does.
+
 ## v2.7.3-b.87
 
 - **The chimes play on USB-C headphones**, as Ember does (its PR #4). The

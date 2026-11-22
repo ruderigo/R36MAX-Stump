@@ -1,6 +1,6 @@
 /*
  * stump_r36max_engine.c — Native 720x720 handheld cockpit for the R36MAX
- * (RK3326 / dArkOS), v2.7.3-b.87.
+ * (RK3326 / dArkOS), v2.7.4-b.87.
  *
  * The Stump on the handheld is a stock Stump on a computer (SandBox_Stump_On
  * pc/stump_pc.py, set up by provisioner.py --pc). This cockpit is only its
@@ -706,7 +706,7 @@ static void scan_transports(TransportStatus *ts) {
     }
 }
 
-#define STUMP_ENGINE_VERSION "v2.7.3-b.87"
+#define STUMP_ENGINE_VERSION "v2.7.4-b.87"
 #define STUMP_ENGINE_BUILD   "2026.06.24-dArkOS"
 #define MAX_LOG_LINES 60      /* a room's scrollback: all the Stump keeps (MAX_MESSAGES_PER_ROOM) */
 #define MAX_ITEMS 20          /* notices and files listed (scrolled) */
@@ -804,6 +804,11 @@ typedef struct {
     volatile bool   running;
     volatile int    chime_freq;
     volatile int    chime_ms;
+    volatile int    chime_next_freq;   /* a second note after this one (the message chime) */
+    volatile int    chime_next_ms;
+    bool            chimes_off;        /* OWNER → Button chimes: off (the feed's SOUND| line) */
+    int             chime_seq_seen;    /* the feed's message-chime count last heard */
+    bool            chime_seq_known;   /* (none at start: no chime for what was there before) */
     int             theme_idx;
     int             tab_idx;       /* 0:CHAT, 1:BOARD, 2:FILES, 3:WIFI, 4:SETUP/CHAIN v1.8 */
     int             room_idx;
@@ -971,9 +976,21 @@ static const char *BOARD_PRESET_BODIES[5] = {
 };
 
 
+/* A button's chime: short, one note. Off when OWNER → Button chimes says so. */
 static void trigger_chime(int freq, int ms) {
+    if (g_st.chimes_off) return;
     g_st.chime_freq = freq;
     g_st.chime_ms = ms;
+}
+
+/* The message chime: two notes going up (E6, A6), a little longer than any
+ * button's, so it can't be mistaken for one. The feed asks for it (SOUND|)
+ * when a message deserves it; OWNER → Message chime decides which, there. */
+static void message_chime(void) {
+    g_st.chime_next_freq = 1760;
+    g_st.chime_next_ms = 110;
+    g_st.chime_freq = 1319;
+    g_st.chime_ms = 70;
 }
 
 /* Send command to Python bridge via UDP 127.0.0.1:42421 FIRST; only write to /dev/shm/stump_cmd.txt
@@ -1696,6 +1713,17 @@ static void poll_live_bridge(void) {
                     }
                 }
             }
+        } else if (strncmp(line, "SOUND|", 6) == 0) {
+            /* SOUND|<button chimes 1/0>|<message chimes so far>: a chime
+             * for each the feed counted since the last read (one, however
+             * many came together). */
+            int on = 1, seq = 0;
+            if (sscanf(line + 6, "%d|%d", &on, &seq) >= 1) {
+                g_st.chimes_off = (on == 0);
+                if (g_st.chime_seq_known && seq > g_st.chime_seq_seen) message_chime();
+                g_st.chime_seq_seen = seq;
+                g_st.chime_seq_known = true;
+            }
         } else if (strncmp(line, "BUSY|", 5) == 0) {
             char *p1 = line + 5;
             char *p2 = strchr(p1, '|');
@@ -2112,7 +2140,13 @@ static void *alsa_chime_thread(void *arg) {
                     usleep(11000);
                 }
             }
-            g_st.chime_ms = 0;
+            if (g_st.chime_next_freq > 0) {                  /* its second note */
+                g_st.chime_freq = g_st.chime_next_freq;
+                g_st.chime_ms = g_st.chime_next_ms;
+                g_st.chime_next_freq = 0;
+            } else {
+                g_st.chime_ms = 0;
+            }
         } else {
             usleep(20000);
         }
@@ -2610,7 +2644,7 @@ int main(int argc, char **argv) {
     g_st.udp_sock = -1;
     g_st.ipc_sock = socket(AF_INET, SOCK_DGRAM, 0);
     load_fonts();
-    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.3-b.87");
+    snprintf(g_st.ver_str, sizeof(g_st.ver_str), "v2.7.4-b.87");
     snprintf(g_st.build_str, sizeof(g_st.build_str), "PC Stump cockpit");
     g_st.http80_ok = true;
     g_st.http8080_ok = true;
@@ -2761,6 +2795,7 @@ int main(int argc, char **argv) {
             g_st.menu_cursor = atoi(getenv("STUMP_COCKPIT_MENU"));
         }
         if (getenv("STUMP_COCKPIT_SCROLL") && frames == 0) g_st.chat_scroll = atoi(getenv("STUMP_COCKPIT_SCROLL"));
+        if (getenv("STUMP_COCKPIT_FORM_ROW") && frames == 0) g_st.form_cursor = atoi(getenv("STUMP_COCKPIT_FORM_ROW"));  /* screenshots */
         if (getenv("STUMP_COCKPIT_OSK") && frames == 0) {     /* screenshots in tests: open it at start */
             g_st.osk_open = true; cmp_reset(); g_cmp.was_open = true;
             g_cmp.page = atoi(getenv("STUMP_COCKPIT_OSK")) % 3;

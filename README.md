@@ -106,13 +106,20 @@ listed yet, restart EmulationStation (or the handheld).
   settings (as in step 1). The Stump uses whatever network the handheld is on
   and follows a change by itself; the cockpit just shows which one.
 
+New to it? **[QUICKSTART.md](QUICKSTART.md)**: install, the tabs, the
+buttons and the sounds on one page.
+
 ### Controls
 
 | Where | Button | Does |
 |---|---|---|
-| Everywhere | L / R | change tab: chats, board, files, network, setup |
+| Everywhere | L / R | change tab: chats, board, files, network, setup, owner |
 | Everywhere | D-pad, A, B | move, choose, back |
+| Everywhere | either stick | scroll the chat (up: older), move through any list |
+| Chats tab | ←/→ | the Stump's rooms |
+| Chats tab | ↑/↓, A | the quick deck: *all commands…* opens every command the Stump answers |
 | Chats tab | Y | open the keyboard to write |
+| Owner tab | | the Stump's owner tools, its admin password, and this handheld's sound |
 | Everywhere | SELECT + START | back to EmulationStation |
 | On-screen keyboard | A / B / X / Y | type / delete / space / shift (upper case) |
 | On-screen keyboard | L / R | letters ↔ symbols ↔ accents |
@@ -120,6 +127,14 @@ listed yet, restart EmulationStation (or the handheld).
 
 A **USB keyboard** on the OTG port (or a hub on it) works everywhere you type:
 on the chat tab, just start typing. Enter sends, Esc cancels.
+
+### Sound
+
+The cockpit chimes as you press buttons, and plays a two-note **message
+chime** when a private message arrives. It plays on USB-C headphones when
+plugged in, otherwise the speaker. OWNER → *Button chimes* and *Message
+chime* turn them off (or the message chime on for every room line). Every
+sound is listed in [handheld/README.md → Sound](handheld/README.md#sound).
 
 ### Update
 

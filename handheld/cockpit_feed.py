@@ -50,9 +50,9 @@ def _version():
     """handheld/VERSION, the one place the release is written (package.sh, the tests)."""
     try:
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"), encoding="utf-8") as f:
-            return f.read().strip() or "2.7.3-b.87"
+            return f.read().strip() or "2.7.4-b.87"
     except OSError:
-        return "2.7.3-b.87"
+        return "2.7.4-b.87"
 
 
 FEED_VERSION = _version()
@@ -66,6 +66,11 @@ LIVE_TXT = os.environ.get("STUMP_LIVE_FILE", "/dev/shm/stump_live.txt")
 CMD_TXT = os.environ.get("STUMP_CMD_FILE", "/dev/shm/stump_cmd.txt")
 IPC_PORT = int(os.environ.get("STUMP_IPC_PORT", "42421"))
 NICK = os.environ.get("STUMP_COCKPIT_NICK", "r36max")
+# OWNER → Button chimes and Message chime, kept for the next start.
+SETTINGS = os.environ.get("STUMP_COCKPIT_SETTINGS") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cockpit_settings.json")
+MSG_CHIMES = ("dms", "all", "off")
+MSG_CHIME_NAMES = ("DMs", "everything", "off")
 HOTSPOT_CON = limbs.OLD_HOTSPOT                  # v2.0's single hotspot (limbs.py moves it)
 LIMBS_FILE = os.environ.get("STUMP_LIMBS_FILE", os.path.join(APP_DIR, "limbs.json"))
 
@@ -430,6 +435,20 @@ class Feed:
         self.room_order = list(ROOMS)
         self.people = []
         self.my_nick = NICK
+        # Sound: the buttons' chimes on or off; the message chime for DMs (the
+        # default), everything, or off. chime_seq counts the messages that
+        # deserved one; the engine chimes when it goes up (SOUND| line).
+        self.sound = {"chimes": True, "msg": "dms"}
+        try:
+            with open(SETTINGS) as f:
+                saved = json.load(f)
+            if isinstance(saved.get("chimes"), bool):
+                self.sound["chimes"] = saved["chimes"]
+            if saved.get("msg") in MSG_CHIMES:
+                self.sound["msg"] = saved["msg"]
+        except (OSError, ValueError, AttributeError):
+            pass
+        self.chime_seq = 0
         self.next_rooms = 0.0
         # The OWNER tab: the form on screen, what it last heard back.
         self.form = "owner"
@@ -576,17 +595,21 @@ class Feed:
             q = "/rrc/poll?room=%s&since=%d" % (urllib.parse.quote(st.room or self.want_room), st.since)
             d = st.get(q)
             room = d.get("room") or "main"
+            backlog = st.since == 0                   # its scrollback (or DMs from before): not news
             if room != st.room:
                 # Joined (or moved to) another room: the poll below brings its
                 # whole scrollback, so start that room's lines afresh.
                 st.room, st.since = room, 0
                 self.msgs[room] = []
+                backlog = True
             for m in (d.get("messages") or []) + (d.get("dms") or []):
                 mid = int(m.get("id") or 0)
                 st.since = max(st.since, mid)
                 if all(int(x.get("id") or 0) != mid for x in self.msgs.setdefault(room, [])):
                     self.msgs[room].append(m)
                     del self.msgs[room][:-KEEP_MSGS]
+                    if not backlog and str(m.get("nick") or "") != str(d.get("nick") or self.my_nick):
+                        self.message_arrived(m.get("kind"))
                 if m.get("kind") == "dm":
                     log("DM", "%s: %s" % (m.get("nick"), m.get("body")))
             self.users[room] = len(d.get("users") or [])
@@ -891,6 +914,19 @@ class Feed:
         if fid == "owner" and key == "setpw":         # typed on the handheld: set, or changed
             self.set_password(value)
             return
+        if fid == "owner" and key in ("chimes", "msgchime"):   # this handheld's sound: no password
+            try:
+                n = int(value)
+            except ValueError:
+                return
+            if key == "chimes" and n in (0, 1):
+                self.sound["chimes"] = n == 0
+            elif key == "msgchime" and 0 <= n < len(MSG_CHIMES):
+                self.sound["msg"] = MSG_CHIMES[n]
+                if MSG_CHIMES[n] != "off":
+                    self.chime_seq += 1                # hear it
+            self.save_sound()
+            return
         if not pw:
             self.busy("No admin password on this Stump", 3)
             return
@@ -946,6 +982,32 @@ class Feed:
                 self.heard(st.send("/bans %s %s" % (pw, "-stump" if self.mod_where == "stump" else "#" + room)))
             st.next_poll = 0
 
+    def message_arrived(self, kind):
+        """A new line from someone else: the message chime, if OWNER →
+        Message chime wants it (DMs: private messages only)."""
+        want = self.sound["msg"]
+        if want == "all" and kind in ("msg", "action", "dm") or want == "dms" and kind == "dm":
+            self.chime_seq += 1
+            return True
+        return False
+
+    def save_sound(self):
+        try:
+            with open(SETTINGS + ".tmp", "w") as f:
+                json.dump(self.sound, f)
+            os.replace(SETTINGS + ".tmp", SETTINGS)
+        except OSError as e:
+            log("SOUND", "couldn't keep the sound settings: %s" % e)
+
+    def sound_rows(self, row):
+        return [row("", "info", "This handheld's sound",
+                    hint="USB-C headphones when plugged in, else the speaker"),
+                row("chimes", "choice", "Button chimes", "on" if self.sound["chimes"] else "off", ("on", "off"),
+                    0 if self.sound["chimes"] else 1, ask=2, hint="the short sounds as you press buttons"),
+                row("msgchime", "choice", "Message chime", MSG_CHIME_NAMES[MSG_CHIMES.index(self.sound["msg"])],
+                    MSG_CHIME_NAMES, MSG_CHIMES.index(self.sound["msg"]), ask=2,
+                    hint="two notes when a message arrives (DMs: private messages to you)")]
+
     def form_rows(self):
         """The form on screen: (title, the form B goes back to, rows). A row:
         {key, kind (open, choice, toggle, text, action, info), label, value,
@@ -963,7 +1025,7 @@ class Feed:
                 row("setpw", "text", "Set the admin password", mx=64,
                     hint="type your own: 4 characters or more, no spaces"),
                 row("makepw", "action", "Make one for me", ask=1,
-                    hint="the cockpit fills it in for you; shown here when you need it on a phone")]
+                    hint="the cockpit fills it in for you; shown here when you need it on a phone")] + self.sound_rows(row)
         if self.form == "setup":
             rows, seen = [], set()
             for c in self.setup or []:
@@ -1037,7 +1099,7 @@ class Feed:
             row("restart", "action", "Restart the Stump", ask=True, hint="settings that wait for a restart"),
             row("", "info", "The rest: /admin on a phone",
                 hint="on its hotspot: the radio, the chain, plugins, themes, layout..."),
-        ]
+        ] + self.sound_rows(row)
 
     # -- the handheld's Wi-Fi (the OS's, via NetworkManager) --
     def _nmcli(self, *args, timeout=25):
@@ -1363,7 +1425,8 @@ class Feed:
         # Other Stumps: from their beacons (/stumps.json), or already from the
         # chain's chat; a "mesh-xxxx" is one whose name hasn't arrived yet.
         peers = len(set(s.get("name") for s in self.stumps) | self.chat_stumps)
-        out = ["META|%s|%d|%s" % (clean(node.get("lxmf") or "STUMP OFFLINE", 32), peers, clean(rlabel, 23))]
+        out = ["META|%s|%d|%s" % (clean(node.get("lxmf") or "STUMP OFFLINE", 32), peers, clean(rlabel, 23)),
+               "SOUND|%d|%d" % (1 if self.sound["chimes"] else 0, self.chime_seq)]
         ip =clean(node.get("ap_ip") or self.net.get("ip") or "127.0.0.1", 20)
         out.append("VER|%s|%s|%d|%d|%s|%d" % (
             clean(node.get("release") or "OFFLINE", 27), clean("PC Stump, feed " + FEED_VERSION, 27),
